@@ -1,0 +1,100 @@
+name: Build Fuji-Lite A7R2 APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 8 (Dalvik Target Compatible)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Set up Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 8512546
+
+      - name: Install Android Build Tools and Platform
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-15" "build-tools;28.0.3" "ndk;21.4.7075529"
+
+      - name: Compile Native C Engine (libcolor_engine_jni.so)
+        run: |
+          $ANDROID_HOME/ndk/21.4.7075529/ndk-build -C jni APP_ABI=armeabi-v7a NDK_PROJECT_PATH=.
+
+      - name: Prepare APK Build Directories
+        run: |
+          mkdir -p bin/classes
+          mkdir -p bin/res
+          mkdir -p libs/armeabi-v7a
+
+      - name: Process Resources and Generate R.java
+        run: |
+          AAPT=$ANDROID_HOME/build-tools/28.0.3/aapt
+          PLATFORM=$ANDROID_HOME/platforms/android-15/android.jar
+          $AAPT package -f -m \
+            -J src \
+            -M AndroidManifest.xml \
+            -I $PLATFORM
+
+      - name: Compile Java Sources (Targeting Java 7 / Dalvik API 10/14)
+        run: |
+          PLATFORM=$ANDROID_HOME/platforms/android-15/android.jar
+          find src -name "*.java" > sources.txt
+          javac -source 1.7 -target 1.7 \
+            -bootclasspath $PLATFORM \
+            -d bin/classes \
+            @sources.txt
+
+      - name: Convert Class Files to Dalvik Executable (classes.dex)
+        run: |
+          $ANDROID_HOME/build-tools/28.0.3/dx --dex --output=bin/classes.dex bin/classes
+
+      - name: Package Unaligned APK
+        run: |
+          AAPT=$ANDROID_HOME/build-tools/28.0.3/aapt
+          PLATFORM=$ANDROID_HOME/platforms/android-15/android.jar
+          $AAPT package -f \
+            -M AndroidManifest.xml \
+            -I $PLATFORM \
+            -F bin/unaligned.apk
+
+          cd bin
+          $AAPT add unaligned.apk classes.dex
+          cd ..
+          $AAPT add bin/unaligned.apk libs/armeabi-v7a/libcolor_engine_jni.so
+
+      - name: ZipAlign APK
+        run: |
+          $ANDROID_HOME/build-tools/28.0.3/zipalign -v -p 4 bin/unaligned.apk bin/fuji-lite-a7r2-unaligned.apk
+
+      - name: Sign APK (Debug Keystore for PMCA Installation)
+        run: |
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          $ANDROID_HOME/build-tools/28.0.3/apksigner sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --key-pass pass:android \
+            --out fuji-lite-a7r2.apk \
+            bin/fuji-lite-a7r2-unaligned.apk
+
+      - name: Upload APK Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuji-lite-a7r2-apk
+          path: fuji-lite-a7r2.apk
+          retention-days: 14

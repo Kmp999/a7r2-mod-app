@@ -1,0 +1,23 @@
+# Android / Dalvik build outputs
+*.class
+*.dex
+*.apk
+bin/
+gen/
+obj/
+libs/
+*.so
+
+# C / Host build outputs
+*.o
+*.a
+*.exe
+__pycache__/
+*.pyc
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
