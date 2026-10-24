@@ -75,7 +75,9 @@ jobs:
           cd bin
           $AAPT add unaligned.apk classes.dex
           cd ..
-          $AAPT add bin/unaligned.apk libs/armeabi-v7a/libcolor_engine_jni.so
+          mkdir -p lib/armeabi-v7a
+          cp libs/armeabi-v7a/libcolor_engine_jni.so lib/armeabi-v7a/
+          $AAPT add bin/unaligned.apk lib/armeabi-v7a/libcolor_engine_jni.so
 
       - name: ZipAlign APK
         run: |
