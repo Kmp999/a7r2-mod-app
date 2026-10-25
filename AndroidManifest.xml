@@ -6,23 +6,30 @@
 
     <uses-sdk
         android:minSdkVersion="10"
-        android:targetSdkVersion="15" />
+        android:targetSdkVersion="10" />
 
-    <!-- Camera and Storage Permissions for Sony PMCA -->
+    <!-- Sony PMCA Camera, Storage, and SurfaceFlinger Display Permissions -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
-    <uses-feature android:name="android.hardware.camera" />
+    <uses-permission android:name="android.permission.ACCESS_SURFACE_FLINGER" />
+
+    <!-- Camera hardware features marked optional so Sony Scalar hardware is accepted -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
 
     <application
-        android:label="Fuji Lite"
+        android:label="@string/app_name"
+        android:icon="@drawable/ic_launcher"
         android:hasCode="true">
 
         <activity
             android:name=".MainActivity"
-            android:label="Fuji Lite A7R2"
+            android:label="@string/app_name"
+            android:icon="@drawable/ic_launcher"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
             android:screenOrientation="landscape"
-            android:configChanges="keyboardHidden|orientation">
+            android:configChanges="keyboardHidden|orientation|screenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

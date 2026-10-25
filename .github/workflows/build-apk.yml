@@ -45,6 +45,7 @@ jobs:
           $AAPT package -f -m \
             -J src \
             -M AndroidManifest.xml \
+            -S res \
             -I $PLATFORM
 
       - name: Compile Java Sources (Targeting Java 7 / Dalvik API 10/14)
@@ -66,6 +67,7 @@ jobs:
           PLATFORM=$ANDROID_HOME/platforms/android-15/android.jar
           $AAPT package -f \
             -M AndroidManifest.xml \
+            -S res \
             -I $PLATFORM \
             -F bin/unaligned.apk
 
@@ -78,18 +80,23 @@ jobs:
 
       - name: ZipAlign APK
         run: |
-          $ANDROID_HOME/build-tools/28.0.3/zipalign -v -p 4 bin/unaligned.apk bin/fuji-lite-a7r2-unaligned.apk
+          $ANDROID_HOME/build-tools/28.0.3/zipalign -v -p 4 bin/unaligned.apk bin/fuji-lite-a7r2-aligned.apk
 
-      - name: Sign APK (Debug Keystore for PMCA Installation)
+      - name: Sign APK (Strict v1 JAR Signing for Sony PMCA)
         run: |
-          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 1024 -sigalg SHA1withRSA -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
           $ANDROID_HOME/build-tools/28.0.3/apksigner sign \
             --ks debug.keystore \
             --ks-pass pass:android \
             --ks-key-alias androiddebugkey \
             --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled false \
+            --v3-signing-enabled false \
             --out fuji-lite-a7r2.apk \
-            bin/fuji-lite-a7r2-unaligned.apk
+            bin/fuji-lite-a7r2-aligned.apk
 
       - name: Upload APK Release Artifact
         uses: actions/upload-artifact@v5
