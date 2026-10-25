@@ -49,6 +49,7 @@ public class UIController {
         void onCycleFilmSim(int direction);
         void onCycleDynamicRange();
         void onCycleRecipeSlot();
+        void onCycleGrain();
         void onToggleAel();
         void onToggleAfMode();
         void onToggleLiveViewLut();
@@ -273,50 +274,46 @@ public class UIController {
 
             case FRONT_DIAL_CW:
                 if (cameraAdapter != null) cameraAdapter.incrementAperture(1);
+                if (qMenuView != null) qMenuView.highlightSegment(2); // Highlight Aperture
                 updateBottomHud();
                 return true;
             case FRONT_DIAL_CCW:
                 if (cameraAdapter != null) cameraAdapter.incrementAperture(-1);
+                if (qMenuView != null) qMenuView.highlightSegment(2);
                 updateBottomHud();
                 return true;
 
             case REAR_DIAL_CW:
-                if (cameraAdapter != null) cameraAdapter.incrementShutterSpeed(1);
+                if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(1);
+                if (qMenuView != null) qMenuView.highlightSegment(1); // Highlight Shutter Speed
                 updateBottomHud();
                 return true;
             case REAR_DIAL_CCW:
-                if (cameraAdapter != null) cameraAdapter.incrementShutterSpeed(-1);
+                if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(-1);
+                if (qMenuView != null) qMenuView.highlightSegment(1);
                 updateBottomHud();
                 return true;
 
             case WHEEL_CW:
-                if (wheelControlsIso && cameraAdapter != null) {
-                    cameraAdapter.setISOSensitivity(800);
-                } else if (cameraAdapter != null) {
-                    cameraAdapter.incrementEV(1);
-                }
+            case DPAD_RIGHT:
+                if (cameraAdapter != null) cameraAdapter.stepIso(1);
+                if (qMenuView != null) qMenuView.highlightSegment(3); // Highlight ISO
                 updateBottomHud();
                 return true;
             case WHEEL_CCW:
-                if (wheelControlsIso && cameraAdapter != null) {
-                    cameraAdapter.setISOSensitivity(200);
-                } else if (cameraAdapter != null) {
-                    cameraAdapter.incrementEV(-1);
-                }
+            case DPAD_LEFT:
+                if (cameraAdapter != null) cameraAdapter.stepIso(-1);
+                if (qMenuView != null) qMenuView.highlightSegment(3);
                 updateBottomHud();
                 return true;
 
             case DPAD_UP:
-                cycleHudMode();
+                if (callback != null) callback.onCycleFilmSim(-1);
+                if (qMenuView != null) qMenuView.highlightSegment(5); // Highlight Film Sim
                 return true;
             case DPAD_DOWN:
-                toggleWheelMode();
-                return true;
-            case DPAD_LEFT:
-                if (callback != null) callback.onCycleFilmSim(-1);
-                return true;
-            case DPAD_RIGHT:
                 if (callback != null) callback.onCycleFilmSim(1);
+                if (qMenuView != null) qMenuView.highlightSegment(5);
                 return true;
 
             case CENTER:
@@ -324,25 +321,19 @@ public class UIController {
                 return true;
 
             case C4_TRASH:
-                if (qMenuView != null) qMenuView.setQMenuOpen(true);
+            case FN:
+                if (qMenuView != null) qMenuView.setQMenuOpen(!qMenuView.isQMenuOpen());
                 else if (callback != null) callback.onToggleQMenu();
                 return true;
 
-            case FN:
-                if (callback != null) callback.onCycleRecipeSlot();
-                return true;
             case C1:
-                if (callback != null) callback.onCycleFilmSim(1);
+                if (qMenuView != null) qMenuView.cycleSplitScreenMode();
                 return true;
             case C2:
-                liveViewLutEnabled = !liveViewLutEnabled;
-                if (!liveViewLutEnabled && qMenuView != null) {
-                    qMenuView.clearLiveViewBuffer();
-                }
-                if (callback != null) callback.onToggleLiveViewLut();
+                if (callback != null) callback.onCycleRecipeSlot();
                 return true;
             case C3:
-                if (callback != null) callback.onCycleDynamicRange();
+                if (callback != null) callback.onCycleGrain();
                 return true;
             case AEL:
                 if (callback != null) callback.onToggleAel();

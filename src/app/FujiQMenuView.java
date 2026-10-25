@@ -97,13 +97,39 @@ public class FujiQMenuView extends View {
         init();
     }
 
+    private int splitScreenMode = 0; // 0=Full LUT, 1=Split 50/50, 2=Bypass
+    private int highlightedSegment = 0; // 1=SS, 2=Aperture, 3=ISO, 4=EV, 5=FilmSim
+    private long highlightEndTime = 0;
+
+    public void setSplitScreenMode(int mode) {
+        this.splitScreenMode = mode;
+        postInvalidate();
+    }
+
+    public int getSplitScreenMode() {
+        return splitScreenMode;
+    }
+
+    public void cycleSplitScreenMode() {
+        splitScreenMode = (splitScreenMode + 1) % 3;
+        String modeName = (splitScreenMode == 0) ? "LIVE LUT [FULL]" : ((splitScreenMode == 1) ? "SPLIT 50/50 [BEFORE/AFTER]" : "BYPASS [SONY]");
+        showCarouselBanner(modeName);
+        postInvalidate();
+    }
+
+    public void highlightSegment(int segment) {
+        this.highlightedSegment = segment;
+        this.highlightEndTime = System.currentTimeMillis() + 1500;
+        postInvalidate();
+    }
+
     public void processLiveViewFrame(byte[] nv21, int width, int height, int grainStrength) {
         if (liveViewBitmap == null || liveViewBitmap.getWidth() != width || liveViewBitmap.getHeight() != height) {
             liveViewBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
             liveViewDirectBuffer = java.nio.ByteBuffer.allocateDirect(width * height * 2);
         }
 
-        boolean success = ColorEngine.gradePreviewNV21toRGB565Safe(nv21, liveViewDirectBuffer, width, height, grainStrength);
+        boolean success = ColorEngine.gradePreviewNV21Safe(nv21, liveViewDirectBuffer, width, height, splitScreenMode, grainStrength);
         if (success) {
             liveViewDirectBuffer.rewind();
             liveViewBitmap.copyPixelsFromBuffer(liveViewDirectBuffer);
@@ -333,11 +359,23 @@ public class FujiQMenuView extends View {
             }
         } else {
             // ----------------------------------------------------------------
-            // Mode 3: Live View Viewfinder HUD (Transparent Background)
+            // Mode 3: Live View Viewfinder (Real-Time LUT Canvas Display)
             // ----------------------------------------------------------------
+            if (liveViewBitmap != null) {
+                dstRect.set(0, 0, w, h);
+                canvas.drawBitmap(liveViewBitmap, null, dstRect, null);
+            }
+
             // Top Bar
             canvas.drawRect(0, 0, w, 28, barBgPaint);
             canvas.drawText(topStatus, 16, 20, headerPaint);
+
+            if (splitScreenMode == 1) {
+                canvas.drawText("SONY [ORIGINAL]", (w / 4f) - 30f, 20, debugPaint);
+                canvas.drawText("[FUJI 3D-LUT]", (w * 3f / 4f) - 30f, 20, headerPaint);
+            } else if (splitScreenMode == 2) {
+                canvas.drawText("[BYPASS]", w - 180, 20, debugPaint);
+            }
 
             if (SonyKeyCodes.sDebugKeyLoggingEnabled) {
                 canvas.drawText("[" + SonyKeyCodes.sLastKeyName + "]", w - 16, 20, debugPaint);
@@ -348,10 +386,10 @@ public class FujiQMenuView extends View {
         // Carousel Banner (Film Sim Notification overlay)
         // --------------------------------------------------------------------
         if (carouselBanner != null && System.currentTimeMillis() < carouselBannerEndTime) {
-            float bannerTop = (h / 2f) - 20f;
-            float bannerBottom = (h / 2f) + 20f;
+            float bannerTop = (h / 2f) - 22f;
+            float bannerBottom = (h / 2f) + 22f;
 
-            bannerPaint.setColor(0xCC000000);
+            bannerPaint.setColor(0xDD000000);
             canvas.drawRect(0, bannerTop, w, bannerBottom, bannerPaint);
 
             bannerTextPaint.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
@@ -359,19 +397,69 @@ public class FujiQMenuView extends View {
             bannerTextPaint.setColor(COLOR_AMBER_GOLD);
             bannerTextPaint.setTextAlign(Paint.Align.CENTER);
             
-            canvas.drawText("[ " + carouselBanner + " ]", w / 2f, bannerTop + 25f, bannerTextPaint);
+            canvas.drawText("[ " + carouselBanner + " ]", w / 2f, bannerTop + 28f, bannerTextPaint);
         }
 
         // --------------------------------------------------------------------
-        // Common: Bottom Exposure Telemetry Bar (Zero-GC)
+        // Common: Bottom Exposure Telemetry Bar (Zero-GC with Parameter Highlighting)
         // --------------------------------------------------------------------
         canvas.drawRect(0, h - 28, w, h, barBgPaint);
 
-        String bottomHud = hudShutter + "   " + hudAperture + "   " + hudIso + "   " + hudEv + " EV   " + hudAf;
+        boolean isHighlighted = (System.currentTimeMillis() < highlightEndTime);
+        float xPos = 16f;
+
+        // 1. Shutter Speed (Segment 1)
+        hudPaint.setColor((isHighlighted && highlightedSegment == 1) ? COLOR_AMBER_GOLD : 0xFFFFFFFF);
+        canvas.drawText(hudShutter, xPos, h - 9, hudPaint);
+        xPos += hudPaint.measureText(hudShutter) + 10f;
+
+        hudPaint.setColor(COLOR_TEXT_LABEL);
+        canvas.drawText("|", xPos, h - 9, hudPaint);
+        xPos += 10f;
+
+        // 2. Aperture F-Stop (Segment 2)
+        hudPaint.setColor((isHighlighted && highlightedSegment == 2) ? COLOR_AMBER_GOLD : 0xFFFFFFFF);
+        canvas.drawText(hudAperture, xPos, h - 9, hudPaint);
+        xPos += hudPaint.measureText(hudAperture) + 10f;
+
+        hudPaint.setColor(COLOR_TEXT_LABEL);
+        canvas.drawText("|", xPos, h - 9, hudPaint);
+        xPos += 10f;
+
+        // 3. ISO (Segment 3)
+        hudPaint.setColor((isHighlighted && highlightedSegment == 3) ? COLOR_AMBER_GOLD : 0xFFFFFFFF);
+        canvas.drawText(hudIso, xPos, h - 9, hudPaint);
+        xPos += hudPaint.measureText(hudIso) + 10f;
+
+        hudPaint.setColor(COLOR_TEXT_LABEL);
+        canvas.drawText("|", xPos, h - 9, hudPaint);
+        xPos += 10f;
+
+        // 4. EV (Segment 4)
+        hudPaint.setColor((isHighlighted && highlightedSegment == 4) ? COLOR_AMBER_GOLD : 0xFFFFFFFF);
+        canvas.drawText(hudEv + " EV", xPos, h - 9, hudPaint);
+        xPos += hudPaint.measureText(hudEv + " EV") + 10f;
+
+        hudPaint.setColor(COLOR_TEXT_LABEL);
+        canvas.drawText("|", xPos, h - 9, hudPaint);
+        xPos += 10f;
+
+        // AF Mode & AE-L
+        hudPaint.setColor(0xFFFFFFFF);
+        canvas.drawText(hudAf, xPos, h - 9, hudPaint);
+        xPos += hudPaint.measureText(hudAf) + 8f;
+
         if (hudAel) {
-            bottomHud += "  [AE-L]";
+            hudPaint.setColor(COLOR_AMBER_GOLD);
+            canvas.drawText("[AE-L]", xPos, h - 9, hudPaint);
         }
-        canvas.drawText(bottomHud, 16, h - 9, hudPaint);
+
+        // 5. Film Sim (Segment 5) on far right
+        if (recipe != null) {
+            String simName = recipe.filmSim.label;
+            hudPaint.setColor((isHighlighted && highlightedSegment == 5) ? COLOR_AMBER_GOLD : COLOR_TEXT_LABEL);
+            canvas.drawText(simName, w - hudPaint.measureText(simName) - 16f, h - 9, hudPaint);
+        }
     }
 
     // ------------------------------------------------------------------------

@@ -141,17 +141,30 @@ public class ColorEngine {
 
     /**
      * Converts NV21 camera preview frames to RGB_565, applying the 3D LUT and Grain in a single pass.
+     * Supports splitScreenMode: 0 = Full LUT, 1 = Split-Screen 50/50, 2 = Bypass.
      * Outputs directly to a Zero-GC DirectByteBuffer.
      */
-    public static boolean gradePreviewNV21toRGB565Safe(byte[] nv21, java.nio.ByteBuffer rgb565Direct, int width, int height, int grain) {
+    public static boolean gradePreviewNV21Safe(byte[] nv21, java.nio.ByteBuffer rgb565Direct, int width, int height, int splitScreenMode, int grain) {
         if (!sNativeAvailable || nv21 == null || rgb565Direct == null || !rgb565Direct.isDirect()) return false;
         try {
-            return nativeGradePreviewNV21toRGB565(nv21, rgb565Direct, width, height, grain);
+            return nativeGradePreviewNV21(nv21, rgb565Direct, width, height, splitScreenMode, grain);
         } catch (Throwable t) {
-            Log.e(TAG, "nativeGradePreviewNV21toRGB565 failed", t);
+            Log.e(TAG, "nativeGradePreviewNV21 failed", t);
             return false;
         }
     }
 
-    public static native boolean nativeGradePreviewNV21toRGB565(byte[] nv21Array, java.nio.ByteBuffer rgb565Direct, int width, int height, int grainStrength);
+    public static native boolean nativeGradePreviewNV21(byte[] nv21Array, java.nio.ByteBuffer rgb565Direct, int width, int height, int splitScreenMode, int grainLevel);
+
+    public static boolean gradeCaptureRGB565Safe(java.nio.ByteBuffer directBuffer, int width, int height) {
+        if (!sNativeAvailable || directBuffer == null || !directBuffer.isDirect()) return false;
+        try {
+            return nativeGradeCaptureRGB565(directBuffer, width, height);
+        } catch (Throwable t) {
+            Log.e(TAG, "nativeGradeCaptureRGB565 failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean nativeGradeCaptureRGB565(java.nio.ByteBuffer directBuffer, int width, int height);
 }

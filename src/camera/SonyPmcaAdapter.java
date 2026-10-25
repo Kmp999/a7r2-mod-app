@@ -398,9 +398,47 @@ public class SonyPmcaAdapter implements CameraAdapter {
         }
     }
 
+    // Standard ISO ladder on Sony Alpha 7R II
+    public static final int[] ISO_STEPS = {
+        0, 50, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600,
+        2000, 2500, 3200, 4000, 5000, 6400, 8000, 10000, 12800, 16000, 20000, 25600
+    };
+    private int currentIsoIndex = 8; // Default ISO 400
+
+    public void stepIso(int delta) {
+        currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + delta));
+        int targetIso = ISO_STEPS[currentIsoIndex];
+        setISOSensitivity(targetIso);
+    }
+
     // ------------------------------------------------------------------------
     // Hardware Exposure Control (Shutter Speed, Aperture, ISO, EV)
     // ------------------------------------------------------------------------
+
+    public void adjustShutterSpeed(int step) {
+        ensureManualOrShutterPriority();
+        if (cameraEx != null) {
+            try {
+                Method m = cameraEx.getClass().getMethod("adjustShutterSpeed", int.class);
+                m.invoke(cameraEx, step);
+                getShutterSpeed();
+                return;
+            } catch (Throwable ignored) {}
+        }
+        incrementShutterSpeed(step);
+    }
+
+    public void ensureManualOrShutterPriority() {
+        if (normalCamera == null) return;
+        try {
+            Camera.Parameters params = normalCamera.getParameters();
+            String mode = params.get("sony-exposure-mode");
+            if ("program-auto".equals(mode) || "aperture-priority".equals(mode)) {
+                params.set("sony-exposure-mode", "manual-exposure");
+                normalCamera.setParameters(params);
+            }
+        } catch (Throwable ignored) {}
+    }
 
     public void incrementShutterSpeed(int step) {
         try {

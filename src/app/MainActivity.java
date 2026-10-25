@@ -138,6 +138,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
 
             @Override
+            public void onCycleGrain() {
+                FujiRecipe r = appState.getActiveRecipe();
+                int next = (r.grainEffect.ordinal() + 1) % FujiRecipe.EffectLevel.values().length;
+                r.grainEffect = FujiRecipe.EffectLevel.values()[next];
+                if (qMenuView != null) {
+                    qMenuView.showCarouselBanner("GRAIN: " + r.grainEffect.label);
+                }
+                onRecipeUpdated(r);
+            }
+
+            @Override
             public void onToggleAel() {
                 if (cameraAdapter != null) {
                     cameraAdapter.setAutoExposureLock(!cameraAdapter.isAutoExposureLock());
