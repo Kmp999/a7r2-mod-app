@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * Enforces:
  *  - 5 FPS deadband (200ms) on text updates to protect main thread.
- *  - Zero-GC formatted Bottom HUD telemetry buffer (char[] based).
+ *  - Direct updating of FujiQMenuView unified HUD and Bottom telemetry.
  *  - Triple-lock anti-repeat & latch for shutter button (defeats Infinite Capture Loop).
  *  - Dual-layer key event routing across Live View, Q-Menu, and Quick Review.
  */
@@ -39,7 +39,6 @@ public class UIController {
     private boolean wheelControlsIso = false;
 
     // Zero-GC Pre-allocated char buffer for bottom telemetry HUD
-    private final char[] hudBuffer = new char[128];
     private final StringBuilder hudStringBuilder = new StringBuilder(128);
 
     // Callbacks to camera and capture systems
@@ -60,6 +59,7 @@ public class UIController {
 
     private ControllerCallback callback;
     private SonyPmcaAdapter cameraAdapter;
+    private FujiQMenuView qMenuView;
 
     public UIController(TextView statusView) {
         this(statusView, null);
@@ -73,6 +73,10 @@ public class UIController {
 
     public void setBottomHudView(TextView view) {
         this.bottomHudView = view;
+    }
+
+    public void setQMenuView(FujiQMenuView view) {
+        this.qMenuView = view;
     }
 
     public void setControllerCallback(ControllerCallback cb) {
@@ -126,18 +130,6 @@ public class UIController {
      * Updates bottom HUD telemetry with Zero-GC overhead.
      */
     public void updateBottomHud() {
-        if (bottomHudView == null) return;
-
-        if (hudMode == HudMode.CLEAN) {
-            mainHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    bottomHudView.setText("");
-                }
-            });
-            return;
-        }
-
         final String ss = (cameraAdapter != null) ? cameraAdapter.getShutterSpeed() : "1/125";
         final String ap = (cameraAdapter != null) ? cameraAdapter.getAperture() : "F2.8";
         final String iso = (cameraAdapter != null) ? cameraAdapter.getIso() : "ISO 400";
@@ -145,11 +137,20 @@ public class UIController {
         final boolean ael = (cameraAdapter != null) && cameraAdapter.isAutoExposureLock();
         final String af = (cameraAdapter != null) ? cameraAdapter.getAfMode() : "AF-S";
 
-        mainHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                hudStringBuilder.setLength(0);
-                if (hudMode == HudMode.FULL) {
+        // Update unified FujiQMenuView HUD
+        if (qMenuView != null) {
+            qMenuView.updateTelemetry(ss, ap, iso, ev, ael, af);
+        }
+
+        if (bottomHudView != null) {
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (hudMode == HudMode.CLEAN) {
+                        bottomHudView.setText("");
+                        return;
+                    }
+                    hudStringBuilder.setLength(0);
                     hudStringBuilder.append(ss).append("  |  ")
                                     .append(ap).append("  |  ")
                                     .append(iso).append("  |  ")
@@ -158,154 +159,207 @@ public class UIController {
                     if (ael) {
                         hudStringBuilder.append("  [AE-L]");
                     }
-                } else {
-                    // Minimal mode: Essential Exposure only
-                    hudStringBuilder.append(ss).append("  ").append(ap).append("  ").append(iso);
-                    if (ael) hudStringBuilder.append(" [L]");
+                    bottomHudView.setText(hudStringBuilder.toString());
                 }
-                bottomHudView.setText(hudStringBuilder.toString());
-            }
-        });
+            });
+        }
+    }
+
+    public boolean handleKeyDown(int keyCode, KeyEvent event) {
+        return handleRawKeyDown(keyCode, event);
+    }
+
+    public boolean handleKeyUp(int keyCode, KeyEvent event) {
+        return handleRawKeyUp(keyCode, event);
     }
 
     /**
      * Dual-layer hardware key press interceptor.
-     * Enforces anti-repeat and cooldown locks for shutter release.
+     * Extracts rawCode from scanCode >= 512 or keyCode == 0.
      */
-    public boolean handleKeyDown(int keyCode, KeyEvent event) {
-        // Anti-repeat lock: Never allow firmware key repeat on shutter buttons
-        if (event.getRepeatCount() > 0) {
-            if (keyCode == SonyKeyCodes.SONY_KEY_SHUTTER || keyCode == SonyKeyCodes.SONY_KEY_SHUTTER_HALF) {
-                return true;
-            }
+    public boolean handleRawKeyDown(int rawCode, KeyEvent event) {
+        SonyKeyCodes.FujiAction action = SonyKeyCodes.resolveAction(rawCode, event);
+        Log.d(TAG, "handleRawKeyDown: raw=" + rawCode + " -> " + action);
+
+        // Always redraw QMenuView if debug logging is enabled to display the key immediately
+        if (qMenuView != null && SonyKeyCodes.sDebugKeyLoggingEnabled) {
+            qMenuView.postInvalidate();
         }
 
-        SonyKeyCodes.FujiAction action = SonyKeyCodes.resolveAction(keyCode, event);
-
-        // Half-shutter autofocus & Q-menu dismiss
-        if (action == SonyKeyCodes.FujiAction.HALF_SHUTTER) {
-            if (callback != null && callback.isQMenuOpen()) {
-                callback.onToggleQMenu();
-                return true;
-            }
-            if (cameraAdapter != null) {
-                cameraAdapter.autoFocus();
-            }
+        // Mode 1: Quick Photo Review Overlay is Active
+        if (qMenuView != null && qMenuView.isReviewing()) {
+            qMenuView.clearQuickReview();
             return true;
         }
 
-        // Full-shutter single-shot capture
-        if (action == SonyKeyCodes.FujiAction.FULL_SHUTTER) {
-            long now = System.currentTimeMillis();
-            if (now - lastS2UpTime < SHUTTER_COOLDOWN_MS) {
-                Log.d(TAG, "Shutter press dropped: Cooldown active");
-                return true;
-            }
-            if (!isShutterButtonPhysicalDown.compareAndSet(false, true)) {
-                Log.d(TAG, "Shutter press dropped: Button already latched down");
-                return true;
-            }
-
-            if (callback != null) {
-                callback.onTriggerCapture();
-            }
-            return true;
-        }
-
-        // Live View vs Q-Menu specific routing
-        boolean qOpen = (callback != null && callback.isQMenuOpen());
-
-        if (!qOpen) {
+        // Mode 2: Q-Menu is Open
+        boolean qOpen = (qMenuView != null && qMenuView.isQMenuOpen()) || (callback != null && callback.isQMenuOpen());
+        if (qOpen) {
             switch (action) {
+                case HALF_SHUTTER:
+                case C4_TRASH:
+                case MENU:
+                    if (qMenuView != null) qMenuView.setQMenuOpen(false);
+                    if (callback != null && callback.isQMenuOpen()) callback.onToggleQMenu();
+                    return true;
+
                 case FRONT_DIAL_CW:
-                    if (cameraAdapter != null) cameraAdapter.incrementAperture(1);
-                    updateBottomHud();
+                    if (qMenuView != null) qMenuView.adjustCurrentSetting(2);
                     return true;
                 case FRONT_DIAL_CCW:
-                    if (cameraAdapter != null) cameraAdapter.incrementAperture(-1);
-                    updateBottomHud();
+                    if (qMenuView != null) qMenuView.adjustCurrentSetting(-2);
                     return true;
+
                 case REAR_DIAL_CW:
-                    if (cameraAdapter != null) cameraAdapter.incrementShutterSpeed(1);
-                    updateBottomHud();
+                case WHEEL_CW:
+                    if (qMenuView != null) qMenuView.adjustCurrentSetting(1);
                     return true;
                 case REAR_DIAL_CCW:
-                    if (cameraAdapter != null) cameraAdapter.incrementShutterSpeed(-1);
-                    updateBottomHud();
-                    return true;
-                case WHEEL_CW:
-                    if (wheelControlsIso && cameraAdapter != null) {
-                        cameraAdapter.setISOSensitivity(800);
-                    } else if (cameraAdapter != null) {
-                        cameraAdapter.incrementEV(1);
-                    }
-                    updateBottomHud();
-                    return true;
                 case WHEEL_CCW:
-                    if (wheelControlsIso && cameraAdapter != null) {
-                        cameraAdapter.setISOSensitivity(200);
-                    } else if (cameraAdapter != null) {
-                        cameraAdapter.incrementEV(-1);
-                    }
-                    updateBottomHud();
+                    if (qMenuView != null) qMenuView.adjustCurrentSetting(-1);
                     return true;
+
                 case DPAD_UP:
-                    cycleHudMode();
+                    if (qMenuView != null) qMenuView.moveSelection(0, -1);
                     return true;
                 case DPAD_DOWN:
-                    toggleWheelMode();
+                    if (qMenuView != null) qMenuView.moveSelection(0, 1);
                     return true;
                 case DPAD_LEFT:
-                    if (callback != null) callback.onCycleFilmSim(-1);
+                    if (qMenuView != null) qMenuView.moveSelection(-1, 0);
                     return true;
                 case DPAD_RIGHT:
-                    if (callback != null) callback.onCycleFilmSim(1);
+                    if (qMenuView != null) qMenuView.moveSelection(1, 0);
                     return true;
+
                 case CENTER:
-                    if (callback != null) callback.onResetParameter();
+                    if (qMenuView != null) qMenuView.resetCurrentSetting();
                     return true;
-                case C4_TRASH:
-                    if (callback != null) callback.onToggleQMenu();
-                    return true;
+
                 case FN:
-                    if (callback != null) callback.onCycleRecipeSlot();
+                    if (qMenuView != null) qMenuView.adjustCurrentSetting(0);
                     return true;
-                case C1:
-                    if (callback != null) callback.onCycleFilmSim(1);
-                    return true;
-                case C2:
-                    if (callback != null) callback.onToggleLiveViewLut();
-                    return true;
-                case C3:
-                    if (callback != null) callback.onCycleDynamicRange();
-                    return true;
-                case AEL:
-                    if (callback != null) callback.onToggleAel();
-                    return true;
-                case AF_MF:
-                    if (callback != null) callback.onToggleAfMode();
-                    return true;
-                case PLAY:
-                    if (callback != null) callback.onToggleQuickReview();
-                    return true;
-                case MENU:
-                    // Return true to block default Android OS app exit
-                    return true;
+
                 default:
-                    break;
+                    return true; // Consume all keys while in Q-Menu
             }
+        }
+
+        // Mode 3: Live View Viewfinder (Standard Shooting)
+        switch (action) {
+            case HALF_SHUTTER:
+                if (cameraAdapter != null) cameraAdapter.autoFocus();
+                return true;
+
+            case FULL_SHUTTER: {
+                long now = System.currentTimeMillis();
+                if (now - lastS2UpTime < SHUTTER_COOLDOWN_MS) {
+                    Log.d(TAG, "Shutter press dropped: Cooldown active");
+                    return true;
+                }
+                if (!isShutterButtonPhysicalDown.compareAndSet(false, true)) {
+                    Log.d(TAG, "Shutter press dropped: Button already latched down");
+                    return true;
+                }
+                if (callback != null) callback.onTriggerCapture();
+                return true;
+            }
+
+            case FRONT_DIAL_CW:
+                if (cameraAdapter != null) cameraAdapter.incrementAperture(1);
+                updateBottomHud();
+                return true;
+            case FRONT_DIAL_CCW:
+                if (cameraAdapter != null) cameraAdapter.incrementAperture(-1);
+                updateBottomHud();
+                return true;
+
+            case REAR_DIAL_CW:
+                if (cameraAdapter != null) cameraAdapter.incrementShutterSpeed(1);
+                updateBottomHud();
+                return true;
+            case REAR_DIAL_CCW:
+                if (cameraAdapter != null) cameraAdapter.incrementShutterSpeed(-1);
+                updateBottomHud();
+                return true;
+
+            case WHEEL_CW:
+                if (wheelControlsIso && cameraAdapter != null) {
+                    cameraAdapter.setISOSensitivity(800);
+                } else if (cameraAdapter != null) {
+                    cameraAdapter.incrementEV(1);
+                }
+                updateBottomHud();
+                return true;
+            case WHEEL_CCW:
+                if (wheelControlsIso && cameraAdapter != null) {
+                    cameraAdapter.setISOSensitivity(200);
+                } else if (cameraAdapter != null) {
+                    cameraAdapter.incrementEV(-1);
+                }
+                updateBottomHud();
+                return true;
+
+            case DPAD_UP:
+                cycleHudMode();
+                return true;
+            case DPAD_DOWN:
+                toggleWheelMode();
+                return true;
+            case DPAD_LEFT:
+                if (callback != null) callback.onCycleFilmSim(-1);
+                return true;
+            case DPAD_RIGHT:
+                if (callback != null) callback.onCycleFilmSim(1);
+                return true;
+
+            case CENTER:
+                if (callback != null) callback.onResetParameter();
+                return true;
+
+            case C4_TRASH:
+                if (qMenuView != null) qMenuView.setQMenuOpen(true);
+                else if (callback != null) callback.onToggleQMenu();
+                return true;
+
+            case FN:
+                if (callback != null) callback.onCycleRecipeSlot();
+                return true;
+            case C1:
+                if (callback != null) callback.onCycleFilmSim(1);
+                return true;
+            case C2:
+                if (callback != null) callback.onToggleLiveViewLut();
+                return true;
+            case C3:
+                if (callback != null) callback.onCycleDynamicRange();
+                return true;
+            case AEL:
+                if (callback != null) callback.onToggleAel();
+                return true;
+            case AF_MF:
+                if (callback != null) callback.onToggleAfMode();
+                return true;
+            case PLAY:
+                if (callback != null) callback.onToggleQuickReview();
+                return true;
+
+            case MENU:
+                // Return true to prevent Android OS from closing the app
+                return true;
+
+            default:
+                break;
         }
 
         return false;
     }
 
-    public boolean handleKeyUp(int keyCode, KeyEvent event) {
-        SonyKeyCodes.FujiAction action = SonyKeyCodes.resolveAction(keyCode, event);
+    public boolean handleRawKeyUp(int rawCode, KeyEvent event) {
+        SonyKeyCodes.FujiAction action = SonyKeyCodes.resolveAction(rawCode, event);
 
         if (action == SonyKeyCodes.FujiAction.HALF_SHUTTER) {
-            if (cameraAdapter != null) {
-                cameraAdapter.cancelAutoFocus();
-            }
+            if (cameraAdapter != null) cameraAdapter.cancelAutoFocus();
             return true;
         }
 

@@ -1,17 +1,27 @@
 package com.fujilite.a7r2;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.view.KeyEvent;
 import android.view.View;
 
 /**
- * Fujifilm Q-Menu 4x4 Grid view for Sony A7R II.
+ * Fujifilm Q-Menu 4x4 Grid & Unified Live View HUD for Sony A7R II.
+ *
  * Rendered at 640x480 (VGA) resolution with Zero-GC allocation during onDraw().
- * Handled entirely with physical hardware buttons and dials.
+ * Fully controlled via physical dials and hardware buttons.
+ *
+ * Acts as the single high-performance overlay over SurfaceView:
+ *  - When Q-Menu is closed: Transparent Live View HUD (Top status, Bottom exposure telemetry, Key Debugger).
+ *  - When Q-Menu is open: Semi-transparent 4x4 Fujifilm grid with Amber cursor.
+ *  - When reviewing a photo: Quick Review photo display overlay.
+ *
+ * Focusable is set to false to prevent stealing Android focus.
  */
 public class FujiQMenuView extends View {
 
@@ -26,25 +36,45 @@ public class FujiQMenuView extends View {
 
     // Fujifilm aesthetic color palette
     private static final int COLOR_BG_DIM        = 0xCC000000; // Semi-transparent black (80%)
+    private static final int COLOR_BAR_BG        = 0x77000000; // Subtle bar backing for Live View HUD
     private static final int COLOR_CELL_NORMAL   = 0x33222222;
     private static final int COLOR_CELL_FOCUSED  = 0x99333333;
     private static final int COLOR_AMBER_GOLD    = 0xFFFFAA00; // Fujifilm Signature Amber
     private static final int COLOR_TEXT_LABEL    = 0xFF888888;
     private static final int COLOR_TEXT_VALUE    = 0xFFFFFFFF;
+    private static final int COLOR_WHITE         = 0xFFFFFFFF;
 
     private int selectedIndex = 0; // 0..15
     private FujiRecipe recipe;
     private OnRecipeChangeListener listener;
 
+    private boolean isQMenuOpen = false;
+    private Bitmap reviewBitmap = null;
+    private String reviewInfo = null;
+
+    // Live View Telemetry State
+    private String hudShutter = "1/125";
+    private String hudAperture = "F2.8";
+    private String hudIso = "ISO 400";
+    private String hudEv = "+0.0";
+    private String hudAf = "AF-S";
+    private boolean hudAel = false;
+    private String topStatus = "FUJIFILM LIVE";
+
     // Pre-allocated graphic objects (Zero GC during onDraw)
     private final Paint bgPaint = new Paint();
+    private final Paint barBgPaint = new Paint();
     private final Paint cellBorderPaint = new Paint();
     private final Paint cellFillPaint = new Paint();
     private final Paint textLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textValuePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint headerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint hudPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint debugPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     private final RectF cellRect = new RectF();
+    private final Rect srcRect = new Rect();
+    private final Rect dstRect = new Rect();
     private final String[] itemTitles = new String[TOTAL_CELLS];
     private final String[] cachedValues = new String[TOTAL_CELLS];
 
@@ -52,21 +82,69 @@ public class FujiQMenuView extends View {
         super(context);
         this.recipe = recipe;
         this.listener = listener;
-        setFocusable(true);
-        setFocusableInTouchMode(true);
+
+        // Never steal focus from Activity dispatchKeyEvent
+        setFocusable(false);
+        setFocusableInTouchMode(false);
         init();
     }
 
     public void setRecipe(FujiRecipe recipe) {
         this.recipe = recipe;
         refreshCachedValues();
-        invalidate();
+        updateTopStatus();
+        postInvalidate();
+    }
+
+    public boolean isQMenuOpen() {
+        return isQMenuOpen;
+    }
+
+    public void setQMenuOpen(boolean open) {
+        this.isQMenuOpen = open;
+        if (open) {
+            refreshCachedValues();
+        }
+        postInvalidate();
+    }
+
+    public void setQuickReviewBitmap(Bitmap bmp, String info) {
+        this.reviewBitmap = bmp;
+        this.reviewInfo = info;
+        postInvalidate();
+    }
+
+    public void clearQuickReview() {
+        this.reviewBitmap = null;
+        this.reviewInfo = null;
+        postInvalidate();
+    }
+
+    public boolean isReviewing() {
+        return (reviewBitmap != null);
+    }
+
+    public void updateTelemetry(String shutter, String aperture, String iso, String ev, boolean ael, String afMode) {
+        this.hudShutter = shutter;
+        this.hudAperture = aperture;
+        this.hudIso = iso;
+        this.hudEv = ev;
+        this.hudAel = ael;
+        this.hudAf = afMode;
+        postInvalidate();
+    }
+
+    private void updateTopStatus() {
+        if (recipe != null) {
+            topStatus = recipe.filmSim.label + "  |  " + recipe.dynamicRange.label + "  |  C" + (recipe.recipeSlotIndex + 1);
+        }
     }
 
     private void init() {
         setWillNotDraw(false);
 
         bgPaint.setColor(COLOR_BG_DIM);
+        barBgPaint.setColor(COLOR_BAR_BG);
 
         cellBorderPaint.setStyle(Paint.Style.STROKE);
         cellBorderPaint.setStrokeWidth(2.5f);
@@ -83,8 +161,17 @@ public class FujiQMenuView extends View {
         textValuePaint.setTextAlign(Paint.Align.CENTER);
 
         headerPaint.setTypeface(Typeface.create(mono, Typeface.BOLD));
-        headerPaint.setTextSize(13f);
+        headerPaint.setTextSize(14f);
         headerPaint.setColor(COLOR_AMBER_GOLD);
+
+        hudPaint.setTypeface(Typeface.create(mono, Typeface.BOLD));
+        hudPaint.setTextSize(15f);
+        hudPaint.setColor(COLOR_AMBER_GOLD);
+
+        debugPaint.setTypeface(mono);
+        debugPaint.setTextSize(11f);
+        debugPaint.setColor(0xFFAAAAAA);
+        debugPaint.setTextAlign(Paint.Align.RIGHT);
 
         // 16 Fujifilm Q-Menu items
         itemTitles[0]  = "BASE FILM";
@@ -105,6 +192,7 @@ public class FujiQMenuView extends View {
         itemTitles[15] = "SLOT SAVE";
 
         refreshCachedValues();
+        updateTopStatus();
     }
 
     public void refreshCachedValues() {
@@ -135,176 +223,122 @@ public class FujiQMenuView extends View {
         final int h = getHeight();
         if (w <= 0 || h <= 0) return;
 
-        // 1. Semi-transparent black background
-        canvas.drawRect(0, 0, w, h, bgPaint);
+        // --------------------------------------------------------------------
+        // Mode 1: Quick Photo Review Display
+        // --------------------------------------------------------------------
+        if (reviewBitmap != null) {
+            srcRect.set(0, 0, reviewBitmap.getWidth(), reviewBitmap.getHeight());
+            dstRect.set(0, 0, w, h);
+            canvas.drawBitmap(reviewBitmap, srcRect, dstRect, null);
 
-        // 2. Header Status
-        canvas.drawText("FUJIFILM Q-MENU [DIAL: ADJUST | SHUTTER / TRASH: EXIT]", 16, 26, headerPaint);
+            canvas.drawRect(0, h - 36, w, h, barBgPaint);
+            canvas.drawText(reviewInfo != null ? reviewInfo : "PREVIEW", 16, h - 14, headerPaint);
+            canvas.drawText("PRESS PLAY / SHUTTER TO EXIT", w - 16, h - 14, debugPaint);
+            return;
+        }
 
-        // 3. 4x4 Grid layout calculation
-        final float marginX = 14f;
-        final float marginTop = 36f;
-        final float marginBottom = 14f;
-        final float gridW = w - (marginX * 2);
-        final float gridH = h - marginTop - marginBottom;
+        // --------------------------------------------------------------------
+        // Mode 2: 4x4 Fujifilm Q-Menu Grid
+        // --------------------------------------------------------------------
+        if (isQMenuOpen) {
+            // Semi-transparent black background
+            canvas.drawRect(0, 0, w, h, bgPaint);
 
-        final float cellW = gridW / COLS;
-        final float cellH = gridH / ROWS;
-        final float pad = 3f;
+            // Header Status
+            canvas.drawText("FUJIFILM Q-MENU [FRONT/REAR DIAL: ADJUST | TRASH: EXIT]", 16, 24, headerPaint);
 
-        for (int r = 0; r < ROWS; r++) {
-            for (int c = 0; c < COLS; c++) {
-                int index = (r * COLS) + c;
-                boolean isFocused = (index == selectedIndex);
+            // 4x4 Grid layout calculation
+            final float marginX = 14f;
+            final float marginTop = 32f;
+            final float marginBottom = 34f;
+            final float gridW = w - (marginX * 2);
+            final float gridH = h - marginTop - marginBottom;
 
-                float left = marginX + (c * cellW) + pad;
-                float top = marginTop + (r * cellH) + pad;
-                float right = marginX + ((c + 1) * cellW) - pad;
-                float bottom = marginTop + ((r + 1) * cellH) - pad;
+            final float cellW = gridW / COLS;
+            final float cellH = gridH / ROWS;
+            final float pad = 3f;
 
-                cellRect.set(left, top, right, bottom);
+            for (int r = 0; r < ROWS; r++) {
+                for (int c = 0; c < COLS; c++) {
+                    int index = (r * COLS) + c;
+                    boolean isFocused = (index == selectedIndex);
 
-                // Cell fill
-                cellFillPaint.setColor(isFocused ? COLOR_CELL_FOCUSED : COLOR_CELL_NORMAL);
-                canvas.drawRect(cellRect, cellFillPaint);
+                    float left = marginX + (c * cellW) + pad;
+                    float top = marginTop + (r * cellH) + pad;
+                    float right = marginX + ((c + 1) * cellW) - pad;
+                    float bottom = marginTop + ((r + 1) * cellH) - pad;
 
-                // Cell border
-                if (isFocused) {
-                    cellBorderPaint.setColor(COLOR_AMBER_GOLD);
-                    cellBorderPaint.setStrokeWidth(2.5f);
-                } else {
-                    cellBorderPaint.setColor(0x44FFFFFF);
-                    cellBorderPaint.setStrokeWidth(1.0f);
-                }
-                canvas.drawRect(cellRect, cellBorderPaint);
+                    cellRect.set(left, top, right, bottom);
 
-                // Label
-                textLabelPaint.setColor(isFocused ? COLOR_AMBER_GOLD : COLOR_TEXT_LABEL);
-                canvas.drawText(itemTitles[index], left + 6f, top + 15f, textLabelPaint);
+                    // Cell fill
+                    cellFillPaint.setColor(isFocused ? COLOR_CELL_FOCUSED : COLOR_CELL_NORMAL);
+                    canvas.drawRect(cellRect, cellFillPaint);
 
-                // Value
-                textValuePaint.setColor(isFocused ? COLOR_TEXT_VALUE : 0xFFCCCCCC);
-                float centerX = (left + right) / 2.0f;
-                float centerY = top + (cellH * 0.68f);
-                if (cachedValues[index] != null) {
-                    canvas.drawText(cachedValues[index], centerX, centerY, textValuePaint);
+                    // Cell border (Amber Gold focus)
+                    if (isFocused) {
+                        cellBorderPaint.setColor(COLOR_AMBER_GOLD);
+                        cellBorderPaint.setStrokeWidth(2.5f);
+                    } else {
+                        cellBorderPaint.setColor(0x44FFFFFF);
+                        cellBorderPaint.setStrokeWidth(1.0f);
+                    }
+                    canvas.drawRect(cellRect, cellBorderPaint);
+
+                    // Label
+                    textLabelPaint.setColor(isFocused ? COLOR_AMBER_GOLD : COLOR_TEXT_LABEL);
+                    canvas.drawText(itemTitles[index], left + 6f, top + 14f, textLabelPaint);
+
+                    // Value
+                    textValuePaint.setColor(isFocused ? COLOR_TEXT_VALUE : 0xFFCCCCCC);
+                    float centerX = (left + right) / 2.0f;
+                    float centerY = top + (cellH * 0.68f);
+                    if (cachedValues[index] != null) {
+                        canvas.drawText(cachedValues[index], centerX, centerY, textValuePaint);
+                    }
                 }
             }
+        } else {
+            // ----------------------------------------------------------------
+            // Mode 3: Live View Viewfinder HUD (Transparent Background)
+            // ----------------------------------------------------------------
+            // Top Bar
+            canvas.drawRect(0, 0, w, 28, barBgPaint);
+            canvas.drawText(topStatus, 16, 20, headerPaint);
+
+            if (SonyKeyCodes.sDebugKeyLoggingEnabled) {
+                canvas.drawText("[" + SonyKeyCodes.sLastKeyName + "]", w - 16, 20, debugPaint);
+            }
         }
+
+        // --------------------------------------------------------------------
+        // Common: Bottom Exposure Telemetry Bar (Zero-GC)
+        // --------------------------------------------------------------------
+        canvas.drawRect(0, h - 28, w, h, barBgPaint);
+
+        String bottomHud = hudShutter + "   " + hudAperture + "   " + hudIso + "   " + hudEv + " EV   " + hudAf;
+        if (hudAel) {
+            bottomHud += "  [AE-L]";
+        }
+        canvas.drawText(bottomHud, 16, h - 9, hudPaint);
     }
 
-    @Override
-    public boolean onKeyDown(int keyCode, KeyEvent event) {
-        switch (keyCode) {
-            // D-Pad Navigation
-            case KeyEvent.KEYCODE_DPAD_UP:
-                selectedIndex = (selectedIndex - COLS + TOTAL_CELLS) % TOTAL_CELLS;
-                invalidate();
-                return true;
+    // ------------------------------------------------------------------------
+    // Q-Menu Navigation & Adjustment Helpers
+    // ------------------------------------------------------------------------
 
-            case KeyEvent.KEYCODE_DPAD_DOWN:
-                selectedIndex = (selectedIndex + COLS) % TOTAL_CELLS;
-                invalidate();
-                return true;
+    public void moveSelection(int dCol, int dRow) {
+        if (!isQMenuOpen) return;
+        int col = selectedIndex % COLS;
+        int row = selectedIndex / COLS;
 
-            case KeyEvent.KEYCODE_DPAD_LEFT:
-                selectedIndex = (selectedIndex % COLS == 0) ? selectedIndex + COLS - 1 : selectedIndex - 1;
-                invalidate();
-                return true;
+        col = (col + dCol + COLS) % COLS;
+        row = (row + dRow + ROWS) % ROWS;
 
-            case KeyEvent.KEYCODE_DPAD_RIGHT:
-                selectedIndex = ((selectedIndex + 1) % COLS == 0) ? selectedIndex - COLS + 1 : selectedIndex + 1;
-                invalidate();
-                return true;
-
-            // Front Dial: Fast 2-step adjustment
-            case SonyKeyCodes.SONY_KEY_DIAL1_CW:
-                adjustCurrentSetting(2);
-                return true;
-
-            case SonyKeyCodes.SONY_KEY_DIAL1_CCW:
-                adjustCurrentSetting(-2);
-                return true;
-
-            // Rear Dial & Control Wheel: Precise 1-step adjustment
-            case SonyKeyCodes.SONY_KEY_DIAL2_CW:
-            case SonyKeyCodes.SONY_KEY_DIAL3_CW:
-            case KeyEvent.KEYCODE_PAGE_UP:
-                adjustCurrentSetting(1);
-                return true;
-
-            case SonyKeyCodes.SONY_KEY_DIAL2_CCW:
-            case SonyKeyCodes.SONY_KEY_DIAL3_CCW:
-            case KeyEvent.KEYCODE_PAGE_DOWN:
-                adjustCurrentSetting(-1);
-                return true;
-
-            // Center Enter button: Reset selected cell to factory default (0 or Standard)
-            case KeyEvent.KEYCODE_DPAD_CENTER:
-            case KeyEvent.KEYCODE_ENTER:
-                if (selectedIndex == 15) {
-                    recipe.saveToSlot(getContext(), recipe.recipeSlotIndex);
-                    refreshCachedValues();
-                    invalidate();
-                } else {
-                    resetCurrentSetting();
-                }
-                return true;
-
-            // Fn key in Q-Menu: Instant Recipe Save
-            case SonyKeyCodes.SONY_KEY_FN:
-                recipe.saveToSlot(getContext(), recipe.recipeSlotIndex);
-                refreshCachedValues();
-                invalidate();
-                return true;
-
-            // Half-shutter, Trash, or Menu: Immediate Dismiss
-            case SonyKeyCodes.SONY_KEY_SHUTTER_HALF:
-            case SonyKeyCodes.ANDROID_CAMERA:
-            case SonyKeyCodes.SONY_KEY_C3_TRASH:
-            case SonyKeyCodes.ANDROID_DEL:
-            case SonyKeyCodes.ANDROID_CLEAR:
-            case KeyEvent.KEYCODE_MENU:
-                if (listener != null) {
-                    listener.onDismissRequest();
-                }
-                return true;
-        }
-
-        return super.onKeyDown(keyCode, event);
+        selectedIndex = row * COLS + col;
+        postInvalidate();
     }
 
-    public void resetCurrentSetting() {
-        if (recipe == null) return;
-
-        switch (selectedIndex) {
-            case 0:  recipe.filmSim = FujiRecipe.FilmSim.PROVIA; break;
-            case 1:  recipe.dynamicRange = FujiRecipe.DynamicRange.DR100; break;
-            case 2:  recipe.grainEffect = FujiRecipe.EffectLevel.OFF; break;
-            case 3:  recipe.colorChrome = FujiRecipe.EffectLevel.OFF; break;
-            case 4:  recipe.colorChromeBlue = FujiRecipe.EffectLevel.OFF; break;
-            case 5:  recipe.whiteBalance = FujiRecipe.WhiteBalance.AUTO; break;
-            case 6:  recipe.wbShiftR = 0; break;
-            case 7:  recipe.wbShiftB = 0; break;
-            case 8:  recipe.highlightTone = 0; break;
-            case 9:  recipe.shadowTone = 0; break;
-            case 10: recipe.color = 0; break;
-            case 11: recipe.sharpness = 0; break;
-            case 12: recipe.noiseReduction = 0; break;
-            case 13: recipe.clarity = 0; break;
-            case 14: recipe.loadFromSlot(getContext(), 0); break;
-            case 15: recipe.saveToSlot(getContext(), recipe.recipeSlotIndex); break;
-        }
-
-        refreshCachedValues();
-        invalidate();
-
-        if (listener != null) {
-            listener.onRecipeChanged(recipe);
-        }
-    }
-
-    private void adjustCurrentSetting(int delta) {
+    public void adjustCurrentSetting(int delta) {
         if (recipe == null) return;
 
         switch (selectedIndex) {
@@ -388,7 +422,39 @@ public class FujiQMenuView extends View {
         }
 
         refreshCachedValues();
-        invalidate();
+        updateTopStatus();
+        postInvalidate();
+
+        if (listener != null) {
+            listener.onRecipeChanged(recipe);
+        }
+    }
+
+    public void resetCurrentSetting() {
+        if (recipe == null) return;
+
+        switch (selectedIndex) {
+            case 0:  recipe.filmSim = FujiRecipe.FilmSim.PROVIA; break;
+            case 1:  recipe.dynamicRange = FujiRecipe.DynamicRange.DR100; break;
+            case 2:  recipe.grainEffect = FujiRecipe.EffectLevel.OFF; break;
+            case 3:  recipe.colorChrome = FujiRecipe.EffectLevel.OFF; break;
+            case 4:  recipe.colorChromeBlue = FujiRecipe.EffectLevel.OFF; break;
+            case 5:  recipe.whiteBalance = FujiRecipe.WhiteBalance.AUTO; break;
+            case 6:  recipe.wbShiftR = 0; break;
+            case 7:  recipe.wbShiftB = 0; break;
+            case 8:  recipe.highlightTone = 0; break;
+            case 9:  recipe.shadowTone = 0; break;
+            case 10: recipe.color = 0; break;
+            case 11: recipe.sharpness = 0; break;
+            case 12: recipe.noiseReduction = 0; break;
+            case 13: recipe.clarity = 0; break;
+            case 14: recipe.loadFromSlot(getContext(), 0); break;
+            case 15: recipe.saveToSlot(getContext(), recipe.recipeSlotIndex); break;
+        }
+
+        refreshCachedValues();
+        updateTopStatus();
+        postInvalidate();
 
         if (listener != null) {
             listener.onRecipeChanged(recipe);

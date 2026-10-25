@@ -4,15 +4,18 @@ import android.util.Log;
 import android.util.SparseArray;
 import android.view.KeyEvent;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 
 /**
  * Comprehensive key & dial decoding for Sony Alpha 7R II (ILCE-7RM2).
  *
  * Implements a Dual-Layer Key Resolver:
- *  - Layer 1: Dynamic reflection against com.sony.scalar.sysutil.ScalarInput for ISV_KEY_* and ISV_DIAL_*.
- *  - Layer 2: Fast lookup with static fallback constants (0x201..0x20E, scanCodes, Android keyCodes).
+ *  - Layer 1: Dynamic reflection against com.sony.scalar.sysutil.ScalarInput
+ *             scanning ALL ISV_KEY_* and ISV_DIAL_* fields.
+ *  - Layer 2: Fast lookup with static fallback constants (512..650, scanCodes, Android keyCodes).
  *
- * All public static final int constants are preserved for switch() compatibility.
+ * On Sony A7R II hardware, dials and buttons send events with keyCode == 0 and scanCode >= 512.
+ * Both keyCode and scanCode are resolved transparently.
  */
 public final class SonyKeyCodes {
     private static final String TAG = "SonyKeyCodes";
@@ -82,84 +85,91 @@ public final class SonyKeyCodes {
     // Dual-Layer Resolver Tables
     // ------------------------------------------------------------------------
     private static final SparseArray<FujiAction> sKeyCodeMap = new SparseArray<FujiAction>();
-    private static final SparseArray<FujiAction> sScanCodeMap = new SparseArray<FujiAction>();
 
     // On-screen debugger telemetry
-    public static volatile boolean sDebugKeyLoggingEnabled = false;
+    public static volatile boolean sDebugKeyLoggingEnabled = true; // Enabled by default for easy tuning on A7R II
     public static volatile int sLastKeyCode = 0;
     public static volatile int sLastScanCode = 0;
     public static volatile String sLastKeyName = "NONE";
 
     static {
-        // Step 1: Register standard fallbacks in Layer 2
         registerDefaultKeyCodes();
-
-        // Step 2: Layer 1 - Reflectively inspect ScalarInput if present on A7R II
         inspectScalarInput();
     }
 
     private static void registerDefaultKeyCodes() {
-        sKeyCodeMap.put(SONY_KEY_SHUTTER_HALF, FujiAction.HALF_SHUTTER);
-        sKeyCodeMap.put(SONY_KEY_SHUTTER,      FujiAction.FULL_SHUTTER);
-        sKeyCodeMap.put(ANDROID_CAMERA,        FujiAction.FULL_SHUTTER);
+        // Fallback registration for both 0x201..0x217 and direct numbers 513..535
+        sKeyCodeMap.put(0x201, FujiAction.HALF_SHUTTER);
+        sKeyCodeMap.put(0x202, FujiAction.FULL_SHUTTER);
+        sKeyCodeMap.put(0x203, FujiAction.FN);
+        sKeyCodeMap.put(0x204, FujiAction.PLAY);
+        sKeyCodeMap.put(0x205, FujiAction.FRONT_DIAL_CW);
+        sKeyCodeMap.put(0x206, FujiAction.FRONT_DIAL_CCW);
+        sKeyCodeMap.put(0x207, FujiAction.REAR_DIAL_CW);
+        sKeyCodeMap.put(0x208, FujiAction.REAR_DIAL_CCW);
+        sKeyCodeMap.put(0x209, FujiAction.WHEEL_CW);
+        sKeyCodeMap.put(0x20a, FujiAction.WHEEL_CCW);
+        sKeyCodeMap.put(0x20b, FujiAction.C1);
+        sKeyCodeMap.put(0x20c, FujiAction.C2);
+        sKeyCodeMap.put(0x20d, FujiAction.C4_TRASH);
+        sKeyCodeMap.put(0x20e, FujiAction.C4_TRASH);
+        sKeyCodeMap.put(0x20f, FujiAction.AEL);
+        sKeyCodeMap.put(0x210, FujiAction.AF_MF);
+        sKeyCodeMap.put(0x211, FujiAction.PLAY);
 
-        sKeyCodeMap.put(SONY_KEY_DIAL1_CW,     FujiAction.FRONT_DIAL_CW);
-        sKeyCodeMap.put(SONY_KEY_DIAL1_CCW,    FujiAction.FRONT_DIAL_CCW);
-        sKeyCodeMap.put(SONY_KEY_DIAL2_CW,     FujiAction.REAR_DIAL_CW);
-        sKeyCodeMap.put(SONY_KEY_DIAL2_CCW,    FujiAction.REAR_DIAL_CCW);
-        sKeyCodeMap.put(SONY_KEY_DIAL3_CW,     FujiAction.WHEEL_CW);
-        sKeyCodeMap.put(SONY_KEY_DIAL3_CCW,    FujiAction.WHEEL_CCW);
+        // Also map standard Sony decimal ranges:
+        sKeyCodeMap.put(513, FujiAction.HALF_SHUTTER);
+        sKeyCodeMap.put(514, FujiAction.FULL_SHUTTER);
+        sKeyCodeMap.put(515, FujiAction.FN);
+        sKeyCodeMap.put(516, FujiAction.PLAY);
+        sKeyCodeMap.put(517, FujiAction.FRONT_DIAL_CW);
+        sKeyCodeMap.put(518, FujiAction.FRONT_DIAL_CCW);
+        sKeyCodeMap.put(519, FujiAction.REAR_DIAL_CW);
+        sKeyCodeMap.put(520, FujiAction.REAR_DIAL_CCW);
+        sKeyCodeMap.put(521, FujiAction.WHEEL_CW);
+        sKeyCodeMap.put(522, FujiAction.WHEEL_CCW);
+        sKeyCodeMap.put(523, FujiAction.C1);
+        sKeyCodeMap.put(524, FujiAction.C2);
+        sKeyCodeMap.put(525, FujiAction.C3);
+        sKeyCodeMap.put(526, FujiAction.C4_TRASH);
+        sKeyCodeMap.put(527, FujiAction.AEL);
+        sKeyCodeMap.put(528, FujiAction.AF_MF);
 
-        sKeyCodeMap.put(ANDROID_DPAD_UP,       FujiAction.DPAD_UP);
-        sKeyCodeMap.put(ANDROID_DPAD_DOWN,     FujiAction.DPAD_DOWN);
-        sKeyCodeMap.put(ANDROID_DPAD_LEFT,     FujiAction.DPAD_LEFT);
-        sKeyCodeMap.put(ANDROID_DPAD_RIGHT,    FujiAction.DPAD_RIGHT);
-        sKeyCodeMap.put(ANDROID_ENTER,         FujiAction.CENTER);
-
-        sKeyCodeMap.put(SONY_KEY_C3_TRASH,     FujiAction.C4_TRASH);
-        sKeyCodeMap.put(SONY_KEY_C4,           FujiAction.C4_TRASH);
-        sKeyCodeMap.put(ANDROID_DEL,           FujiAction.C4_TRASH);
-        sKeyCodeMap.put(ANDROID_CLEAR,         FujiAction.C4_TRASH);
-
-        sKeyCodeMap.put(SONY_KEY_FN,           FujiAction.FN);
-        sKeyCodeMap.put(SONY_KEY_C1,           FujiAction.C1);
-        sKeyCodeMap.put(SONY_KEY_C2,           FujiAction.C2);
-        sKeyCodeMap.put(SONY_KEY_AEL,          FujiAction.AEL);
-        sKeyCodeMap.put(SONY_KEY_AF_MF,        FujiAction.AF_MF);
-        sKeyCodeMap.put(SONY_KEY_PLAY,         FujiAction.PLAY);
-        sKeyCodeMap.put(ANDROID_MENU,          FujiAction.MENU);
+        // Android standard key codes
+        sKeyCodeMap.put(KeyEvent.KEYCODE_CAMERA,        FujiAction.FULL_SHUTTER);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_DPAD_UP,       FujiAction.DPAD_UP);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_DPAD_DOWN,     FujiAction.DPAD_DOWN);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_DPAD_LEFT,     FujiAction.DPAD_LEFT);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_DPAD_RIGHT,    FujiAction.DPAD_RIGHT);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_DPAD_CENTER,   FujiAction.CENTER);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_ENTER,         FujiAction.CENTER);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_DEL,           FujiAction.C4_TRASH);
+        sKeyCodeMap.put(28,                             FujiAction.C4_TRASH); // KEYCODE_CLEAR
+        sKeyCodeMap.put(KeyEvent.KEYCODE_MENU,          FujiAction.MENU);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_PAGE_UP,       FujiAction.REAR_DIAL_CW);
+        sKeyCodeMap.put(KeyEvent.KEYCODE_PAGE_DOWN,     FujiAction.REAR_DIAL_CCW);
     }
 
     private static void inspectScalarInput() {
         try {
             Class<?> scalarClass = Class.forName("com.sony.scalar.sysutil.ScalarInput");
-            Log.i(TAG, "ScalarInput found; resolving hardware keycodes via reflection...");
+            Log.i(TAG, "ScalarInput found; reflecting all hardware key & dial fields...");
 
-            mapScalarField(scalarClass, "ISV_KEY_S1_1",             FujiAction.HALF_SHUTTER);
-            mapScalarField(scalarClass, "ISV_KEY_S2",               FujiAction.FULL_SHUTTER);
-            mapScalarField(scalarClass, "ISV_KEY_FN",               FujiAction.FN);
-            mapScalarField(scalarClass, "ISV_KEY_PLAY",             FujiAction.PLAY);
-            mapScalarField(scalarClass, "ISV_KEY_DELETE",           FujiAction.C4_TRASH);
-            mapScalarField(scalarClass, "ISV_KEY_CUSTOM1",          FujiAction.C1);
-            mapScalarField(scalarClass, "ISV_KEY_CUSTOM2",          FujiAction.C2);
-            mapScalarField(scalarClass, "ISV_KEY_CUSTOM3",          FujiAction.C3);
-            mapScalarField(scalarClass, "ISV_KEY_AEL",              FujiAction.AEL);
-            mapScalarField(scalarClass, "ISV_KEY_STAMINA",          FujiAction.AF_MF);
-            mapScalarField(scalarClass, "ISV_KEY_MENU",             FujiAction.MENU);
-            mapScalarField(scalarClass, "ISV_KEY_ENTER",            FujiAction.CENTER);
-            mapScalarField(scalarClass, "ISV_KEY_UP",               FujiAction.DPAD_UP);
-            mapScalarField(scalarClass, "ISV_KEY_DOWN",             FujiAction.DPAD_DOWN);
-            mapScalarField(scalarClass, "ISV_KEY_LEFT",             FujiAction.DPAD_LEFT);
-            mapScalarField(scalarClass, "ISV_KEY_RIGHT",            FujiAction.DPAD_RIGHT);
+            Field[] fields = scalarClass.getFields();
+            for (Field field : fields) {
+                if (!Modifier.isStatic(field.getModifiers()) || field.getType() != int.class) {
+                    continue;
+                }
+                String name = field.getName();
+                int code = field.getInt(null);
+                if (code <= 0) continue;
 
-            // Dial rotations
-            mapScalarField(scalarClass, "ISV_DIAL_1_CLOCKWISE",        FujiAction.FRONT_DIAL_CW);
-            mapScalarField(scalarClass, "ISV_DIAL_1_COUNTERCLOCKWISE", FujiAction.FRONT_DIAL_CCW);
-            mapScalarField(scalarClass, "ISV_DIAL_2_CLOCKWISE",        FujiAction.REAR_DIAL_CW);
-            mapScalarField(scalarClass, "ISV_DIAL_2_COUNTERCLOCKWISE", FujiAction.REAR_DIAL_CCW);
-            mapScalarField(scalarClass, "ISV_DIAL_3_CLOCKWISE",        FujiAction.WHEEL_CW);
-            mapScalarField(scalarClass, "ISV_DIAL_3_COUNTERCLOCKWISE", FujiAction.WHEEL_CCW);
-
+                FujiAction action = matchFieldToAction(name);
+                if (action != null) {
+                    sKeyCodeMap.put(code, action);
+                    Log.d(TAG, "Reflected ScalarInput." + name + " = " + code + " -> " + action);
+                }
+            }
         } catch (ClassNotFoundException e) {
             Log.d(TAG, "ScalarInput not present (running on host or emulator); using fallback table.");
         } catch (Throwable t) {
@@ -167,46 +177,76 @@ public final class SonyKeyCodes {
         }
     }
 
-    private static void mapScalarField(Class<?> cls, String fieldName, FujiAction action) {
-        try {
-            Field field = cls.getField(fieldName);
-            int code = field.getInt(null);
-            if (code > 0) {
-                sKeyCodeMap.put(code, action);
-                Log.d(TAG, "Mapped ScalarInput." + fieldName + " (" + code + ") -> " + action);
-            }
-        } catch (NoSuchFieldException ignored) {
-        } catch (Throwable t) {
-            Log.w(TAG, "Could not map field " + fieldName, t);
+    private static FujiAction matchFieldToAction(String name) {
+        String u = name.toUpperCase();
+        if (u.contains("S1_1") || u.contains("S1_2") || u.contains("HALF")) return FujiAction.HALF_SHUTTER;
+        if (u.contains("S2") || u.contains("SHUTTER")) return FujiAction.FULL_SHUTTER;
+        if (u.contains("FN")) return FujiAction.FN;
+        if (u.contains("PLAY")) return FujiAction.PLAY;
+        if (u.contains("DELETE") || u.contains("TRASH")) return FujiAction.C4_TRASH;
+        if (u.contains("CUSTOM1") || u.endsWith("_C1")) return FujiAction.C1;
+        if (u.contains("CUSTOM2") || u.endsWith("_C2")) return FujiAction.C2;
+        if (u.contains("CUSTOM3") || u.endsWith("_C3")) return FujiAction.C3;
+        if (u.contains("CUSTOM4") || u.endsWith("_C4")) return FujiAction.C4_TRASH;
+        if (u.contains("AEL")) return FujiAction.AEL;
+        if (u.contains("STAMINA") || u.contains("AF_MF")) return FujiAction.AF_MF;
+        if (u.contains("MENU")) return FujiAction.MENU;
+        if (u.contains("ENTER") || u.contains("CENTER")) return FujiAction.CENTER;
+        if (u.contains("UP")) return FujiAction.DPAD_UP;
+        if (u.contains("DOWN")) return FujiAction.DPAD_DOWN;
+        if (u.contains("LEFT")) return FujiAction.DPAD_LEFT;
+        if (u.contains("RIGHT")) return FujiAction.DPAD_RIGHT;
+
+        // Dials
+        if (u.contains("DIAL_1") || u.contains("DIAL1")) {
+            return (u.contains("COUNTER") || u.contains("CCW")) ? FujiAction.FRONT_DIAL_CCW : FujiAction.FRONT_DIAL_CW;
         }
+        if (u.contains("DIAL_2") || u.contains("DIAL2")) {
+            return (u.contains("COUNTER") || u.contains("CCW")) ? FujiAction.REAR_DIAL_CCW : FujiAction.REAR_DIAL_CW;
+        }
+        if (u.contains("DIAL_3") || u.contains("DIAL3") || u.contains("WHEEL")) {
+            return (u.contains("COUNTER") || u.contains("CCW")) ? FujiAction.WHEEL_CCW : FujiAction.WHEEL_CW;
+        }
+
+        return null;
     }
 
     /**
      * Resolves an incoming KeyEvent using the Dual-Layer Key Resolver.
-     * Checks keyCode first, then scanCode, with full debug telemetry tracking.
+     * On Sony A7R II, if scanCode >= 512 or keyCode == 0, prioritize scanCode!
      */
-    public static FujiAction resolveAction(int keyCode, KeyEvent event) {
-        sLastKeyCode = keyCode;
-        int scanCode = (event != null) ? event.getScanCode() : 0;
-        sLastScanCode = scanCode;
+    public static FujiAction resolveAction(int rawCode, KeyEvent event) {
+        int scan = (event != null) ? event.getScanCode() : 0;
+        int key = (event != null) ? event.getKeyCode() : 0;
+        sLastKeyCode = key;
+        sLastScanCode = scan;
 
-        // Layer 1: Direct keyCode check
-        FujiAction action = sKeyCodeMap.get(keyCode);
+        // Choose effective code: On Sony A7R II, physical dials and buttons have scanCode >= 512 or key == 0
+        int effective = (scan >= 512 || key == 0) ? (scan > 0 ? scan : rawCode) : ((rawCode > 0) ? rawCode : key);
+
+        FujiAction action = sKeyCodeMap.get(effective);
         if (action != null) {
             sLastKeyName = action.name();
             return action;
         }
 
-        // Layer 2: ScanCode fallback
-        if (scanCode > 0) {
-            action = sScanCodeMap.get(scanCode);
+        if (scan > 0) {
+            action = sKeyCodeMap.get(scan);
             if (action != null) {
                 sLastKeyName = action.name();
                 return action;
             }
         }
 
-        sLastKeyName = "UNKNOWN(" + keyCode + "/" + scanCode + ")";
+        if (key > 0) {
+            action = sKeyCodeMap.get(key);
+            if (action != null) {
+                sLastKeyName = action.name();
+                return action;
+            }
+        }
+
+        sLastKeyName = "UNKNOWN(" + rawCode + "/s:" + scan + "/k:" + key + ")";
         return FujiAction.UNKNOWN;
     }
 
