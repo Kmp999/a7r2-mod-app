@@ -18,12 +18,16 @@ import java.util.concurrent.Executors;
 public class CaptureController {
     private static final String TAG = "CaptureController";
 
-    // Highest-resolution color grading we can perform safely inside the camera's
-    // Dalvik heap (~32-64 MB). Peak working set is roughly pixels * 4 bytes
-    // (RGB_565 bitmap + RGB_565 short[]). 8 MP keeps us well under the limit
-    // while staying far above the old 720p proxy. 42 MP cannot fit in-heap and
-    // is downscaled to this budget automatically.
-    private static final int MAX_GRADE_PIXELS = 8 * 1024 * 1024;
+    // When true, use the JNI engine (fastest, enables larger resolution). This is
+    // opt-in: a failed native dlopen can abort the whole process on Sony PMCA, so
+    // we default to the pure-Java engine which cannot crash the camera app.
+    private static final boolean USE_NATIVE_ENGINE = false;
+
+    // Heap-safe pixel budget. Peak working set is roughly pixels * 4 bytes
+    // (RGB_565 bitmap + RGB_565 short[]). Pure-Java grading is per-pixel, so a
+    // 4 MP budget keeps the turnaround low while staying far above 720p. 42 MP
+    // cannot fit in the Dalvik heap and is downscaled to this budget.
+    private static final int MAX_GRADE_PIXELS = USE_NATIVE_ENGINE ? (8 * 1024 * 1024) : (4 * 1024 * 1024);
 
     private static final String OUTPUT_DIR = "/sdcard/DCIM/100MSDCF/";
 
@@ -31,6 +35,8 @@ public class CaptureController {
     private final UIController uiController;
     private final AppState appState;
     private final ExecutorService processingExecutor;
+    private final JavaColorEngine javaEngine = new JavaColorEngine();
+    private boolean engineInitAttempted = false;
 
     public CaptureController(CameraAdapter adapter, UIController uiController, AppState state) {
         this.cameraAdapter = adapter;
@@ -89,18 +95,30 @@ public class CaptureController {
             int w = bitmap.getWidth();
             int h = bitmap.getHeight();
 
-            // 3. Color grade via the native engine (one short per RGB_565 pixel).
+            // 3. Color grade (one short per RGB_565 pixel). The pure-Java engine
+            //    is the default and has no native dependency, so grading can never
+            //    crash the camera app. The JNI engine is opt-in only.
             boolean graded = false;
-            if (ColorEngine.isNativeAvailable()) {
-                short[] pixels = new short[w * h];
-                ShortBuffer buffer = ShortBuffer.wrap(pixels);
-                bitmap.copyPixelsToBuffer(buffer);
-                graded = ColorEngine.processRGB565Safe(pixels, w, h);
-                if (graded) {
-                    buffer.rewind();
-                    bitmap.copyPixelsFromBuffer(buffer);
+            short[] pixels = new short[w * h];
+            ShortBuffer buffer = ShortBuffer.wrap(pixels);
+            bitmap.copyPixelsToBuffer(buffer);
+
+            if (USE_NATIVE_ENGINE) {
+                if (!engineInitAttempted) {
+                    engineInitAttempted = true;
+                    ColorEngine.initEngineSafe(appState.getCurrentPresetId(), ColorEngine.MODE_SAFE_FASTEST);
                 }
+                graded = ColorEngine.isNativeAvailable()
+                    && ColorEngine.processRGB565Safe(pixels, w, h);
             }
+            if (!graded) {
+                javaEngine.init(appState.getCurrentPresetId());
+                javaEngine.processRGB565(pixels, w, h);
+                graded = true;
+            }
+
+            buffer.rewind();
+            bitmap.copyPixelsFromBuffer(buffer);
 
             // 4. Re-encode and save to the SD card.
             boolean saved = saveJpeg(bitmap);

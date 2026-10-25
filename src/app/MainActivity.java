@@ -59,7 +59,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         captureBtn.setText("CAPTURE");
 
         statusText = new TextView(this);
-        statusText.setText("Mode: Proxy 720p | Preset: Provia");
+        statusText.setText("Fuji Lite ready - tap CAPTURE");
         statusText.setTextColor(Color.WHITE);
         statusText.setPadding(20, 20, 20, 20);
 
@@ -89,12 +89,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         uiController = new UIController(statusText);
         captureController = new CaptureController(cameraAdapter, uiController, appState);
 
-        // Initialize Native Color Engine with Provia preset (non-fatal if the
-        // native library is missing or incompatible).
-        ColorEngine.initEngineSafe(appState.getCurrentPresetId(), ColorEngine.MODE_SAFE_FASTEST);
-        if (!ColorEngine.isNativeAvailable() && statusText != null) {
-            statusText.setText("Native engine unavailable - passthrough mode");
-        }
+        // IMPORTANT: do not touch the native color engine here. Referencing
+        // ColorEngine runs its static initializer (System.loadLibrary), and on
+        // Sony PMCA cameras a failed dlopen aborts the process (SIGABRT) rather
+        // than throwing a catchable UnsatisfiedLinkError - which bounces the app
+        // straight back to the menu with a single vibration. The native library
+        // is loaded lazily on the first capture instead (see CaptureController).
 
         // Bind SurfaceHolder for camera preview
         cameraPreview.getHolder().addCallback(this);
