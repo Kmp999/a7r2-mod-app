@@ -84,11 +84,8 @@ jobs:
 
       - name: Sign APK (Strict v1 JAR Signing for Sony PMCA)
         run: |
-          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey \
-            -keypass android -keyalg RSA -keysize 1024 -sigalg SHA1withRSA -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
           jarsigner -sigalg SHA1withRSA -digestalg SHA1 \
-            -keystore debug.keystore -storepass android -keypass android \
+            -keystore build/debug.keystore -storepass android -keypass android \
             bin/fuji-lite-a7r2-aligned.apk androiddebugkey
           cp bin/fuji-lite-a7r2-aligned.apk fuji-lite-a7r2.apk
 
