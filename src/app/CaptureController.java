@@ -2,7 +2,11 @@ package com.fujilite.a7r2;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
 import android.hardware.Camera;
+import android.os.Environment;
 import android.util.Log;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -43,6 +47,17 @@ public class CaptureController {
         this.uiController = uiController;
         this.appState = state;
         this.processingExecutor = Executors.newSingleThreadExecutor();
+    }
+
+    /** Delivers the graded bitmap to the UI; the UI owns and recycles it. */
+    public interface ResultListener {
+        void onResult(Bitmap graded, String info);
+    }
+
+    private volatile ResultListener resultListener;
+
+    public void setResultListener(ResultListener l) {
+        this.resultListener = l;
     }
 
     public void triggerCapture() {
@@ -120,15 +135,12 @@ public class CaptureController {
             buffer.rewind();
             bitmap.copyPixelsFromBuffer(buffer);
 
-            // 4. Re-encode and save to the SD card.
-            boolean saved = saveJpeg(bitmap);
-            bitmap.recycle();
-
+            // 4. Resume live view immediately, then save and show the result.
+            cameraAdapter.resumePreview();
+            String savedPath = saveJpeg(bitmap);
             long duration = System.currentTimeMillis() - start;
             appState.setLastProcessingTimeMs(duration);
-            String tag = graded ? "Graded" : "Saved (passthrough)";
-            uiController.updateStatusAsync(tag + " " + w + "x" + h
-                + (saved ? " in " + duration + " ms" : " (write failed)"));
+            deliverResult(bitmap, appState.getCurrentPresetName(), w, h, duration, savedPath);
         } catch (Throwable t) {
             Log.e(TAG, "Error processing capture", t);
             appState.setLastErrorMessage(String.valueOf(t.getMessage()));
@@ -136,6 +148,76 @@ public class CaptureController {
         } finally {
             appState.setProcessing(false);
         }
+    }
+
+    private void deliverResult(Bitmap bitmap, String preset, int w, int h, long ms, String savedPath) {
+        uiController.updateStatusAsync(preset + "  " + w + "x" + h + "  " + ms + " ms"
+            + (savedPath == null ? "  SAVE FAILED" : ""));
+        ResultListener l = resultListener;
+        if (l != null) {
+            String where = savedPath != null ? ("Saved: " + savedPath) : "Save failed - check SD card";
+            l.onResult(bitmap, preset + "   " + w + "x" + h + "   " + ms + " ms\n" + where);
+        } else {
+            bitmap.recycle();
+        }
+    }
+
+    /**
+     * Renders a synthetic test chart and grades it with the selected preset.
+     * Lets the look be verified on-device even when the camera is unavailable.
+     */
+    public void runDemo() {
+        if (appState.isProcessing()) return;
+        appState.setProcessing(true);
+        uiController.updateStatusAsync("Rendering demo...");
+        processingExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                final long start = System.currentTimeMillis();
+                try {
+                    Bitmap bitmap = makeTestImage(1280, 720);
+                    int w = bitmap.getWidth();
+                    int h = bitmap.getHeight();
+                    short[] pixels = new short[w * h];
+                    ShortBuffer buffer = ShortBuffer.wrap(pixels);
+                    bitmap.copyPixelsToBuffer(buffer);
+                    javaEngine.init(appState.getCurrentPresetId());
+                    javaEngine.processRGB565(pixels, w, h);
+                    buffer.rewind();
+                    bitmap.copyPixelsFromBuffer(buffer);
+                    String savedPath = saveJpeg(bitmap);
+                    long duration = System.currentTimeMillis() - start;
+                    deliverResult(bitmap, appState.getCurrentPresetName() + " (demo)", w, h, duration, savedPath);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Demo failed", t);
+                    uiController.updateStatusAsync("Demo error: " + t.getClass().getSimpleName());
+                } finally {
+                    appState.setProcessing(false);
+                }
+            }
+        });
+    }
+
+    private Bitmap makeTestImage(int w, int h) {
+        Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
+        Canvas c = new Canvas(bmp);
+        Paint p = new Paint();
+        int[] bars = {
+            Color.rgb(255, 255, 255), Color.rgb(255, 0, 0), Color.rgb(0, 255, 0),
+            Color.rgb(0, 0, 255), Color.rgb(255, 255, 0), Color.rgb(0, 255, 255),
+            Color.rgb(255, 0, 255), Color.rgb(128, 128, 128)
+        };
+        int bw = w / bars.length;
+        for (int i = 0; i < bars.length; i++) {
+            p.setColor(bars[i]);
+            c.drawRect(i * bw, 0, (i + 1) * bw, h / 2, p);
+        }
+        for (int x = 0; x < w; x++) {
+            int v = (int) (255L * x / w);
+            p.setColor(Color.rgb(v, v, v));
+            c.drawRect(x, h / 2, x + 1, h, p);
+        }
+        return bmp;
     }
 
     /** Largest power-of-two sample size that keeps the decoded pixel count within budget. */
@@ -147,27 +229,36 @@ public class CaptureController {
         return sample;
     }
 
-    private boolean saveJpeg(Bitmap bitmap) {
-        FileOutputStream out = null;
-        try {
-            File dir = new File(OUTPUT_DIR);
-            if (!dir.exists()) {
-                dir.mkdirs();
-            }
-            File file = new File(dir, "FUJI_" + System.currentTimeMillis() + ".JPG");
-            out = new FileOutputStream(file);
-            return bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out);
-        } catch (Throwable t) {
-            Log.e(TAG, "Failed to write output JPEG", t);
-            return false;
-        } finally {
-            if (out != null) {
-                try {
-                    out.close();
-                } catch (Throwable ignored) {
+    /** Saves the graded JPEG, trying several SD-card locations. Returns the path or null. */
+    private String saveJpeg(Bitmap bitmap) {
+        String name = "FUJI_" + System.currentTimeMillis() + ".JPG";
+        String ext = Environment.getExternalStorageDirectory() + "/DCIM/100MSDCF/";
+        String[] dirs = { OUTPUT_DIR, ext, "/sdcard/DCIM/", "/storage/sdcard1/DCIM/100MSDCF/" };
+        for (String d : dirs) {
+            FileOutputStream out = null;
+            try {
+                File dir = new File(d);
+                if (!dir.exists()) {
+                    dir.mkdirs();
+                }
+                File file = new File(dir, name);
+                out = new FileOutputStream(file);
+                if (bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
+                    out.flush();
+                    return file.getAbsolutePath();
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "Save failed in " + d, t);
+            } finally {
+                if (out != null) {
+                    try {
+                        out.close();
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
         }
+        return null;
     }
 
     public void shutdown() {

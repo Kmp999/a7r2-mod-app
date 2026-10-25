@@ -8,7 +8,12 @@ public class AppState {
         ASYNC_FULLRES
     }
 
-    private int currentPresetId = ColorEngine.PRESET_PROVIA_LIKE;
+    // Preset ids line up with ColorEngine / JavaColorEngine preset order.
+    public static final String[] PRESET_NAMES = {
+        "Provia", "Astia", "Velvia", "Classic Neg", "Eterna"
+    };
+
+    private int currentPresetId = 0;
     private Mode currentMode = Mode.JPEG_PROXY;
     private boolean isProcessing = false;
     private long lastProcessingTimeMs = 0;
@@ -16,6 +21,18 @@ public class AppState {
 
     public int getCurrentPresetId() { return currentPresetId; }
     public void setCurrentPresetId(int id) { this.currentPresetId = id; }
+
+    public String getCurrentPresetName() {
+        int id = currentPresetId;
+        if (id < 0 || id >= PRESET_NAMES.length) id = 0;
+        return PRESET_NAMES[id];
+    }
+
+    /** Advances to the next film look and returns its new id. */
+    public int cycleNextPreset() {
+        currentPresetId = (currentPresetId + 1) % PRESET_NAMES.length;
+        return currentPresetId;
+    }
 
     public Mode getCurrentMode() { return currentMode; }
     public void setCurrentMode(Mode mode) { this.currentMode = mode; }

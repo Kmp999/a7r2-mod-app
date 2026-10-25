@@ -2,53 +2,106 @@ package com.fujilite.a7r2;
 
 import android.hardware.Camera;
 import android.util.Log;
+import android.view.SurfaceHolder;
+
+import java.lang.reflect.Method;
 
 /**
- * Adapter that safely attempts to use com.sony.scalar extensions,
- * falling back to standard Android Camera API.
+ * Camera adapter for Sony PMCA bodies (A7R II).
+ *
+ * The standard android.hardware.Camera.open() does NOT drive the A7-series
+ * imaging sensor - it yields a black preview and no capture. The proven path
+ * (see ma1co PMCADemo) is Sony's com.sony.scalar.hardware.CameraEx:
+ *
+ *     CameraEx cam = CameraEx.open(0, null);
+ *     Camera normal = cam.getNormalCamera();   // a real android.hardware.Camera
+ *     normal.setPreviewDisplay(holder); normal.startPreview();
+ *     normal.takePicture(null, null, jpegCallback);
+ *
+ * CameraEx is not in android.jar, and this project builds with raw javac/dx (no
+ * compileOnly stubs), so we reach it through reflection and fall back to the
+ * standard Camera API when the Sony class is unavailable (e.g. host testing).
  */
 public class SonyPmcaAdapter implements CameraAdapter {
     private static final String TAG = "SonyPmcaAdapter";
-    private Camera mCamera;
+    private static final String CAMERA_EX_CLASS = "com.sony.scalar.hardware.CameraEx";
+
+    private Object cameraEx;          // com.sony.scalar.hardware.CameraEx (via reflection)
+    private Camera normalCamera;      // android.hardware.Camera actually used
+    private String activePath = "none";
 
     public SonyPmcaAdapter() {
-        // Do NOT open the camera in the constructor. On the A7R II the Sony
-        // firmware owns the sensor and a synchronous Camera.open() during
-        // onCreate can abort natively (uncaught by catch(Exception)) and bounce
-        // the app back to the menu. Open lazily and defensively instead.
+        // Opened lazily; never during onCreate.
     }
 
-    /** Opens the hardware camera on demand; never throws. */
+    /** Returns which camera backend is live: "CameraEx", "Camera", or "none". */
+    public String getActivePath() {
+        return activePath;
+    }
+
     private boolean ensureOpen() {
-        if (mCamera != null) return true;
+        if (normalCamera != null) return true;
+
+        // 1) Preferred: Sony CameraEx (the only backend that drives the A7R II sensor).
         try {
-            mCamera = Camera.open();
+            Class<?> cls = Class.forName(CAMERA_EX_CLASS);
+            Method openM = null;
+            for (Method m : cls.getMethods()) {
+                if ("open".equals(m.getName()) && m.getParameterTypes().length == 2) {
+                    openM = m;
+                    break;
+                }
+            }
+            if (openM != null) {
+                cameraEx = openM.invoke(null, 0, null);
+                Object nc = cls.getMethod("getNormalCamera").invoke(cameraEx);
+                if (nc instanceof Camera) {
+                    normalCamera = (Camera) nc;
+                    activePath = "CameraEx";
+                    return true;
+                }
+                Log.e(TAG, "getNormalCamera() returned " + (nc == null ? "null" : nc.getClass().getName()));
+                releaseCameraEx();
+            }
+        } catch (ClassNotFoundException e) {
+            Log.i(TAG, "CameraEx not present; falling back to standard Camera");
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to open camera", t);
-            mCamera = null;
+            Log.e(TAG, "CameraEx open failed; falling back to standard Camera", t);
+            releaseCameraEx();
         }
-        return mCamera != null;
+
+        // 2) Fallback: standard Camera (works on host/mock, limited on A7R II).
+        try {
+            normalCamera = Camera.open();
+            activePath = normalCamera != null ? "Camera" : "none";
+            return normalCamera != null;
+        } catch (Throwable t) {
+            Log.e(TAG, "Standard Camera.open() failed", t);
+            normalCamera = null;
+            activePath = "none";
+            return false;
+        }
     }
 
     @Override
     public void startPreview(Camera.PreviewCallback callback) {
         if (!ensureOpen()) return;
         try {
-            mCamera.setPreviewCallback(callback);
-            mCamera.startPreview();
+            normalCamera.setPreviewCallback(callback);
+            normalCamera.startPreview();
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to start preview callback", t);
+            Log.e(TAG, "startPreview(callback) failed", t);
         }
     }
 
     @Override
-    public void startPreview(android.view.SurfaceHolder holder) {
+    public void startPreview(SurfaceHolder holder) {
         if (!ensureOpen()) return;
         try {
-            mCamera.setPreviewDisplay(holder);
-            mCamera.startPreview();
+            normalCamera.setPreviewDisplay(holder);
+            normalCamera.startPreview();
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to start preview on SurfaceHolder", t);
+            Log.e(TAG, "startPreview(holder) failed", t);
         }
     }
 
@@ -56,29 +109,52 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public void takePicture(Camera.PictureCallback jpegCallback) {
         if (!ensureOpen()) return;
         try {
-            // Null for Shutter and RAW/Postview callbacks to maximize speed
-            mCamera.takePicture(null, null, jpegCallback);
+            // Null shutter/raw callbacks for speed; jpeg callback delivers full-res bytes.
+            normalCamera.takePicture(null, null, jpegCallback);
         } catch (Throwable t) {
             Log.e(TAG, "takePicture failed", t);
         }
     }
 
     @Override
-    public void release() {
-        if (mCamera != null) {
+    public void resumePreview() {
+        if (normalCamera == null) return;
+        try {
+            normalCamera.startPreview();
+        } catch (Throwable t) {
+            Log.e(TAG, "resumePreview failed", t);
+        }
+    }
+
+    private void releaseCameraEx() {
+        if (cameraEx != null) {
             try {
-                mCamera.setPreviewCallback(null);
-                mCamera.release();
+                cameraEx.getClass().getMethod("release").invoke(cameraEx);
             } catch (Throwable t) {
-                Log.e(TAG, "Failed to release camera", t);
+                Log.e(TAG, "CameraEx.release failed", t);
             }
-            mCamera = null;
+            cameraEx = null;
         }
     }
 
     @Override
+    public void release() {
+        if (normalCamera != null) {
+            try {
+                normalCamera.setPreviewCallback(null);
+                normalCamera.release();
+            } catch (Throwable t) {
+                Log.e(TAG, "Camera release failed", t);
+            }
+            normalCamera = null;
+        }
+        releaseCameraEx();
+        activePath = "none";
+    }
+
+    @Override
     public boolean supportsInternalColorPipeline() {
-        // TODO(SONY_SDK): Return true if CameraEx.ParametersModifier is detected and usable.
+        // TODO(SONY_SDK): Detect CameraEx.ParametersModifier for picture-profile control.
         return false;
     }
 }
