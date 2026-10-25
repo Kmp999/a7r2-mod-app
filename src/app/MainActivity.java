@@ -145,6 +145,91 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         appState = new AppState();
         cameraAdapter = new SonyPmcaAdapter();
         uiController = new UIController(statusText);
+        uiController.setCameraAdapter(cameraAdapter);
+        uiController.setControllerCallback(new UIController.ControllerCallback() {
+            @Override
+            public void onTriggerCapture() {
+                if (captureController != null) captureController.triggerCapture();
+            }
+
+            @Override
+            public void onToggleQMenu() {
+                if (qMenuView != null && qMenuView.getVisibility() == View.VISIBLE) {
+                    hideQMenu();
+                } else {
+                    showQMenu();
+                }
+            }
+
+            @Override
+            public boolean isQMenuOpen() {
+                return qMenuView != null && qMenuView.getVisibility() == View.VISIBLE;
+            }
+
+            @Override
+            public void onCycleFilmSim(int direction) {
+                cycleLook(direction);
+            }
+
+            @Override
+            public void onCycleDynamicRange() {
+                FujiRecipe r = appState.getActiveRecipe();
+                int next = (r.dynamicRange.ordinal() + 1) % FujiRecipe.DynamicRange.values().length;
+                r.dynamicRange = FujiRecipe.DynamicRange.values()[next];
+                onRecipeUpdated(r);
+            }
+
+            @Override
+            public void onCycleRecipeSlot() {
+                FujiRecipe r = appState.getActiveRecipe();
+                int next = (r.recipeSlotIndex + 1) % FujiRecipe.SLOT_COUNT;
+                r.loadFromSlot(MainActivity.this, next);
+                onRecipeUpdated(r);
+            }
+
+            @Override
+            public void onToggleAel() {
+                if (cameraAdapter != null) {
+                    cameraAdapter.setAutoExposureLock(!cameraAdapter.isAutoExposureLock());
+                }
+                uiController.updateBottomHud();
+            }
+
+            @Override
+            public void onToggleAfMode() {
+                if (cameraAdapter != null) {
+                    cameraAdapter.toggleAfMode();
+                }
+                uiController.updateBottomHud();
+            }
+
+            @Override
+            public void onToggleLiveViewLut() {
+                uiController.updateStatusAsync("LUT Preview Toggled");
+            }
+
+            @Override
+            public void onToggleQuickReview() {
+                if (lastResult != null && resultView.getVisibility() == View.VISIBLE) {
+                    hideResult();
+                } else if (lastResult != null) {
+                    resultView.setVisibility(View.VISIBLE);
+                }
+            }
+
+            @Override
+            public void onResetParameter() {
+                if (cameraAdapter != null) {
+                    cameraAdapter.incrementEV(0);
+                }
+                uiController.updateBottomHud();
+            }
+
+            @Override
+            public void onExitApp() {
+                finish();
+            }
+        });
         captureController = new CaptureController(cameraAdapter, uiController, appState);
 
         // Load saved recipe slot 0 (C1)
@@ -247,12 +332,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return true;
         }
 
+        // Anti-repeat check for shutter to prevent infinite capture loop
+        if (event.getRepeatCount() > 0) {
+            if (keyCode == SonyKeyCodes.SONY_KEY_SHUTTER || keyCode == SonyKeyCodes.SONY_KEY_SHUTTER_HALF) {
+                return true;
+            }
+        }
+
+        // Delegate to UIController's dual-layer resolver first
+        if (uiController != null && uiController.handleKeyDown(keyCode, event)) {
+            return true;
+        }
+
         // If Q-Menu is open, delegate all hardware keys to Q-Menu
         if (qMenuView != null && qMenuView.getVisibility() == View.VISIBLE) {
             return qMenuView.onKeyDown(keyCode, event);
         }
 
-        // When Q-Menu is hidden:
+        // Fallback when Q-Menu is hidden:
         switch (keyCode) {
             // Open Q-Menu: Trash / C3 / Fn / Menu
             case SonyKeyCodes.SONY_KEY_C3_TRASH:
@@ -286,6 +383,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         return super.onKeyDown(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (uiController != null && uiController.handleKeyUp(keyCode, event)) {
+            return true;
+        }
+        return super.onKeyUp(keyCode, event);
     }
 
     private void cycleLook(int delta) {

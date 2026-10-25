@@ -217,22 +217,29 @@ public class FujiQMenuView extends View {
                 invalidate();
                 return true;
 
-            // Rear Dial / Control Wheel: Instant Value Adjustment
+            // Front Dial: Fast 2-step adjustment
+            case SonyKeyCodes.SONY_KEY_DIAL1_CW:
+                adjustCurrentSetting(2);
+                return true;
+
+            case SonyKeyCodes.SONY_KEY_DIAL1_CCW:
+                adjustCurrentSetting(-2);
+                return true;
+
+            // Rear Dial & Control Wheel: Precise 1-step adjustment
             case SonyKeyCodes.SONY_KEY_DIAL2_CW:
             case SonyKeyCodes.SONY_KEY_DIAL3_CW:
-            case SonyKeyCodes.SONY_KEY_DIAL1_CW:
             case KeyEvent.KEYCODE_PAGE_UP:
                 adjustCurrentSetting(1);
                 return true;
 
             case SonyKeyCodes.SONY_KEY_DIAL2_CCW:
             case SonyKeyCodes.SONY_KEY_DIAL3_CCW:
-            case SonyKeyCodes.SONY_KEY_DIAL1_CCW:
             case KeyEvent.KEYCODE_PAGE_DOWN:
                 adjustCurrentSetting(-1);
                 return true;
 
-            // Center Enter button
+            // Center Enter button: Reset selected cell to factory default (0 or Standard)
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
                 if (selectedIndex == 15) {
@@ -240,17 +247,23 @@ public class FujiQMenuView extends View {
                     refreshCachedValues();
                     invalidate();
                 } else {
-                    adjustCurrentSetting(1);
+                    resetCurrentSetting();
                 }
                 return true;
 
-            // Half-shutter, Trash, Fn, or Menu: Immediate Dismiss
+            // Fn key in Q-Menu: Instant Recipe Save
+            case SonyKeyCodes.SONY_KEY_FN:
+                recipe.saveToSlot(getContext(), recipe.recipeSlotIndex);
+                refreshCachedValues();
+                invalidate();
+                return true;
+
+            // Half-shutter, Trash, or Menu: Immediate Dismiss
             case SonyKeyCodes.SONY_KEY_SHUTTER_HALF:
             case SonyKeyCodes.ANDROID_CAMERA:
             case SonyKeyCodes.SONY_KEY_C3_TRASH:
             case SonyKeyCodes.ANDROID_DEL:
             case SonyKeyCodes.ANDROID_CLEAR:
-            case SonyKeyCodes.SONY_KEY_FN:
             case KeyEvent.KEYCODE_MENU:
                 if (listener != null) {
                     listener.onDismissRequest();
@@ -259,6 +272,36 @@ public class FujiQMenuView extends View {
         }
 
         return super.onKeyDown(keyCode, event);
+    }
+
+    public void resetCurrentSetting() {
+        if (recipe == null) return;
+
+        switch (selectedIndex) {
+            case 0:  recipe.filmSim = FujiRecipe.FilmSim.PROVIA; break;
+            case 1:  recipe.dynamicRange = FujiRecipe.DynamicRange.DR100; break;
+            case 2:  recipe.grainEffect = FujiRecipe.EffectLevel.OFF; break;
+            case 3:  recipe.colorChrome = FujiRecipe.EffectLevel.OFF; break;
+            case 4:  recipe.colorChromeBlue = FujiRecipe.EffectLevel.OFF; break;
+            case 5:  recipe.whiteBalance = FujiRecipe.WhiteBalance.AUTO; break;
+            case 6:  recipe.wbShiftR = 0; break;
+            case 7:  recipe.wbShiftB = 0; break;
+            case 8:  recipe.highlightTone = 0; break;
+            case 9:  recipe.shadowTone = 0; break;
+            case 10: recipe.color = 0; break;
+            case 11: recipe.sharpness = 0; break;
+            case 12: recipe.noiseReduction = 0; break;
+            case 13: recipe.clarity = 0; break;
+            case 14: recipe.loadFromSlot(getContext(), 0); break;
+            case 15: recipe.saveToSlot(getContext(), recipe.recipeSlotIndex); break;
+        }
+
+        refreshCachedValues();
+        invalidate();
+
+        if (listener != null) {
+            listener.onRecipeChanged(recipe);
+        }
     }
 
     private void adjustCurrentSetting(int delta) {

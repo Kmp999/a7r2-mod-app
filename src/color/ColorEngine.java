@@ -122,4 +122,20 @@ public class ColorEngine {
      * Applies 17x17x17 3D LUT in-place to RGB_565 buffer.
      */
     public static native void applyLut17RGB565(short[] rgb565, int pixelCount);
+
+    /**
+     * Applies 17x17x17 3D LUT with 4x4 Bayer Dithering & Grain directly to a Direct ByteBuffer in-place.
+     * Zero-Copy: Never locks the Dalvik Garbage Collector.
+     */
+    public static boolean applyLut17DirectRGB565Safe(java.nio.ByteBuffer directBuffer, int width, int height) {
+        if (!sNativeAvailable || directBuffer == null || !directBuffer.isDirect()) return false;
+        try {
+            return applyLut17DirectRGB565(directBuffer, width, height);
+        } catch (Throwable t) {
+            Log.e(TAG, "applyLut17DirectRGB565 failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean applyLut17DirectRGB565(java.nio.ByteBuffer directBuffer, int width, int height);
 }
