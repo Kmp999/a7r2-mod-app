@@ -43,6 +43,9 @@ FujiResult color_engine_process_nv21(ColorEngineContext* ctx, uint8_t* nv21_buff
 // Fast in-place RGB24 processing (For decoded JPEG proxy or host testing)
 FujiResult color_engine_process_rgb24(ColorEngineContext* ctx, uint8_t* rgb_buffer, int width, int height);
 
+// Fast in-place RGB_565 processing (one uint16_t per pixel, from decoded JPEG capture)
+FujiResult color_engine_process_rgb565(ColorEngineContext* ctx, uint16_t* rgb565_buffer, int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

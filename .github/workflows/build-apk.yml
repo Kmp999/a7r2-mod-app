@@ -78,16 +78,15 @@ jobs:
           cp libs/armeabi-v7a/libcolor_engine_jni.so lib/armeabi-v7a/
           $AAPT add bin/unaligned.apk lib/armeabi-v7a/libcolor_engine_jni.so
 
-      - name: ZipAlign APK
-        run: |
-          $ANDROID_HOME/build-tools/28.0.3/zipalign -v -p 4 bin/unaligned.apk bin/fuji-lite-a7r2-aligned.apk
-
       - name: Sign APK (Strict v1 JAR Signing for Sony PMCA)
         run: |
           jarsigner -sigalg SHA1withRSA -digestalg SHA1 \
             -keystore build/debug.keystore -storepass android -keypass android \
-            bin/fuji-lite-a7r2-aligned.apk androiddebugkey
-          cp bin/fuji-lite-a7r2-aligned.apk fuji-lite-a7r2.apk
+            bin/unaligned.apk androiddebugkey
+
+      - name: ZipAlign Signed APK
+        run: |
+          $ANDROID_HOME/build-tools/28.0.3/zipalign -f -v -p 4 bin/unaligned.apk fuji-lite-a7r2.apk
 
       - name: Upload APK Release Artifact
         uses: actions/upload-artifact@v5

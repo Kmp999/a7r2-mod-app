@@ -31,3 +31,20 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_processNV21(JNIEnv *en
     // Release pointer (0 means copy back changes if it wasn't pinned, but GetPrimitiveArrayCritical usually pins)
     (*env)->ReleasePrimitiveArrayCritical(env, nv21Array, buffer_ptr, 0);
 }
+
+JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_processRGB565(JNIEnv *env, jclass clazz, jshortArray rgb565Array, jint width, jint height) {
+    if (rgb565Array == NULL || width <= 0 || height <= 0) {
+        LOGE("Invalid arguments provided to processRGB565");
+        return;
+    }
+
+    jshort* buffer_ptr = (*env)->GetPrimitiveArrayCritical(env, rgb565Array, 0);
+    if (buffer_ptr == NULL) {
+        LOGE("Failed to get critical array pointer for RGB565");
+        return;
+    }
+
+    color_engine_process_rgb565(&g_ctx, (uint16_t*)buffer_ptr, width, height);
+
+    (*env)->ReleasePrimitiveArrayCritical(env, rgb565Array, buffer_ptr, 0);
+}

@@ -9,9 +9,12 @@ import android.widget.TextView;
 import android.widget.LinearLayout;
 import android.view.View;
 import android.graphics.Color;
+import android.util.Log;
 
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
-    
+
+    private static final String TAG = "FujiLiteMain";
+
     private SurfaceView cameraPreview;
     private TextView statusText;
     private Button captureBtn;
@@ -21,64 +24,93 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private SonyPmcaAdapter cameraAdapter;
     private CaptureController captureController;
 
-    // Load C native engine
-    static {
-        System.loadLibrary("color_engine_jni");
-    }
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Core component orchestration
-        appState = new AppState();
-        cameraAdapter = new SonyPmcaAdapter();
+        // The whole startup is guarded: on the A7R II any uncaught exception or
+        // native fault here makes the camera vibrate once and bounce back to the
+        // application menu. We would rather stay open and report the problem.
+        try {
+            buildUi();
+            initPipeline();
+        } catch (Throwable t) {
+            Log.e(TAG, "Startup failed; continuing in degraded mode", t);
+            showFatalSafe(t);
+        }
+    }
 
+    private void buildUi() {
         // Minimalistic UI without XML inflation for Dalvik efficiency
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setBackgroundColor(Color.BLACK);
-        
+
         cameraPreview = new SurfaceView(this);
         LinearLayout.LayoutParams previewParams = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 
+            LinearLayout.LayoutParams.MATCH_PARENT,
             0, 1.0f);
         layout.addView(cameraPreview, previewParams);
-        
+
         LinearLayout controlPanel = new LinearLayout(this);
         controlPanel.setOrientation(LinearLayout.HORIZONTAL);
-        
+
         captureBtn = new Button(this);
         captureBtn.setText("CAPTURE");
-        
+
         statusText = new TextView(this);
         statusText.setText("Mode: Proxy 720p | Preset: Provia");
         statusText.setTextColor(Color.WHITE);
         statusText.setPadding(20, 20, 20, 20);
-        
+
         controlPanel.addView(captureBtn);
         controlPanel.addView(statusText);
         layout.addView(controlPanel);
-        
+
         setContentView(layout);
-
-        // Initialize UI controller & capture controller
-        uiController = new UIController(statusText);
-        captureController = new CaptureController(cameraAdapter, uiController, appState);
-
-        // Initialize Native Color Engine with Provia preset
-        ColorEngine.initEngine(appState.getCurrentPresetId(), ColorEngine.MODE_SAFE_FASTEST);
-
-        // Bind SurfaceHolder for camera preview
-        cameraPreview.getHolder().addCallback(this);
 
         // Direct capture button wiring
         captureBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                captureController.triggerCapture();
+                if (captureController != null) {
+                    captureController.triggerCapture();
+                }
             }
         });
+    }
+
+    private void initPipeline() {
+        // Core component orchestration
+        appState = new AppState();
+        cameraAdapter = new SonyPmcaAdapter();
+
+        // Initialize UI controller & capture controller
+        uiController = new UIController(statusText);
+        captureController = new CaptureController(cameraAdapter, uiController, appState);
+
+        // Initialize Native Color Engine with Provia preset (non-fatal if the
+        // native library is missing or incompatible).
+        ColorEngine.initEngineSafe(appState.getCurrentPresetId(), ColorEngine.MODE_SAFE_FASTEST);
+        if (!ColorEngine.isNativeAvailable() && statusText != null) {
+            statusText.setText("Native engine unavailable - passthrough mode");
+        }
+
+        // Bind SurfaceHolder for camera preview
+        cameraPreview.getHolder().addCallback(this);
+    }
+
+    private void showFatalSafe(Throwable t) {
+        try {
+            if (statusText == null) {
+                statusText = new TextView(this);
+                statusText.setTextColor(Color.WHITE);
+                setContentView(statusText);
+            }
+            statusText.setText("Startup error: " + t.getClass().getSimpleName());
+        } catch (Throwable ignored) {
+            // Never let error reporting itself crash the activity.
+        }
     }
 
     @Override

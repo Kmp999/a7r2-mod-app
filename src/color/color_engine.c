@@ -44,6 +44,31 @@ FujiResult color_engine_process_rgb24(ColorEngineContext* ctx, uint8_t* rgb_buff
     return FUJI_SUCCESS;
 }
 
+FujiResult color_engine_process_rgb565(ColorEngineContext* ctx, uint16_t* rgb565_buffer, int width, int height) {
+    if (!ctx || !rgb565_buffer) return FUJI_ERR_NULL_POINTER;
+    if (width <= 0 || height <= 0) return FUJI_ERR_INVALID_PARAM;
+
+    int total_pixels = width * height;
+    for (int i = 0; i < total_pixels; i++) {
+        uint16_t px = rgb565_buffer[i];
+
+        // Unpack RGB_565 -> 8-bit components
+        uint8_t r = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);
+        uint8_t g = (uint8_t)(((px >> 5) & 0x3F) * 255 / 63);
+        uint8_t b = (uint8_t)((px & 0x1F) * 255 / 31);
+
+        matrix_apply_rgb(&ctx->matrix, &r, &g, &b);
+        if (ctx->mode != COLOR_MODE_MATRIX_ONLY) {
+            lut_apply_rgb(&ctx->lut, &r, &g, &b);
+        }
+
+        // Repack into RGB_565
+        rgb565_buffer[i] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+    }
+
+    return FUJI_SUCCESS;
+}
+
 FujiResult color_engine_process_nv21(ColorEngineContext* ctx, uint8_t* nv21_buffer, int width, int height) {
     if (!ctx || !nv21_buffer) return FUJI_ERR_NULL_POINTER;
     if (width <= 0 || height <= 0) return FUJI_ERR_INVALID_PARAM;

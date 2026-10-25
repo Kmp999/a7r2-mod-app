@@ -12,47 +12,66 @@ public class SonyPmcaAdapter implements CameraAdapter {
     private Camera mCamera;
 
     public SonyPmcaAdapter() {
+        // Do NOT open the camera in the constructor. On the A7R II the Sony
+        // firmware owns the sensor and a synchronous Camera.open() during
+        // onCreate can abort natively (uncaught by catch(Exception)) and bounce
+        // the app back to the menu. Open lazily and defensively instead.
+    }
+
+    /** Opens the hardware camera on demand; never throws. */
+    private boolean ensureOpen() {
+        if (mCamera != null) return true;
         try {
             mCamera = Camera.open();
-            // TODO(SONY_SDK): Use reflection to see if com.sony.scalar.hardware.CameraEx is available.
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to open camera", e);
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to open camera", t);
+            mCamera = null;
         }
+        return mCamera != null;
     }
 
     @Override
     public void startPreview(Camera.PreviewCallback callback) {
-        if (mCamera != null) {
+        if (!ensureOpen()) return;
+        try {
             mCamera.setPreviewCallback(callback);
             mCamera.startPreview();
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to start preview callback", t);
         }
     }
 
     @Override
     public void startPreview(android.view.SurfaceHolder holder) {
-        if (mCamera != null) {
-            try {
-                mCamera.setPreviewDisplay(holder);
-                mCamera.startPreview();
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to start preview on SurfaceHolder", e);
-            }
+        if (!ensureOpen()) return;
+        try {
+            mCamera.setPreviewDisplay(holder);
+            mCamera.startPreview();
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to start preview on SurfaceHolder", t);
         }
     }
 
     @Override
     public void takePicture(Camera.PictureCallback jpegCallback) {
-        if (mCamera != null) {
+        if (!ensureOpen()) return;
+        try {
             // Null for Shutter and RAW/Postview callbacks to maximize speed
             mCamera.takePicture(null, null, jpegCallback);
+        } catch (Throwable t) {
+            Log.e(TAG, "takePicture failed", t);
         }
     }
 
     @Override
     public void release() {
         if (mCamera != null) {
-            mCamera.setPreviewCallback(null);
-            mCamera.release();
+            try {
+                mCamera.setPreviewCallback(null);
+                mCamera.release();
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to release camera", t);
+            }
             mCamera = null;
         }
     }

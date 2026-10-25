@@ -1,20 +1,31 @@
 package com.fujilite.a7r2;
 
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.hardware.Camera;
 import android.util.Log;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.nio.ShortBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * Manages the capture pipeline, dispatching image processing off the UI thread.
- * Guaranteed zero heap allocation inside the execution hot path.
+ * The hardware JPEG is decoded to RGB_565, color-graded by the native engine,
+ * then re-encoded and written to the SD card.
  */
 public class CaptureController {
     private static final String TAG = "CaptureController";
-    
-    // Default proxy dimensions targeted for Sony A7R II live-view/proxy budget
-    public static final int DEFAULT_PROXY_WIDTH = 1280;
-    public static final int DEFAULT_PROXY_HEIGHT = 720;
+
+    // Highest-resolution color grading we can perform safely inside the camera's
+    // Dalvik heap (~32-64 MB). Peak working set is roughly pixels * 4 bytes
+    // (RGB_565 bitmap + RGB_565 short[]). 8 MP keeps us well under the limit
+    // while staying far above the old 720p proxy. 42 MP cannot fit in-heap and
+    // is downscaled to this budget automatically.
+    private static final int MAX_GRADE_PIXELS = 8 * 1024 * 1024;
+
+    private static final String OUTPUT_DIR = "/sdcard/DCIM/100MSDCF/";
 
     private final CameraAdapter cameraAdapter;
     private final UIController uiController;
@@ -37,51 +48,108 @@ public class CaptureController {
 
         cameraAdapter.takePicture(new Camera.PictureCallback() {
             @Override
-            public void onPictureTaken(final byte[] data, Camera camera) {
-                final long imageAvailableTimestamp = System.currentTimeMillis();
-
+            public void onPictureTaken(final byte[] jpegData, Camera camera) {
                 processingExecutor.execute(new Runnable() {
                     @Override
                     public void run() {
-                        try {
-                            if (data == null || data.length == 0) {
-                                uiController.updateStatusAsync("Capture failed: Empty buffer");
-                                return;
-                            }
-
-                            int width = DEFAULT_PROXY_WIDTH;
-                            int height = DEFAULT_PROXY_HEIGHT;
-
-                            // Defensive dimension validation:
-                            // NV21 requires Y plane (W*H) + UV interleaved (W*H/2) = W*H * 1.5 bytes
-                            int expectedNv21Bytes = (width * height * 3) / 2;
-                            if (data.length < expectedNv21Bytes) {
-                                // Fallback resolution probe if sensor returned standard 640x480 preview
-                                if (data.length >= (640 * 480 * 3) / 2) {
-                                    width = 640;
-                                    height = 480;
-                                } else {
-                                    Log.w(TAG, "Buffer size (" + data.length + " bytes) does not match expected NV21 geometry");
-                                }
-                            }
-
-                            // In-place processing via native color engine (zero allocation)
-                            ColorEngine.processNV21(data, width, height);
-
-                            long duration = System.currentTimeMillis() - imageAvailableTimestamp;
-                            appState.setLastProcessingTimeMs(duration);
-                            uiController.updateStatusAsync("Processed in " + duration + " ms");
-                        } catch (Throwable t) {
-                            Log.e(TAG, "Error processing frame", t);
-                            appState.setLastErrorMessage(t.getMessage());
-                            uiController.updateStatusAsync("Error: " + t.getMessage());
-                        } finally {
-                            appState.setProcessing(false);
-                        }
+                        processJpeg(jpegData);
                     }
                 });
             }
         });
+    }
+
+    private void processJpeg(byte[] jpegData) {
+        final long start = System.currentTimeMillis();
+        try {
+            if (jpegData == null || jpegData.length == 0) {
+                uiController.updateStatusAsync("Capture failed: Empty buffer");
+                return;
+            }
+
+            // 1. Probe dimensions without allocating the full bitmap.
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                uiController.updateStatusAsync("Capture failed: Not a JPEG");
+                return;
+            }
+
+            // 2. Decode as RGB_565 at the largest heap-safe scale.
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inPreferredConfig = Bitmap.Config.RGB_565;
+            opts.inSampleSize = computeSampleSize(bounds.outWidth, bounds.outHeight, MAX_GRADE_PIXELS);
+            Bitmap bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, opts);
+            if (bitmap == null) {
+                uiController.updateStatusAsync("Capture failed: decode error");
+                return;
+            }
+
+            int w = bitmap.getWidth();
+            int h = bitmap.getHeight();
+
+            // 3. Color grade via the native engine (one short per RGB_565 pixel).
+            boolean graded = false;
+            if (ColorEngine.isNativeAvailable()) {
+                short[] pixels = new short[w * h];
+                ShortBuffer buffer = ShortBuffer.wrap(pixels);
+                bitmap.copyPixelsToBuffer(buffer);
+                graded = ColorEngine.processRGB565Safe(pixels, w, h);
+                if (graded) {
+                    buffer.rewind();
+                    bitmap.copyPixelsFromBuffer(buffer);
+                }
+            }
+
+            // 4. Re-encode and save to the SD card.
+            boolean saved = saveJpeg(bitmap);
+            bitmap.recycle();
+
+            long duration = System.currentTimeMillis() - start;
+            appState.setLastProcessingTimeMs(duration);
+            String tag = graded ? "Graded" : "Saved (passthrough)";
+            uiController.updateStatusAsync(tag + " " + w + "x" + h
+                + (saved ? " in " + duration + " ms" : " (write failed)"));
+        } catch (Throwable t) {
+            Log.e(TAG, "Error processing capture", t);
+            appState.setLastErrorMessage(String.valueOf(t.getMessage()));
+            uiController.updateStatusAsync("Error: " + t.getClass().getSimpleName());
+        } finally {
+            appState.setProcessing(false);
+        }
+    }
+
+    /** Largest power-of-two sample size that keeps the decoded pixel count within budget. */
+    static int computeSampleSize(int width, int height, int maxPixels) {
+        int sample = 1;
+        while (((long) (width / sample)) * (height / sample) > maxPixels) {
+            sample *= 2;
+        }
+        return sample;
+    }
+
+    private boolean saveJpeg(Bitmap bitmap) {
+        FileOutputStream out = null;
+        try {
+            File dir = new File(OUTPUT_DIR);
+            if (!dir.exists()) {
+                dir.mkdirs();
+            }
+            File file = new File(dir, "FUJI_" + System.currentTimeMillis() + ".JPG");
+            out = new FileOutputStream(file);
+            return bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out);
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to write output JPEG", t);
+            return false;
+        } finally {
+            if (out != null) {
+                try {
+                    out.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
     }
 
     public void shutdown() {
