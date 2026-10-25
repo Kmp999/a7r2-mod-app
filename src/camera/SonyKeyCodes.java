@@ -98,42 +98,70 @@ public final class SonyKeyCodes {
     }
 
     private static void registerDefaultKeyCodes() {
-        // Fallback registration for both 0x201..0x217 and direct numbers 513..535
+        // Core Shutter
         sKeyCodeMap.put(0x201, FujiAction.HALF_SHUTTER);
         sKeyCodeMap.put(0x202, FujiAction.FULL_SHUTTER);
-        sKeyCodeMap.put(0x203, FujiAction.FN);
-        sKeyCodeMap.put(0x204, FujiAction.PLAY);
-        sKeyCodeMap.put(0x205, FujiAction.FRONT_DIAL_CW);
-        sKeyCodeMap.put(0x206, FujiAction.FRONT_DIAL_CCW);
-        sKeyCodeMap.put(0x207, FujiAction.REAR_DIAL_CW);
-        sKeyCodeMap.put(0x208, FujiAction.REAR_DIAL_CCW);
-        sKeyCodeMap.put(0x209, FujiAction.WHEEL_CW);
-        sKeyCodeMap.put(0x20a, FujiAction.WHEEL_CCW);
-        sKeyCodeMap.put(0x20b, FujiAction.C1);
-        sKeyCodeMap.put(0x20c, FujiAction.C2);
-        sKeyCodeMap.put(0x20d, FujiAction.C4_TRASH);
-        sKeyCodeMap.put(0x20e, FujiAction.C4_TRASH);
-        sKeyCodeMap.put(0x20f, FujiAction.AEL);
-        sKeyCodeMap.put(0x210, FujiAction.AF_MF);
-        sKeyCodeMap.put(0x211, FujiAction.PLAY);
-
-        // Also map standard Sony decimal ranges:
         sKeyCodeMap.put(513, FujiAction.HALF_SHUTTER);
         sKeyCodeMap.put(514, FujiAction.FULL_SHUTTER);
-        sKeyCodeMap.put(515, FujiAction.FN);
-        sKeyCodeMap.put(516, FujiAction.PLAY);
-        sKeyCodeMap.put(517, FujiAction.FRONT_DIAL_CW);
-        sKeyCodeMap.put(518, FujiAction.FRONT_DIAL_CCW);
-        sKeyCodeMap.put(519, FujiAction.REAR_DIAL_CW);
-        sKeyCodeMap.put(520, FujiAction.REAR_DIAL_CCW);
-        sKeyCodeMap.put(521, FujiAction.WHEEL_CW);
-        sKeyCodeMap.put(522, FujiAction.WHEEL_CCW);
-        sKeyCodeMap.put(523, FujiAction.C1);
-        sKeyCodeMap.put(524, FujiAction.C2);
-        sKeyCodeMap.put(525, FujiAction.C3);
-        sKeyCodeMap.put(526, FujiAction.C4_TRASH);
-        sKeyCodeMap.put(527, FujiAction.AEL);
-        sKeyCodeMap.put(528, FujiAction.AF_MF);
+
+        // Menu & Navigation
+        sKeyCodeMap.put(515, FujiAction.MENU);
+        sKeyCodeMap.put(516, FujiAction.CENTER);
+        
+        sKeyCodeMap.put(517, FujiAction.DPAD_UP);
+        sKeyCodeMap.put(103, FujiAction.DPAD_UP);
+        
+        sKeyCodeMap.put(518, FujiAction.DPAD_DOWN);
+        sKeyCodeMap.put(108, FujiAction.DPAD_DOWN);
+        
+        sKeyCodeMap.put(591, FujiAction.DPAD_LEFT);
+        sKeyCodeMap.put(105, FujiAction.DPAD_LEFT);
+        
+        sKeyCodeMap.put(592, FujiAction.DPAD_RIGHT);
+        sKeyCodeMap.put(106, FujiAction.DPAD_RIGHT);
+
+        // Dials
+        sKeyCodeMap.put(519, FujiAction.WHEEL_CW);
+        sKeyCodeMap.put(520, FujiAction.WHEEL_CCW);
+        sKeyCodeMap.put(0x209, FujiAction.WHEEL_CW);
+        sKeyCodeMap.put(0x20a, FujiAction.WHEEL_CCW);
+
+        sKeyCodeMap.put(525, FujiAction.FRONT_DIAL_CW);
+        sKeyCodeMap.put(534, FujiAction.FRONT_DIAL_CW);
+        sKeyCodeMap.put(0x205, FujiAction.FRONT_DIAL_CW);
+        
+        sKeyCodeMap.put(526, FujiAction.FRONT_DIAL_CCW);
+        sKeyCodeMap.put(535, FujiAction.FRONT_DIAL_CCW);
+        sKeyCodeMap.put(0x206, FujiAction.FRONT_DIAL_CCW);
+
+        sKeyCodeMap.put(527, FujiAction.REAR_DIAL_CW);
+        sKeyCodeMap.put(536, FujiAction.REAR_DIAL_CW);
+        sKeyCodeMap.put(0x207, FujiAction.REAR_DIAL_CW);
+        
+        sKeyCodeMap.put(528, FujiAction.REAR_DIAL_CCW);
+        sKeyCodeMap.put(537, FujiAction.REAR_DIAL_CCW);
+        sKeyCodeMap.put(0x208, FujiAction.REAR_DIAL_CCW);
+
+        // Custom Buttons & Toggles
+        sKeyCodeMap.put(521, FujiAction.FN);
+        sKeyCodeMap.put(0x203, FujiAction.FN);
+        
+        sKeyCodeMap.put(532, FujiAction.AEL);
+        sKeyCodeMap.put(533, FujiAction.AF_MF);
+        sKeyCodeMap.put(538, FujiAction.PLAY);
+
+        sKeyCodeMap.put(588, FujiAction.C1);
+        sKeyCodeMap.put(622, FujiAction.C1);
+
+        sKeyCodeMap.put(589, FujiAction.C2);
+        sKeyCodeMap.put(623, FujiAction.C2);
+
+        sKeyCodeMap.put(590, FujiAction.C3);
+        sKeyCodeMap.put(624, FujiAction.C3);
+
+        sKeyCodeMap.put(595, FujiAction.C4_TRASH);
+        sKeyCodeMap.put(625, FujiAction.C4_TRASH);
+        sKeyCodeMap.put(0x20d, FujiAction.C4_TRASH);
 
         // Android standard key codes
         sKeyCodeMap.put(KeyEvent.KEYCODE_CAMERA,        FujiAction.FULL_SHUTTER);
