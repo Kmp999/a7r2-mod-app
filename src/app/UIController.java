@@ -71,6 +71,12 @@ public class UIController {
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
 
+    private boolean liveViewLutEnabled = true;
+
+    public boolean isLiveViewLutEnabled() {
+        return liveViewLutEnabled;
+    }
+
     public void setBottomHudView(TextView view) {
         this.bottomHudView = view;
     }
@@ -329,6 +335,10 @@ public class UIController {
                 if (callback != null) callback.onCycleFilmSim(1);
                 return true;
             case C2:
+                liveViewLutEnabled = !liveViewLutEnabled;
+                if (!liveViewLutEnabled && qMenuView != null) {
+                    qMenuView.clearLiveViewBuffer();
+                }
                 if (callback != null) callback.onToggleLiveViewLut();
                 return true;
             case C3:

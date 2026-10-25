@@ -138,4 +138,20 @@ public class ColorEngine {
     }
 
     public static native boolean applyLut17DirectRGB565(java.nio.ByteBuffer directBuffer, int width, int height);
+
+    /**
+     * Converts NV21 camera preview frames to RGB_565, applying the 3D LUT and Grain in a single pass.
+     * Outputs directly to a Zero-GC DirectByteBuffer.
+     */
+    public static boolean gradePreviewNV21toRGB565Safe(byte[] nv21, java.nio.ByteBuffer rgb565Direct, int width, int height, int grain) {
+        if (!sNativeAvailable || nv21 == null || rgb565Direct == null || !rgb565Direct.isDirect()) return false;
+        try {
+            return nativeGradePreviewNV21toRGB565(nv21, rgb565Direct, width, height, grain);
+        } catch (Throwable t) {
+            Log.e(TAG, "nativeGradePreviewNV21toRGB565 failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean nativeGradePreviewNV21toRGB565(byte[] nv21Array, java.nio.ByteBuffer rgb565Direct, int width, int height, int grainStrength);
 }

@@ -134,8 +134,50 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 }
             }
             Log.i(TAG, "CameraEx reflection cache initialized successfully");
+            registerHardwareListeners(cls);
         } catch (Throwable t) {
             Log.w(TAG, "ParametersModifier reflection cache init failed", t);
+        }
+    }
+
+    private void registerHardwareListeners(Class<?> cls) {
+        if (cameraEx == null) return;
+        try {
+            // Register ShutterSpeedChangeListener
+            Class<?> ssListenerCls = Class.forName("com.sony.scalar.hardware.CameraEx$ShutterSpeedChangeListener");
+            Object ssProxy = java.lang.reflect.Proxy.newProxyInstance(
+                ssListenerCls.getClassLoader(),
+                new Class<?>[]{ssListenerCls},
+                new java.lang.reflect.InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        Log.i(TAG, "ShutterSpeedChangeListener triggered by BIONZ X");
+                        return null;
+                    }
+                }
+            );
+            Method setSsListener = cls.getMethod("setShutterSpeedChangeListener", ssListenerCls);
+            setSsListener.invoke(cameraEx, ssProxy);
+
+            // Register ApertureChangeListener
+            Class<?> apListenerCls = Class.forName("com.sony.scalar.hardware.CameraEx$ApertureChangeListener");
+            Object apProxy = java.lang.reflect.Proxy.newProxyInstance(
+                apListenerCls.getClassLoader(),
+                new Class<?>[]{apListenerCls},
+                new java.lang.reflect.InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        Log.i(TAG, "ApertureChangeListener triggered by BIONZ X");
+                        return null;
+                    }
+                }
+            );
+            Method setApListener = cls.getMethod("setApertureChangeListener", apListenerCls);
+            setApListener.invoke(cameraEx, apProxy);
+
+            Log.i(TAG, "Hardware dial listeners registered successfully via Proxy");
+        } catch (Throwable t) {
+            Log.w(TAG, "Hardware listener registration unsupported on this body", t);
         }
     }
 
@@ -145,6 +187,103 @@ public class SonyPmcaAdapter implements CameraAdapter {
             return createModifierMethod.invoke(cameraEx, normalCamera.getParameters());
         } catch (Throwable t) {
             return null;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Hardware Poller & Preview Framework
+    // ------------------------------------------------------------------------
+
+    private Runnable hardwarePoller;
+    private android.os.Handler pollerHandler;
+    private boolean isPolling = false;
+
+    private byte[] previewBufferA;
+    private byte[] previewBufferB;
+    private boolean previewBuffersAllocated = false;
+
+    private void allocatePreviewBuffers(int width, int height) {
+        if (previewBuffersAllocated) return;
+        int yuvSize = width * height * 3 / 2; // NV21 format
+        previewBufferA = new byte[yuvSize];
+        previewBufferB = new byte[yuvSize];
+        previewBuffersAllocated = true;
+        Log.i(TAG, "Allocated double preview buffers: " + yuvSize + " bytes each");
+    }
+
+    public void setRealtimePreviewCallback(Camera.PreviewCallback callback, int width, int height) {
+        if (!ensureOpen() || normalCamera == null) return;
+        try {
+            allocatePreviewBuffers(width, height);
+            normalCamera.setPreviewCallbackWithBuffer(callback);
+            normalCamera.addCallbackBuffer(previewBufferA);
+            normalCamera.addCallbackBuffer(previewBufferB);
+            Log.i(TAG, "Real-time PreviewCallbackWithBuffer registered");
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to setPreviewCallbackWithBuffer", t);
+        }
+    }
+
+    public void addCallbackBuffer(byte[] buffer) {
+        if (normalCamera != null && buffer != null) {
+            try {
+                normalCamera.addCallbackBuffer(buffer);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    public void clearPreviewCallback() {
+        if (normalCamera != null) {
+            try {
+                normalCamera.setPreviewCallbackWithBuffer(null);
+                normalCamera.setPreviewCallback(null);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    public void startHardwarePoller(final Runnable onHardwareChange) {
+        if (isPolling) return;
+        if (pollerHandler == null) {
+            pollerHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        }
+
+        isPolling = true;
+        hardwarePoller = new Runnable() {
+            private String lastShutter = "";
+            private String lastAperture = "";
+            private String lastIso = "";
+            private String lastEv = "";
+
+            @Override
+            public void run() {
+                if (!isPolling) return;
+
+                String s = getShutterSpeed();
+                String a = getAperture();
+                String i = getIso();
+                String e = getEv();
+
+                if (!s.equals(lastShutter) || !a.equals(lastAperture) || !i.equals(lastIso) || !e.equals(lastEv)) {
+                    lastShutter = s;
+                    lastAperture = a;
+                    lastIso = i;
+                    lastEv = e;
+                    if (onHardwareChange != null) {
+                        onHardwareChange.run();
+                    }
+                }
+
+                pollerHandler.postDelayed(this, 100); // 10Hz polling
+            }
+        };
+        pollerHandler.post(hardwarePoller);
+        Log.i(TAG, "10Hz Hardware Exposure Poller started");
+    }
+
+    public void stopHardwarePoller() {
+        isPolling = false;
+        if (pollerHandler != null && hardwarePoller != null) {
+            pollerHandler.removeCallbacks(hardwarePoller);
         }
     }
 

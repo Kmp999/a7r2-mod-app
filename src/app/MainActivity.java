@@ -200,11 +200,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Precompute initial 17x17x17 LUT
         precomputeActiveLut();
         uiController.updateBottomHud();
+        
+        // Start 10Hz Hardware Poller for Exposure Dials
+        if (cameraAdapter instanceof SonyPmcaAdapter) {
+            ((SonyPmcaAdapter) cameraAdapter).startHardwarePoller(new Runnable() {
+                @Override
+                public void run() {
+                    uiController.updateBottomHud();
+                }
+            });
+        }
     }
 
     private void onRecipeUpdated(FujiRecipe r) {
         if (qMenuView != null) {
             qMenuView.setRecipe(r);
+            qMenuView.showCarouselBanner(r.filmSim.label);
         }
 
         // 1. Stage 1: Hardware mapping to Sony ISP (0ms)
@@ -264,6 +275,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return true;
             }
         } else if (action == KeyEvent.ACTION_UP) {
+            // Failsafe for dials that only emit ACTION_UP on some firmware versions
+            if (rawCode >= 519 && rawCode <= 537) {
+                 if (uiController != null && uiController.handleRawKeyDown(rawCode, event)) return true;
+            }
             if (uiController != null && uiController.handleRawKeyUp(rawCode, event)) {
                 return true;
             }
@@ -271,6 +286,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         return super.dispatchKeyEvent(event);
     }
+
+    private final android.hardware.Camera.PreviewCallback realtimePreviewCallback = new android.hardware.Camera.PreviewCallback() {
+        @Override
+        public void onPreviewFrame(byte[] data, android.hardware.Camera camera) {
+            if (qMenuView != null && uiController != null && uiController.isLiveViewLutEnabled()) {
+                android.hardware.Camera.Size size = camera.getParameters().getPreviewSize();
+                if (size != null) {
+                    qMenuView.processLiveViewFrame(data, size.width, size.height, appState.getActiveRecipe().grainEffect.ordinal());
+                }
+            }
+            if (cameraAdapter instanceof SonyPmcaAdapter) {
+                ((SonyPmcaAdapter) cameraAdapter).addCallbackBuffer(data);
+            }
+        }
+    };
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
@@ -285,6 +315,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         if (uiController != null) {
             uiController.updateBottomHud();
+        }
+
+        // Register Zero-GC Real-time Preview Callback
+        if (cameraAdapter instanceof SonyPmcaAdapter) {
+            try {
+                android.hardware.Camera.Size previewSize = cameraAdapter.getNormalCamera().getParameters().getPreviewSize();
+                if (previewSize != null) {
+                    ((SonyPmcaAdapter) cameraAdapter).setRealtimePreviewCallback(realtimePreviewCallback, previewSize.width, previewSize.height);
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to initialize realtime preview callback", t);
+            }
         }
     }
 

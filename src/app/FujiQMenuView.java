@@ -60,6 +60,12 @@ public class FujiQMenuView extends View {
     private String hudAf = "AF-S";
     private boolean hudAel = false;
     private String topStatus = "FUJIFILM LIVE";
+    private String carouselBanner = null;
+    private long carouselBannerEndTime = 0;
+
+    // Zero-GC Live View Canvas Buffer
+    private Bitmap liveViewBitmap = null;
+    private java.nio.ByteBuffer liveViewDirectBuffer = null;
 
     // Pre-allocated graphic objects (Zero GC during onDraw)
     private final Paint bgPaint = new Paint();
@@ -71,6 +77,8 @@ public class FujiQMenuView extends View {
     private final Paint headerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint hudPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint debugPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint bannerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint bannerTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     private final RectF cellRect = new RectF();
     private final Rect srcRect = new Rect();
@@ -87,6 +95,32 @@ public class FujiQMenuView extends View {
         setFocusable(false);
         setFocusableInTouchMode(false);
         init();
+    }
+
+    public void processLiveViewFrame(byte[] nv21, int width, int height, int grainStrength) {
+        if (liveViewBitmap == null || liveViewBitmap.getWidth() != width || liveViewBitmap.getHeight() != height) {
+            liveViewBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
+            liveViewDirectBuffer = java.nio.ByteBuffer.allocateDirect(width * height * 2);
+        }
+
+        boolean success = ColorEngine.gradePreviewNV21toRGB565Safe(nv21, liveViewDirectBuffer, width, height, grainStrength);
+        if (success) {
+            liveViewDirectBuffer.rewind();
+            liveViewBitmap.copyPixelsFromBuffer(liveViewDirectBuffer);
+            postInvalidate();
+        }
+    }
+
+    public void clearLiveViewBuffer() {
+        liveViewBitmap = null;
+        liveViewDirectBuffer = null;
+        postInvalidate();
+    }
+
+    public void showCarouselBanner(String text) {
+        carouselBanner = text;
+        carouselBannerEndTime = System.currentTimeMillis() + 1500; // Show for 1.5 seconds
+        postInvalidate();
     }
 
     public void setRecipe(FujiRecipe recipe) {
@@ -308,6 +342,24 @@ public class FujiQMenuView extends View {
             if (SonyKeyCodes.sDebugKeyLoggingEnabled) {
                 canvas.drawText("[" + SonyKeyCodes.sLastKeyName + "]", w - 16, 20, debugPaint);
             }
+        }
+
+        // --------------------------------------------------------------------
+        // Carousel Banner (Film Sim Notification overlay)
+        // --------------------------------------------------------------------
+        if (carouselBanner != null && System.currentTimeMillis() < carouselBannerEndTime) {
+            float bannerTop = (h / 2f) - 20f;
+            float bannerBottom = (h / 2f) + 20f;
+
+            bannerPaint.setColor(0xCC000000);
+            canvas.drawRect(0, bannerTop, w, bannerBottom, bannerPaint);
+
+            bannerTextPaint.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+            bannerTextPaint.setTextSize(18f);
+            bannerTextPaint.setColor(COLOR_AMBER_GOLD);
+            bannerTextPaint.setTextAlign(Paint.Align.CENTER);
+            
+            canvas.drawText("[ " + carouselBanner + " ]", w / 2f, bannerTop + 25f, bannerTextPaint);
         }
 
         // --------------------------------------------------------------------

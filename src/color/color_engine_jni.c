@@ -171,3 +171,85 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_applyLut17DirectRG
 
     return JNI_TRUE;
 }
+
+/**
+ * Fused Real-time Live View Kernel (NV21 to LUT RGB_565).
+ * Processes NV21 preview frames, applies 17x17x17 3D LUT, and writes directly
+ * to a pre-allocated RGB_565 DirectByteBuffer for Zero-GC rendering on Canvas.
+ * Target: < 18ms per frame at 640x480.
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradePreviewNV21toRGB565(JNIEnv *env, jclass clazz,
+                                                                                             jbyteArray nv21Array,
+                                                                                             jobject rgb565Direct,
+                                                                                             jint width, jint height,
+                                                                                             jint grainStrength) {
+    if (nv21Array == NULL || rgb565Direct == NULL || width <= 0 || height <= 0) {
+        return JNI_FALSE;
+    }
+
+    init_grain_lut();
+
+    jbyte* yuv = (*env)->GetPrimitiveArrayCritical(env, nv21Array, 0);
+    if (yuv == NULL) return JNI_FALSE;
+
+    uint16_t* out_rgb = (uint16_t*)(*env)->GetDirectBufferAddress(env, rgb565Direct);
+    if (out_rgb == NULL) {
+        (*env)->ReleasePrimitiveArrayCritical(env, nv21Array, yuv, 0);
+        return JNI_FALSE;
+    }
+
+    int frameSize = width * height;
+    const uint8_t* yPlane = (const uint8_t*)yuv;
+    const uint8_t* uvPlane = (const uint8_t*)(yuv + frameSize);
+
+    int x, y;
+    for (y = 0; y < height; y++) {
+        int uvOffset = (y >> 1) * width;
+        const int8_t* bayerRow = BAYER_4X4[y & 3];
+        const int8_t* grainRow = g_grainLut[y & 63];
+        int yOffset = y * width;
+
+        for (x = 0; x < width; x++) {
+            int yIndex = yOffset + x;
+            int uvIndex = uvOffset + (x & ~1);
+
+            int Y = yPlane[yIndex] - 16;
+            if (Y < 0) Y = 0;
+            int V = uvPlane[uvIndex] - 128;
+            int U = uvPlane[uvIndex + 1] - 128;
+
+            // Integer BT.601 YUV to RGB
+            int r0 = (298 * Y + 409 * V + 128) >> 8;
+            int g0 = (298 * Y - 100 * U - 208 * V + 128) >> 8;
+            int b0 = (298 * Y + 516 * U + 128) >> 8;
+
+            uint8_t r = (uint8_t)(r0 < 0 ? 0 : (r0 > 255 ? 255 : r0));
+            uint8_t g = (uint8_t)(g0 < 0 ? 0 : (g0 > 255 ? 255 : g0));
+            uint8_t b = (uint8_t)(b0 < 0 ? 0 : (b0 > 255 ? 255 : b0));
+
+            // Trilinear LUT Interpolation
+            uint8_t or_val, og_val, ob_val;
+            lut17_interpolate_pixel(&g_lut17, r, g, b, &or_val, &og_val, &ob_val);
+
+            // Dithering & Grain
+            int dither = bayerRow[x & 3];
+            if (grainStrength > 0) {
+                 dither += (grainRow[x & 63] * grainStrength);
+            }
+
+            int dr = or_val + dither;
+            int dg = og_val + (dither >> 1);
+            int db = ob_val + dither;
+
+            if (dr < 0) dr = 0; else if (dr > 255) dr = 255;
+            if (dg < 0) dg = 0; else if (dg > 255) dg = 255;
+            if (db < 0) db = 0; else if (db > 255) db = 255;
+
+            // Pack RGB_565
+            out_rgb[yIndex] = (uint16_t)(((dr >> 3) << 11) | ((dg >> 2) << 5) | (db >> 3));
+        }
+    }
+
+    (*env)->ReleasePrimitiveArrayCritical(env, nv21Array, yuv, 0);
+    return JNI_TRUE;
+}
