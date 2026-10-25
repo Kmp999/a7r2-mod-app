@@ -50,6 +50,30 @@ public class ColorEngine {
         }
     }
 
+    /** Precomputes 17x17x17 3D LUT in native memory from recipe parameters. */
+    public static boolean precomputeLut17Safe(short[] ccmQ8, byte[] rCurve, byte[] gCurve, byte[] bCurve) {
+        if (!sNativeAvailable) return false;
+        try {
+            precomputeLut17(ccmQ8, rCurve, gCurve, bCurve);
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "precomputeLut17 failed", t);
+            return false;
+        }
+    }
+
+    /** Applies precomputed 17x17x17 3D LUT to packed RGB_565 buffer in-place. */
+    public static boolean applyLut17RGB565Safe(short[] rgb565, int pixelCount) {
+        if (!sNativeAvailable) return false;
+        try {
+            applyLut17RGB565(rgb565, pixelCount);
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "applyLut17RGB565 failed", t);
+            return false;
+        }
+    }
+
     /** Processes NV21 in-place; returns true if native processing ran. */
     public static boolean processNV21Safe(byte[] nv21Array, int width, int height) {
         if (!sNativeAvailable) return false;
@@ -76,23 +100,26 @@ public class ColorEngine {
 
     /**
      * Initializes the native engine with precomputed LUTs and Matrices.
-     * Call this once during app startup or when changing presets.
      */
     public static native void initEngine(int presetId, int mode);
 
     /**
      * Processes an NV21 byte array in-place.
-     * WARNING: Runs synchronously. Call from a background thread to prevent UI blocks.
-     * 
-     * @param nv21Array The YUV data buffer from Camera.PreviewCallback
-     * @param width Width of the image
-     * @param height Height of the image
      */
     public static native void processNV21(byte[] nv21Array, int width, int height);
 
     /**
      * Processes a packed RGB_565 buffer (one short per pixel) in-place.
-     * Used by the full-resolution capture path after JPEG decode.
      */
     public static native void processRGB565(short[] rgb565, int width, int height);
+
+    /**
+     * Precomputes 17x17x17 3D LUT from matrix and tone curves.
+     */
+    public static native void precomputeLut17(short[] ccmQ8, byte[] toneCurveR, byte[] toneCurveG, byte[] toneCurveB);
+
+    /**
+     * Applies 17x17x17 3D LUT in-place to RGB_565 buffer.
+     */
+    public static native void applyLut17RGB565(short[] rgb565, int pixelCount);
 }

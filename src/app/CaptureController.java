@@ -16,22 +16,17 @@ import java.util.concurrent.Executors;
 
 /**
  * Manages the capture pipeline, dispatching image processing off the UI thread.
- * The hardware JPEG is decoded to RGB_565, color-graded by the native engine,
- * then re-encoded and written to the SD card.
+ * Decodes proxy JPEG to RGB_565, grades with 17x17x17 3D LUT (native or Java fallback),
+ * then re-encodes and writes to SD card asynchronously.
  */
 public class CaptureController {
     private static final String TAG = "CaptureController";
 
-    // When true, use the JNI engine (fastest, enables larger resolution). This is
-    // opt-in: a failed native dlopen can abort the whole process on Sony PMCA, so
-    // we default to the pure-Java engine which cannot crash the camera app.
-    private static final boolean USE_NATIVE_ENGINE = false;
+    // Use native 17x17x17 3D LUT when available, gracefully fallback to Java engine
+    private static final boolean USE_NATIVE_ENGINE = true;
 
-    // Heap-safe pixel budget. Peak working set is roughly pixels * 4 bytes
-    // (RGB_565 bitmap + RGB_565 short[]). Pure-Java grading is per-pixel, so a
-    // 4 MP budget keeps the turnaround low while staying far above 720p. 42 MP
-    // cannot fit in the Dalvik heap and is downscaled to this budget.
-    private static final int MAX_GRADE_PIXELS = USE_NATIVE_ENGINE ? (8 * 1024 * 1024) : (4 * 1024 * 1024);
+    // Heap-safe pixel budget (4 MP for smooth turnaround under 500ms on A7R II)
+    private static final int MAX_GRADE_PIXELS = 4 * 1024 * 1024;
 
     private static final String OUTPUT_DIR = "/sdcard/DCIM/100MSDCF/";
 
@@ -40,7 +35,6 @@ public class CaptureController {
     private final AppState appState;
     private final ExecutorService processingExecutor;
     private final JavaColorEngine javaEngine = new JavaColorEngine();
-    private boolean engineInitAttempted = false;
 
     public CaptureController(CameraAdapter adapter, UIController uiController, AppState state) {
         this.cameraAdapter = adapter;
@@ -88,7 +82,7 @@ public class CaptureController {
                 return;
             }
 
-            // 1. Probe dimensions without allocating the full bitmap.
+            // 1. Probe dimensions without allocating the full bitmap
             BitmapFactory.Options bounds = new BitmapFactory.Options();
             bounds.inJustDecodeBounds = true;
             BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, bounds);
@@ -97,7 +91,7 @@ public class CaptureController {
                 return;
             }
 
-            // 2. Decode as RGB_565 at the largest heap-safe scale.
+            // 2. Decode as RGB_565 at the largest heap-safe scale
             BitmapFactory.Options opts = new BitmapFactory.Options();
             opts.inPreferredConfig = Bitmap.Config.RGB_565;
             opts.inSampleSize = computeSampleSize(bounds.outWidth, bounds.outHeight, MAX_GRADE_PIXELS);
@@ -110,22 +104,23 @@ public class CaptureController {
             int w = bitmap.getWidth();
             int h = bitmap.getHeight();
 
-            // 3. Color grade (one short per RGB_565 pixel). The pure-Java engine
-            //    is the default and has no native dependency, so grading can never
-            //    crash the camera app. The JNI engine is opt-in only.
+            // 3. Color grade (RGB_565 short[])
             boolean graded = false;
             short[] pixels = new short[w * h];
             ShortBuffer buffer = ShortBuffer.wrap(pixels);
             bitmap.copyPixelsToBuffer(buffer);
 
-            if (USE_NATIVE_ENGINE) {
-                if (!engineInitAttempted) {
-                    engineInitAttempted = true;
-                    ColorEngine.initEngineSafe(appState.getCurrentPresetId(), ColorEngine.MODE_SAFE_FASTEST);
-                }
-                graded = ColorEngine.isNativeAvailable()
-                    && ColorEngine.processRGB565Safe(pixels, w, h);
+            if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
+                FujiRecipe recipe = appState.getActiveRecipe();
+                ColorEngine.precomputeLut17Safe(
+                    recipe.computeCcmQ8(),
+                    recipe.generateToneCurve('R'),
+                    recipe.generateToneCurve('G'),
+                    recipe.generateToneCurve('B')
+                );
+                graded = ColorEngine.applyLut17RGB565Safe(pixels, w * h);
             }
+
             if (!graded) {
                 javaEngine.init(appState.getCurrentPresetId());
                 javaEngine.processRGB565(pixels, w, h);
@@ -135,7 +130,7 @@ public class CaptureController {
             buffer.rewind();
             bitmap.copyPixelsFromBuffer(buffer);
 
-            // 4. Resume live view immediately, then save and show the result.
+            // 4. Resume live view immediately, then save and show the result
             cameraAdapter.resumePreview();
             String savedPath = saveJpeg(bitmap);
             long duration = System.currentTimeMillis() - start;
@@ -164,7 +159,6 @@ public class CaptureController {
 
     /**
      * Renders a synthetic test chart and grades it with the selected preset.
-     * Lets the look be verified on-device even when the camera is unavailable.
      */
     public void runDemo() {
         if (appState.isProcessing()) return;
@@ -181,8 +175,24 @@ public class CaptureController {
                     short[] pixels = new short[w * h];
                     ShortBuffer buffer = ShortBuffer.wrap(pixels);
                     bitmap.copyPixelsToBuffer(buffer);
-                    javaEngine.init(appState.getCurrentPresetId());
-                    javaEngine.processRGB565(pixels, w, h);
+
+                    boolean graded = false;
+                    if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
+                        FujiRecipe recipe = appState.getActiveRecipe();
+                        ColorEngine.precomputeLut17Safe(
+                            recipe.computeCcmQ8(),
+                            recipe.generateToneCurve('R'),
+                            recipe.generateToneCurve('G'),
+                            recipe.generateToneCurve('B')
+                        );
+                        graded = ColorEngine.applyLut17RGB565Safe(pixels, w * h);
+                    }
+                    if (!graded) {
+                        javaEngine.init(appState.getCurrentPresetId());
+                        javaEngine.processRGB565(pixels, w, h);
+                        graded = true;
+                    }
+
                     buffer.rewind();
                     bitmap.copyPixelsFromBuffer(buffer);
                     String savedPath = saveJpeg(bitmap);
@@ -220,7 +230,7 @@ public class CaptureController {
         return bmp;
     }
 
-    /** Largest power-of-two sample size that keeps the decoded pixel count within budget. */
+    /** Largest power-of-two sample size that keeps decoded pixel count within budget. */
     static int computeSampleSize(int width, int height, int maxPixels) {
         int sample = 1;
         while (((long) (width / sample)) * (height / sample) > maxPixels) {
@@ -229,7 +239,7 @@ public class CaptureController {
         return sample;
     }
 
-    /** Saves the graded JPEG, trying several SD-card locations. Returns the path or null. */
+    /** Saves graded JPEG to SD-card. Returns path or null. */
     private String saveJpeg(Bitmap bitmap) {
         String name = "FUJI_" + System.currentTimeMillis() + ".JPG";
         String ext = Environment.getExternalStorageDirectory() + "/DCIM/100MSDCF/";

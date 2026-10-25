@@ -8,30 +8,58 @@ public class AppState {
         ASYNC_FULLRES
     }
 
-    // Preset ids line up with ColorEngine / JavaColorEngine preset order.
+    // Film simulations matching FujiRecipe
     public static final String[] PRESET_NAMES = {
-        "Provia", "Astia", "Velvia", "Classic Neg", "Eterna"
+        "Provia", "Velvia", "Astia", "Classic Chr", "Classic Neg",
+        "Pro Neg Hi", "Pro Neg Std", "Eterna", "Acros"
     };
 
-    private int currentPresetId = 0;
+    private FujiRecipe activeRecipe = new FujiRecipe();
     private Mode currentMode = Mode.JPEG_PROXY;
     private boolean isProcessing = false;
     private long lastProcessingTimeMs = 0;
     private String lastErrorMessage = "";
+    private boolean isQMenuVisible = false;
 
-    public int getCurrentPresetId() { return currentPresetId; }
-    public void setCurrentPresetId(int id) { this.currentPresetId = id; }
-
-    public String getCurrentPresetName() {
-        int id = currentPresetId;
-        if (id < 0 || id >= PRESET_NAMES.length) id = 0;
-        return PRESET_NAMES[id];
+    public FujiRecipe getActiveRecipe() {
+        return activeRecipe;
     }
 
-    /** Advances to the next film look and returns its new id. */
+    public void setActiveRecipe(FujiRecipe recipe) {
+        if (recipe != null) {
+            this.activeRecipe = recipe;
+        }
+    }
+
+    public int getCurrentPresetId() {
+        return activeRecipe.filmSim.ordinal();
+    }
+
+    public void setCurrentPresetId(int id) {
+        FujiRecipe.FilmSim[] sims = FujiRecipe.FilmSim.values();
+        if (id >= 0 && id < sims.length) {
+            activeRecipe.filmSim = sims[id];
+        }
+    }
+
+    public String getCurrentPresetName() {
+        return activeRecipe.filmSim.label;
+    }
+
+    /** Advances to next film simulation. */
     public int cycleNextPreset() {
-        currentPresetId = (currentPresetId + 1) % PRESET_NAMES.length;
-        return currentPresetId;
+        FujiRecipe.FilmSim[] sims = FujiRecipe.FilmSim.values();
+        int next = (activeRecipe.filmSim.ordinal() + 1) % sims.length;
+        activeRecipe.filmSim = sims[next];
+        return next;
+    }
+
+    public boolean isQMenuVisible() {
+        return isQMenuVisible;
+    }
+
+    public void setQMenuVisible(boolean visible) {
+        this.isQMenuVisible = visible;
     }
 
     public Mode getCurrentMode() { return currentMode; }

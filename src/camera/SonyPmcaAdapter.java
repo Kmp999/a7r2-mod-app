@@ -39,6 +39,14 @@ public class SonyPmcaAdapter implements CameraAdapter {
         return activePath;
     }
 
+    public Object getCameraEx() {
+        return cameraEx;
+    }
+
+    public Camera getNormalCamera() {
+        return normalCamera;
+    }
+
     private boolean ensureOpen() {
         if (normalCamera != null) return true;
 

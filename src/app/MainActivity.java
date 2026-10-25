@@ -8,6 +8,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -21,6 +22,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final String TAG = "FujiLiteMain";
 
+    private FrameLayout rootLayout;
     private SurfaceView cameraPreview;
     private TextView statusText;
     private Button captureBtn;
@@ -28,6 +30,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private ImageView resultView;
     private TextView resultInfo;
     private Bitmap lastResult;
+
+    private FujiQMenuView qMenuView;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -40,9 +44,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // The whole startup is guarded: on the A7R II any uncaught exception or
-        // native fault here makes the camera vibrate once and bounce back to the
-        // application menu. We would rather stay open and report the problem.
         try {
             buildUi();
             initPipeline();
@@ -53,15 +54,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void buildUi() {
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.BLACK);
+        rootLayout = new FrameLayout(this);
+        rootLayout.setBackgroundColor(Color.BLACK);
 
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
 
         cameraPreview = new SurfaceView(this);
         try {
-            // Sony live view requires a push-buffer surface.
             cameraPreview.getHolder().setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS);
         } catch (Throwable ignored) {
         }
@@ -72,7 +72,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         controlPanel.setOrientation(LinearLayout.HORIZONTAL);
 
         presetBtn = new Button(this);
-        presetBtn.setText("LOOK: Provia");
+        presetBtn.setText("Q-MENU");
         captureBtn = new Button(this);
         captureBtn.setText("CAPTURE");
         Button demoBtn = new Button(this);
@@ -89,15 +89,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         controlPanel.addView(statusText);
         layout.addView(controlPanel);
 
-        root.addView(layout, new FrameLayout.LayoutParams(
+        rootLayout.addView(layout, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        // Full-screen result overlay (tap to dismiss and return to live view).
+        // Result preview overlay
         resultView = new ImageView(this);
         resultView.setBackgroundColor(Color.BLACK);
         resultView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         resultView.setVisibility(View.GONE);
-        root.addView(resultView, new FrameLayout.LayoutParams(
+        rootLayout.addView(resultView, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         resultInfo = new TextView(this);
@@ -108,32 +108,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         FrameLayout.LayoutParams infoLp = new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
         infoLp.gravity = Gravity.BOTTOM;
-        root.addView(resultInfo, infoLp);
+        rootLayout.addView(resultInfo, infoLp);
 
-        setContentView(root);
+        setContentView(rootLayout);
 
         presetBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                if (appState == null) return;
-                appState.cycleNextPreset();
-                String name = appState.getCurrentPresetName();
-                presetBtn.setText("LOOK: " + name);
-                statusText.setText("Look: " + name);
+                toggleQMenu();
             }
         });
+
         demoBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 if (captureController != null) captureController.runDemo();
             }
         });
+
         captureBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 if (captureController != null) captureController.triggerCapture();
             }
         });
+
         resultView.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -147,7 +146,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         cameraAdapter = new SonyPmcaAdapter();
         uiController = new UIController(statusText);
         captureController = new CaptureController(cameraAdapter, uiController, appState);
-        presetBtn.setText("LOOK: " + appState.getCurrentPresetName());
+
+        // Load saved recipe slot 0 (C1)
+        FujiRecipe recipe = appState.getActiveRecipe();
+        recipe.loadFromSlot(this, 0);
+
+        presetBtn.setText("Q: " + recipe.filmSim.label);
+
+        // Build Q-Menu View
+        qMenuView = new FujiQMenuView(this, recipe, new FujiQMenuView.OnRecipeChangeListener() {
+            @Override
+            public void onRecipeChanged(FujiRecipe r) {
+                onRecipeUpdated(r);
+            }
+
+            @Override
+            public void onDismissRequest() {
+                hideQMenu();
+            }
+        });
+        qMenuView.setVisibility(View.GONE);
+        rootLayout.addView(qMenuView, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         captureController.setResultListener(new CaptureController.ResultListener() {
             @Override
@@ -161,8 +181,119 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         });
 
-        // Native engine is loaded lazily on first capture (never during onCreate).
         cameraPreview.getHolder().addCallback(this);
+
+        // Initial precomputation of 17x17x17 LUT
+        precomputeActiveLut();
+    }
+
+    private void onRecipeUpdated(FujiRecipe r) {
+        presetBtn.setText("Q: " + r.filmSim.label);
+        if (statusText != null) {
+            statusText.setText(r.filmSim.label + " | DR: " + r.dynamicRange.label);
+        }
+
+        // 1. Stage 1: Hardware mapping to Sony ISP (0ms)
+        if (cameraAdapter != null) {
+            SonyToFujiHardwareMapper.applyRecipeToHardware(
+                cameraAdapter.getCameraEx(),
+                cameraAdapter.getNormalCamera(),
+                r
+            );
+        }
+
+        // 2. Stage 2: Pre-compute 17x17x17 LUT (~2ms)
+        precomputeActiveLut();
+    }
+
+    private void precomputeActiveLut() {
+        FujiRecipe r = appState.getActiveRecipe();
+        ColorEngine.precomputeLut17Safe(
+            r.computeCcmQ8(),
+            r.generateToneCurve('R'),
+            r.generateToneCurve('G'),
+            r.generateToneCurve('B')
+        );
+    }
+
+    private void toggleQMenu() {
+        if (qMenuView == null) return;
+        if (qMenuView.getVisibility() == View.VISIBLE) {
+            hideQMenu();
+        } else {
+            showQMenu();
+        }
+    }
+
+    private void showQMenu() {
+        if (qMenuView == null) return;
+        qMenuView.setRecipe(appState.getActiveRecipe());
+        qMenuView.setVisibility(View.VISIBLE);
+        qMenuView.requestFocus();
+        appState.setQMenuVisible(true);
+    }
+
+    private void hideQMenu() {
+        if (qMenuView == null) return;
+        qMenuView.setVisibility(View.GONE);
+        appState.setQMenuVisible(false);
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        // If result preview is visible, any key dismisses it
+        if (resultView.getVisibility() == View.VISIBLE) {
+            hideResult();
+            return true;
+        }
+
+        // If Q-Menu is open, delegate all hardware keys to Q-Menu
+        if (qMenuView != null && qMenuView.getVisibility() == View.VISIBLE) {
+            return qMenuView.onKeyDown(keyCode, event);
+        }
+
+        // When Q-Menu is hidden:
+        switch (keyCode) {
+            // Open Q-Menu: Trash / C3 / Fn / Menu
+            case SonyKeyCodes.SONY_KEY_C3_TRASH:
+            case SonyKeyCodes.ANDROID_DEL:
+            case SonyKeyCodes.ANDROID_CLEAR:
+            case SonyKeyCodes.SONY_KEY_FN:
+            case KeyEvent.KEYCODE_MENU:
+                showQMenu();
+                return true;
+
+            // Trigger Capture: Full Shutter press or Camera key
+            case SonyKeyCodes.SONY_KEY_SHUTTER:
+            case SonyKeyCodes.ANDROID_CAMERA:
+                if (captureController != null) {
+                    captureController.triggerCapture();
+                }
+                return true;
+
+            // Dials quick cycle film simulations
+            case SonyKeyCodes.SONY_KEY_DIAL2_CW:
+            case SonyKeyCodes.SONY_KEY_DIAL3_CW:
+            case KeyEvent.KEYCODE_PAGE_UP:
+                cycleLook(1);
+                return true;
+
+            case SonyKeyCodes.SONY_KEY_DIAL2_CCW:
+            case SonyKeyCodes.SONY_KEY_DIAL3_CCW:
+            case KeyEvent.KEYCODE_PAGE_DOWN:
+                cycleLook(-1);
+                return true;
+        }
+
+        return super.onKeyDown(keyCode, event);
+    }
+
+    private void cycleLook(int delta) {
+        FujiRecipe recipe = appState.getActiveRecipe();
+        int len = FujiRecipe.FilmSim.values().length;
+        int next = (recipe.filmSim.ordinal() + delta + len) % len;
+        recipe.filmSim = FujiRecipe.FilmSim.values()[next];
+        onRecipeUpdated(recipe);
     }
 
     private void showResult(Bitmap graded, String info) {
@@ -172,7 +303,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         lastResult = graded;
         resultView.setImageBitmap(graded);
         resultView.setVisibility(View.VISIBLE);
-        resultInfo.setText(info + "\n(tap image to return to live view)");
+        resultInfo.setText(info + "\n(Press Shutter or Trash to return)");
         resultInfo.setVisibility(View.VISIBLE);
     }
 
@@ -195,7 +326,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             statusText.setText("Startup error: " + t.getClass().getSimpleName());
         } catch (Throwable ignored) {
-            // Never let error reporting itself crash the activity.
         }
     }
 
@@ -204,6 +334,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (cameraAdapter == null) return;
         cameraAdapter.startPreview(holder);
         final String path = cameraAdapter.getActivePath();
+
+        // Apply initial hardware recipe to camera
+        SonyToFujiHardwareMapper.applyRecipeToHardware(
+            cameraAdapter.getCameraEx(),
+            cameraAdapter.getNormalCamera(),
+            appState.getActiveRecipe()
+        );
+
         ui.post(new Runnable() {
             @Override
             public void run() {
@@ -218,7 +356,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        // Handled directly by Sony hardware layer
     }
 
     @Override
@@ -231,9 +368,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onResume() {
         super.onResume();
-        // Reopen and restart preview when returning from pause. On first launch the
-        // surface is not ready yet; surfaceCreated() will start it. Both paths are
-        // guarded inside the adapter.
         if (cameraAdapter != null && cameraPreview != null) {
             cameraAdapter.startPreview(cameraPreview.getHolder());
         }
