@@ -105,34 +105,50 @@ public class SonyPmcaAdapter implements CameraAdapter {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Strict Reflection Resolver (Bypasses IllegalAccessException on Sony A7R II)
+    // ------------------------------------------------------------------------
+
+    private static Method findAccessibleMethod(Object target, String name, Class<?>... paramTypes) throws NoSuchMethodException {
+        if (target == null) throw new NoSuchMethodException("Target is null for method " + name);
+
+        // 1. Try public interface first
+        try {
+            Class<?> iface = Class.forName("com.sony.scalar.hardware.CameraEx$ParametersModifier");
+            if (iface.isInstance(target)) {
+                Method m = iface.getMethod(name, paramTypes);
+                m.setAccessible(true);
+                return m;
+            }
+        } catch (Throwable ignored) {}
+
+        // 2. Fallback to implementation class hierarchy
+        Class<?> clazz = target.getClass();
+        while (clazz != null) {
+            try {
+                Method m = clazz.getDeclaredMethod(name, paramTypes);
+                m.setAccessible(true);
+                return m;
+            } catch (NoSuchMethodException e) {
+                try {
+                    Method m = clazz.getMethod(name, paramTypes);
+                    m.setAccessible(true);
+                    return m;
+                } catch (NoSuchMethodException ignored) {}
+            }
+            clazz = clazz.getSuperclass();
+        }
+        throw new NoSuchMethodException(name);
+    }
+
     private void initReflectionCache(Class<?> cls) {
         try {
             createModifierMethod = cls.getMethod("createParametersModifier", Camera.Parameters.class);
-            Class<?> modifierCls = Class.forName("com.sony.scalar.hardware.CameraEx$ParametersModifier");
-
-            for (Method m : modifierCls.getMethods()) {
-                String name = m.getName();
-                Class<?>[] params = m.getParameterTypes();
-                if ("getShutterSpeed".equals(name) && params.length == 0) {
-                    getShutterSpeedMethod = m;
-                } else if ("setShutterSpeed".equals(name) && params.length == 2) {
-                    setShutterSpeedMethod = m;
-                } else if ("getSupportedShutterSpeed".equals(name)) {
-                    getSupportedShutterSpeedMethod = m;
-                } else if ("getAperture".equals(name) && params.length == 0) {
-                    getApertureMethod = m;
-                } else if ("setAperture".equals(name) && params.length == 1) {
-                    setApertureMethod = m;
-                } else if ("getSupportedAperture".equals(name)) {
-                    getSupportedApertureMethod = m;
-                } else if ("setISOSensitivity".equals(name) && params.length == 1) {
-                    setISOSensitivityMethod = m;
-                } else if ("getISOSensitivity".equals(name) && params.length == 0) {
-                    getISOSensitivityMethod = m;
-                } else if ("setDriveMode".equals(name)) {
-                    setDriveModeMethod = m;
-                }
-            }
+            createModifierMethod.setAccessible(true);
+            
+            // Note: Caching modifier methods here is dangerous because the modifier instance changes.
+            // We will dynamically resolve them per-call using findAccessibleMethod.
+            
             Log.i(TAG, "CameraEx reflection cache initialized successfully");
             registerHardwareListeners(cls);
         } catch (Throwable t) {
@@ -143,7 +159,6 @@ public class SonyPmcaAdapter implements CameraAdapter {
     private void registerHardwareListeners(Class<?> cls) {
         if (cameraEx == null) return;
         try {
-            // Register ShutterSpeedChangeListener
             Class<?> ssListenerCls = Class.forName("com.sony.scalar.hardware.CameraEx$ShutterSpeedChangeListener");
             Object ssProxy = java.lang.reflect.Proxy.newProxyInstance(
                 ssListenerCls.getClassLoader(),
@@ -157,9 +172,9 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 }
             );
             Method setSsListener = cls.getMethod("setShutterSpeedChangeListener", ssListenerCls);
+            setSsListener.setAccessible(true);
             setSsListener.invoke(cameraEx, ssProxy);
 
-            // Register ApertureChangeListener
             Class<?> apListenerCls = Class.forName("com.sony.scalar.hardware.CameraEx$ApertureChangeListener");
             Object apProxy = java.lang.reflect.Proxy.newProxyInstance(
                 apListenerCls.getClassLoader(),
@@ -173,6 +188,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 }
             );
             Method setApListener = cls.getMethod("setApertureChangeListener", apListenerCls);
+            setApListener.setAccessible(true);
             setApListener.invoke(cameraEx, apProxy);
 
             Log.i(TAG, "Hardware dial listeners registered successfully via Proxy");
