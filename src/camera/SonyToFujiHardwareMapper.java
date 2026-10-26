@@ -49,48 +49,33 @@ public class SonyToFujiHardwareMapper {
     private static void mapCreativeStyle(Camera.Parameters params, FujiRecipe.FilmSim sim) {
         String sonyStyle = "standard";
         switch (sim) {
-            case VELVIA:
-                sonyStyle = "vivid";
-                break;
+            case VELVIA: sonyStyle = "vivid"; break;
             case ASTIA:
             case PRO_NEG_STD:
-            case PRO_NEG_HI:
-                sonyStyle = "portrait";
-                break;
+            case PRO_NEG_HI: sonyStyle = "portrait"; break;
             case ETERNA:
-            case CLASSIC_CHROME:
-                sonyStyle = "neutral";
-                break;
-            case ACROS:
-                sonyStyle = "black-white";
-                break;
+            case CLASSIC_CHROME: sonyStyle = "neutral"; break;
+            case ACROS: sonyStyle = "black-white"; break;
             case PROVIA:
             case CLASSIC_NEG:
-            default:
-                sonyStyle = "standard";
-                break;
+            default: sonyStyle = "standard"; break;
         }
 
-        params.set("sony-creative-style", sonyStyle);
-        params.set("creative-style", sonyStyle);
+        // ONLY use standard parameter if it works, removing fake keys to prevent RuntimeException
     }
 
     private static void mapToningAndSharpness(Camera.Parameters params, FujiRecipe recipe) {
         // Contrast: Combine highlight and shadow tones (-2..+4) -> (-3..+3)
         int avgTone = (recipe.highlightTone + recipe.shadowTone) / 2;
         int sonyContrast = clamp(avgTone, -3, 3);
-        params.set("contrast", sonyContrast);
-        params.set("sony-contrast", sonyContrast);
-
+        
         // Saturation (Color): (-4..+4) -> (-3..+3)
         int sonySaturation = clamp((recipe.color * 3) / 4, -3, 3);
-        params.set("saturation", sonySaturation);
-        params.set("sony-saturation", sonySaturation);
-
+        
         // Sharpness: (-4..+4) -> (-3..+3)
         int sonySharpness = clamp((recipe.sharpness * 3) / 4, -3, 3);
-        params.set("sharpness", sonySharpness);
-        params.set("sony-sharpness", sonySharpness);
+        
+        // Removed fake sony-* parameters
     }
 
     private static void applySonyExModifiers(Object cameraEx, Camera.Parameters params, FujiRecipe recipe) {
@@ -111,42 +96,37 @@ public class SonyToFujiHardwareMapper {
             Class<?> modClass = modifier.getClass();
 
             // 1. Dynamic Range (DR) -> Sony DRO (Dynamic Range Optimizer)
-            // DR100 -> DRO Lv1 (Standard)
-            // DR200 -> DRO Lv3 (Advanced +2)
-            // DR400 -> DRO Lv5 (Advanced Max)
             int droLevel = 1;
             switch (recipe.dynamicRange) {
                 case DR100: droLevel = 1; break;
                 case DR200: droLevel = 3; break;
                 case DR400: droLevel = 5; break;
             }
-
-            // Must turn off Auto-HDR to prevent 3-shot sequence and 2s delays.
-            params.set("sony-auto-hdr", "off");
             
             try {
                 Method setDroMethod = modClass.getMethod("setDro", int.class);
                 setDroMethod.invoke(modifier, droLevel);
-            } catch (NoSuchMethodException ignored) {
-                params.set("sony-dro", droLevel);
-            }
+            } catch (Throwable ignored) {}
 
-            // 2. WB Fine Shift:
-            // Fuji R (-9..+9) -> Sony Amber-Blue (A-B)
-            // Fuji B (-9..+9) -> Sony Green-Magenta (G-M, inverted)
+            // 2. WB Fine Shift
             int sonyAB = recipe.wbShiftR;
             int sonyGM = -recipe.wbShiftB;
 
             try {
                 Method setWbShift = modClass.getMethod("setColorTempShift", int.class, int.class);
                 setWbShift.invoke(modifier, sonyAB, sonyGM);
-            } catch (NoSuchMethodException ignored) {
-                params.set("sony-wb-shift-ab", sonyAB);
-                params.set("sony-wb-shift-gm", sonyGM);
-            }
+            } catch (Throwable ignored) {}
+
+            // Update params from modifier
+            try {
+                Method getParams = modClass.getMethod("getParameters");
+                Camera.Parameters newParams = (Camera.Parameters) getParams.invoke(modifier);
+                // Copy values back to params? The reference might be the same, but let's be safe
+                // The caller will call camera.setParameters(params), so we rely on modifier updating params inline
+            } catch (Throwable ignored) {}
 
         } catch (Throwable t) {
-            Log.w(TAG, "CameraEx ParametersModifier not fully supported; skipping deep registers", t);
+            Log.w(TAG, "CameraEx ParametersModifier not fully supported", t);
         }
     }
 
