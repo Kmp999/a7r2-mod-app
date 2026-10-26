@@ -40,6 +40,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread thread, Throwable ex) {
+                Log.e(TAG, "FATAL CRASH on thread " + thread.getName(), ex);
+            }
+        });
+
         try {
             buildUi();
             initPipeline();
@@ -208,8 +215,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         cameraPreview.getHolder().addCallback(this);
 
-        // Initialize native color engine and precompute initial 17x17x17 LUT
-        ColorEngine.initEngineSafe(appState.getCurrentPresetId(), ColorEngine.MODE_SAFE_FASTEST);
+        // Precompute initial 17x17x17 LUT
         precomputeActiveLut();
         uiController.updateBottomHud();
         

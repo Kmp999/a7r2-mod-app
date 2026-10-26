@@ -312,9 +312,13 @@ public class SonyPmcaAdapter implements CameraAdapter {
     private void commitModifier(Object modifier) {
         if (modifier == null || normalCamera == null) return;
         try {
-            Method getParams = modifier.getClass().getMethod("getParameters");
-            Camera.Parameters params = (Camera.Parameters) getParams.invoke(modifier);
-            normalCamera.setParameters(params);
+            Camera.Parameters toApply = normalCamera.getParameters();
+            try {
+                Method getParams = modifier.getClass().getMethod("getParameters");
+                Object p = getParams.invoke(modifier);
+                if (p instanceof Camera.Parameters) toApply = (Camera.Parameters) p;
+            } catch (Throwable ignored) {}
+            normalCamera.setParameters(toApply);
         } catch (Throwable t) {
             Log.e(TAG, "commitModifier failed", t);
         }
@@ -455,9 +459,15 @@ public class SonyPmcaAdapter implements CameraAdapter {
             if (mod != null) {
                 Method setIsoMethod = findAccessibleMethod(mod, "setISOSensitivity", int.class);
                 setIsoMethod.invoke(mod, targetIso);
-                Method getParams = mod.getClass().getMethod("getParameters");
-                Camera.Parameters modified = (Camera.Parameters) getParams.invoke(mod);
-                normalCamera.setParameters(modified);
+
+                Camera.Parameters toApply = params;
+                try {
+                    Method getParams = mod.getClass().getMethod("getParameters");
+                    Object p = getParams.invoke(mod);
+                    if (p instanceof Camera.Parameters) toApply = (Camera.Parameters) p;
+                } catch (Throwable ignored) {}
+
+                normalCamera.setParameters(toApply);
                 lastManualIsoChangeTime = System.currentTimeMillis();
                 cachedIso = (targetIso == 0) ? "ISO AUTO" : "ISO " + targetIso;
                 return true;
@@ -666,8 +676,16 @@ public class SonyPmcaAdapter implements CameraAdapter {
                         int next = Math.max(0, Math.min(supported.size() - 1, idx + step));
                         Object nextVal = supported.get(next);
                         if (nextVal instanceof Integer) {
-                            setApertureMethod.invoke(modifier, ((Integer) nextVal).intValue());
-                            commitModifier(modifier);
+                            setMethod.invoke(modifier, ((Integer) nextVal).intValue());
+
+                            Camera.Parameters toApply = params;
+                            try {
+                                Method getParams = modifier.getClass().getMethod("getParameters");
+                                Object p = getParams.invoke(modifier);
+                                if (p instanceof Camera.Parameters) toApply = (Camera.Parameters) p;
+                            } catch (Throwable ignored) {}
+
+                            normalCamera.setParameters(toApply);
                             int val = ((Integer) nextVal).intValue();
                             cachedAperture = (val <= 0) ? "F--" : String.format(java.util.Locale.US, "F%.1f", val / 100.0f);
                             return;
