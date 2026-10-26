@@ -278,9 +278,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int rawCode = (scanCode >= 512 || keyCode == 0) ? scanCode : keyCode;
 
         int action = event.getAction();
-        
-        // Strict Hardware Shutter Debouncing
-        if (rawCode == SonyKeyCodes.SONY_KEY_SHUTTER) { // S2 Full Press
+        SonyKeyCodes.FujiAction fujiAction = SonyKeyCodes.resolveAction(rawCode, event);
+
+        // Strict Hardware Shutter Debouncing (catches 514, 516, 0x202, 513, 515, 0x201)
+        if (fujiAction == SonyKeyCodes.FujiAction.FULL_SHUTTER) {
             if (action == KeyEvent.ACTION_DOWN) {
                 if (event.getRepeatCount() > 0 || isS2PhysicallyHeld) return true; // Block hardware burst loop
                 isS2PhysicallyHeld = true;
@@ -288,11 +289,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return true;
             } else if (action == KeyEvent.ACTION_UP) {
                 isS2PhysicallyHeld = false;
+                if (captureController != null) captureController.onShutterKeyUp();
                 return true;
             }
         }
-        
-        if (rawCode == SonyKeyCodes.SONY_KEY_SHUTTER_HALF) { // S1_1 Half Press
+
+        if (fujiAction == SonyKeyCodes.FujiAction.HALF_SHUTTER) {
             if (action == KeyEvent.ACTION_DOWN) {
                 if (event.getRepeatCount() > 0 || isS1Held) return true;
                 isS1Held = true;

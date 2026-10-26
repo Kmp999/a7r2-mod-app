@@ -292,16 +292,30 @@ public class FujiQMenuView extends View {
         if (w <= 0 || h <= 0) return;
 
         // --------------------------------------------------------------------
-        // Mode 1: Quick Photo Review Display
+        // Mode 1: Quick Review Overlay (Instant Capture Feedback)
         // --------------------------------------------------------------------
         if (reviewBitmap != null) {
             srcRect.set(0, 0, reviewBitmap.getWidth(), reviewBitmap.getHeight());
             dstRect.set(0, 0, w, h);
             canvas.drawBitmap(reviewBitmap, srcRect, dstRect, null);
 
-            canvas.drawRect(0, h - 36, w, h, barBgPaint);
-            canvas.drawText(reviewInfo != null ? reviewInfo : "PREVIEW", 16, h - 14, headerPaint);
-            canvas.drawText("PRESS PLAY / SHUTTER TO EXIT", w - 16, h - 14, debugPaint);
+            canvas.drawRect(0, h - 48, w, h, barBgPaint);
+            if (reviewInfo != null && reviewInfo.contains("SAVE FAILED")) {
+                headerPaint.setColor(0xFFFF4444);
+            } else if (reviewInfo != null && reviewInfo.contains("SAVED OK")) {
+                headerPaint.setColor(0xFF44FF44);
+            } else {
+                headerPaint.setColor(COLOR_AMBER_GOLD);
+            }
+            String[] lines = (reviewInfo != null ? reviewInfo : "PREVIEW").split("\n");
+            if (lines.length > 1) {
+                canvas.drawText(lines[0], 16, h - 26, headerPaint);
+                canvas.drawText(lines[1], 16, h - 10, headerPaint);
+            } else {
+                canvas.drawText(lines[0], 16, h - 18, headerPaint);
+            }
+            headerPaint.setColor(COLOR_AMBER_GOLD);
+            canvas.drawText("PRESS PLAY / SHUTTER TO EXIT", w - 16, h - 18, debugPaint);
             return;
         }
 

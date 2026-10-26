@@ -503,12 +503,14 @@ public class SonyPmcaAdapter implements CameraAdapter {
 
             // Step 3: Optional fallback if ISO control throws or is unsupported in current mode
             if (fallbackToModeChange || targetIso == -1) {
-                String sceneMode = params.getSceneMode();
-                if (Camera.Parameters.SCENE_MODE_AUTO.equals(sceneMode) || "superior-auto".equals(sceneMode)) {
+                List<String> supportedModes = params.getSupportedSceneModes();
+                if (supportedModes != null && supportedModes.contains("manual-exposure")) {
                     params.setSceneMode("manual-exposure");
                     normalCamera.setParameters(params);
                     params = normalCamera.getParameters(); // Refresh
-                    modifier = createModMethod.invoke(cameraEx, params); // Recreate
+                    if (createModMethod != null) {
+                        modifier = createModMethod.invoke(cameraEx, params); // Recreate
+                    }
                     if (modifier == null) return;
                 }
                 currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + direction));
@@ -542,10 +544,14 @@ public class SonyPmcaAdapter implements CameraAdapter {
         if (normalCamera == null) return;
         try {
             Camera.Parameters params = normalCamera.getParameters();
+            List<String> supported = params.getSupportedSceneModes();
             String mode = params.get("sony-exposure-mode");
             if ("program-auto".equals(mode) || "aperture-priority".equals(mode)) {
-                params.set("sony-exposure-mode", "manual-exposure");
-                normalCamera.setParameters(params);
+                if (supported != null && supported.contains("manual-exposure")) {
+                    params.set("sony-exposure-mode", "manual-exposure");
+                    params.setSceneMode("manual-exposure");
+                    normalCamera.setParameters(params);
+                }
             }
         } catch (Throwable ignored) {}
     }
@@ -558,7 +564,9 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 m.invoke(cameraEx, step);
                 getShutterSpeed();
                 return;
-            } catch (Throwable ignored) {}
+            } catch (Throwable t) {
+                Log.w(TAG, "cameraEx.adjustShutterSpeed failed", t);
+            }
         }
         incrementShutterSpeed(step);
     }
@@ -595,14 +603,24 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public String getShutterSpeed() {
         try {
             Object modifier = getModifier();
-            if (modifier != null && getShutterSpeedMethod != null) {
-                Object cur = getShutterSpeedMethod.invoke(modifier);
+            if (modifier != null) {
+                Method m = findAccessibleMethod(modifier, "getShutterSpeed");
+                Object cur = m.invoke(modifier);
                 if (cur != null) {
                     Class<?> pairCls = cur.getClass();
-                    Object first = pairCls.getField("first").get(cur);
-                    Object second = pairCls.getField("second").get(cur);
-                    if (first instanceof Integer && second instanceof Integer) {
-                        cachedShutter = formatShutterSpeed(((Integer) first).intValue(), ((Integer) second).intValue());
+                    int first = 0;
+                    int second = 0;
+                    try {
+                        first = ((Integer) pairCls.getField("first").get(cur)).intValue();
+                        second = ((Integer) pairCls.getField("second").get(cur)).intValue();
+                    } catch (Throwable t) {
+                        try {
+                            first = ((Integer) pairCls.getMethod("getFirst").invoke(cur)).intValue();
+                            second = ((Integer) pairCls.getMethod("getSecond").invoke(cur)).intValue();
+                        } catch (Throwable ignored) {}
+                    }
+                    if (first != 0 || second != 0) {
+                        cachedShutter = formatShutterSpeed(first, second);
                     }
                 }
             }
@@ -611,11 +629,12 @@ public class SonyPmcaAdapter implements CameraAdapter {
     }
 
     private String formatShutterSpeed(int num, int den) {
-        if (num <= 0 || den <= 0) return "AUTO";
-        if (num == 1) return "1/" + den;
+        if (num == 65535 && den == 1) return "BULB";
         if (den == 1) return num + "\"";
+        if (num == 1) return "1/" + den;
+        if (num <= 0 || den <= 0) return "AUTO";
         float sec = (float) num / (float) den;
-        return String.format("%.1f\"", sec);
+        return String.format(java.util.Locale.US, "%.1f\"", sec);
     }
 
     public void adjustAperture(int step) {
@@ -625,7 +644,9 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 m.invoke(cameraEx, step);
                 getAperture();
                 return;
-            } catch (Throwable ignored) {}
+            } catch (Throwable t) {
+                Log.w(TAG, "cameraEx.adjustAperture failed", t);
+            }
         }
         incrementAperture(step);
     }
@@ -645,7 +666,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
                             setApertureMethod.invoke(modifier, ((Integer) nextVal).intValue());
                             commitModifier(modifier);
                             int val = ((Integer) nextVal).intValue();
-                            cachedAperture = (val == 0) ? "F--" : String.format("F%.1f", val / 100.0f);
+                            cachedAperture = (val <= 0) ? "F--" : String.format(java.util.Locale.US, "F%.1f", val / 100.0f);
                             return;
                         }
                     }
@@ -659,11 +680,12 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public String getAperture() {
         try {
             Object modifier = getModifier();
-            if (modifier != null && getApertureMethod != null) {
-                Object cur = getApertureMethod.invoke(modifier);
+            if (modifier != null) {
+                Method m = findAccessibleMethod(modifier, "getAperture");
+                Object cur = m.invoke(modifier);
                 if (cur instanceof Integer) {
                     int val = ((Integer) cur).intValue();
-                    cachedAperture = (val == 0) ? "F--" : String.format("F%.1f", val / 100.0f);
+                    cachedAperture = (val <= 0) ? "F--" : String.format(java.util.Locale.US, "F%.1f", val / 100.0f);
                 }
             }
         } catch (Throwable ignored) {}

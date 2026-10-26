@@ -39,6 +39,9 @@ public class CaptureController {
     }
 
     private volatile CameraState currentState = CameraState.IDLE_PREVIEW;
+    private final java.util.concurrent.atomic.AtomicBoolean isCapturing = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private long lastCaptureTime = 0;
+    private static final long MIN_SHOT_INTERVAL_MS = 600;
 
     // Use native 17x17x17 3D LUT when available, gracefully fallback to Java engine
     private static final boolean USE_NATIVE_ENGINE = true;
@@ -107,37 +110,66 @@ public class CaptureController {
     }
 
     public void triggerCapture() {
-        if (currentState == CameraState.CAPTURING_SINGLE || appState.isProcessing()) {
+        long now = System.currentTimeMillis();
+        if (!isCapturing.compareAndSet(false, true)) {
             Log.d(TAG, "Capture ignored: Pipeline currently busy");
             return;
         }
+        if (now - lastCaptureTime < MIN_SHOT_INTERVAL_MS) {
+            isCapturing.set(false);
+            Log.d(TAG, "Capture ignored: In cooldown (<" + MIN_SHOT_INTERVAL_MS + "ms)");
+            return;
+        }
+        lastCaptureTime = now;
 
         setState(CameraState.CAPTURING_SINGLE);
         appState.setProcessing(true);
         uiController.updateStatusAsync("Capturing...");
 
-        cameraAdapter.takePicture(new Camera.PictureCallback() {
-            @Override
-            public void onPictureTaken(final byte[] jpegData, Camera camera) {
-                // Step 1: Immediately cancel BIONZ X shutter cycle to prevent Infinite Capture Loop
-                if (cameraAdapter instanceof SonyPmcaAdapter) {
-                    ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
-                    ((SonyPmcaAdapter) cameraAdapter).cancelAutoFocus();
-                }
-
-                // Step 2: Instant EVF Viewfinder recovery via Watchdog (<150ms target)
-                setState(CameraState.RESTORING_PREVIEW);
-                restorePreviewWithWatchdog(3);
-
-                // Step 3: Offload heavy processing to grading executor
-                processingExecutor.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        processJpeg(jpegData);
+        try {
+            cameraAdapter.takePicture(new Camera.PictureCallback() {
+                @Override
+                public void onPictureTaken(final byte[] jpegData, Camera camera) {
+                    // Step 1: Immediately cancel BIONZ X shutter cycle to prevent Infinite Capture Loop
+                    if (cameraAdapter instanceof SonyPmcaAdapter) {
+                        ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
+                        ((SonyPmcaAdapter) cameraAdapter).cancelAutoFocus();
                     }
-                });
+
+                    // Step 2: Instant EVF Viewfinder recovery via Watchdog (<150ms target)
+                    setState(CameraState.RESTORING_PREVIEW);
+                    restorePreviewWithWatchdog(3);
+
+                    // Step 3: Offload heavy processing to grading executor
+                    processingExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                processJpeg(jpegData);
+                            } finally {
+                                isCapturing.set(false);
+                                setState(CameraState.IDLE_PREVIEW);
+                            }
+                        }
+                    });
+                }
+            });
+        } catch (Throwable t) {
+            Log.e(TAG, "takePicture failed, attempting preview restore", t);
+            if (cameraAdapter instanceof SonyPmcaAdapter) {
+                ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
             }
-        });
+            restorePreviewWithWatchdog(3);
+            isCapturing.set(false);
+            setState(CameraState.IDLE_PREVIEW);
+            appState.setProcessing(false);
+        }
+    }
+
+    public void onShutterKeyUp() {
+        if (cameraAdapter instanceof SonyPmcaAdapter) {
+            ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
+        }
     }
 
     /**
@@ -269,14 +301,24 @@ public class CaptureController {
     }
 
     private void deliverResult(Bitmap bitmap, String preset, int w, int h, long ms, String savedPath) {
-        uiController.updateStatusAsync(preset + "  " + w + "x" + h + "  " + ms + " ms"
-            + (savedPath == null ? "  SAVE FAILED" : ""));
-        ResultListener l = resultListener;
-        if (l != null) {
-            String where = savedPath != null ? ("Saved: " + savedPath) : "Save failed - check SD card";
-            l.onResult(bitmap, preset + "   " + w + "x" + h + "   " + ms + " ms\n" + where);
+        String baseInfo = preset + "  " + w + "x" + h + "  " + ms + " ms";
+        if (savedPath != null) {
+            uiController.updateStatusAsync("SAVED OK: " + savedPath);
+            ResultListener l = resultListener;
+            if (l != null) {
+                l.onResult(bitmap, baseInfo + "\nSAVED OK: " + savedPath);
+            } else {
+                bitmap.recycle();
+            }
         } else {
-            bitmap.recycle();
+            String errDetail = "SAVE FAILED: " + appState.getLastErrorMessage() + " | " + StorageResolver.getLastDiagnostic();
+            uiController.updateStatusAsync(errDetail);
+            ResultListener l = resultListener;
+            if (l != null) {
+                l.onResult(bitmap, baseInfo + "\n" + errDetail);
+            } else {
+                bitmap.recycle();
+            }
         }
     }
 
@@ -364,63 +406,30 @@ public class CaptureController {
         return sample;
     }
 
-    private File resolveWritableDcimDir() {
-        // Sony ScalarOS Real SD Card Path Resolution (Priority Order)
-        String[] roots = {
-            "/mnt/sd0",         // Primary physical SD card slot on Sony A7R II
-            "/mnt/sd1",         // Secondary slot fallback
-            "/mnt/ext_sd",
-            "/storage/sdcard0",
-            "/mnt/sdcard",
-            Environment.getExternalStorageDirectory().getAbsolutePath()
-        };
-        for (String root : roots) {
-            File rootDir = new File(root);
-            if (!rootDir.exists() || !rootDir.isDirectory()) continue;
-            File dcimDir = new File(rootDir, "DCIM/100MSDCF");
-            if (!dcimDir.exists()) {
-                dcimDir.mkdirs();
-            }
-            // Real write test (canWrite() is unreliable on Sony FAT32 mounts)
-            File probe = new File(dcimDir, ".fuji_probe");
-            try {
-                FileOutputStream fos = new FileOutputStream(probe);
-                fos.write(1);
-                fos.close();
-                probe.delete();
-                return dcimDir; // Confirmed physically writable!
-            } catch (Throwable ignored) {
-                // Try next mount point
-            }
-        }
-        return null;
-    }
-
-    /** Saves graded JPEG to SD-card using robust PMCA-specific multi-path resolution. */
+    /** Saves graded JPEG to SD-card using robust StorageResolver. */
     private String saveJpeg(Bitmap bitmap) {
-        // DCF-Compliant 8.3 Filename
-        // Must be exactly 4 chars + 4 digits + .JPG for AvindexStore to catalog it
-        String name = String.format("FUJI%04d.JPG", (System.currentTimeMillis() % 10000));
-        
-        File dir = resolveWritableDcimDir();
+        File dir = StorageResolver.findSonySdCardMount();
         if (dir != null) {
+            String name = StorageResolver.generateDcfFilename(dir);
+            File file = new File(dir, name);
             FileOutputStream out = null;
             try {
-                File file = new File(dir, name);
                 out = new FileOutputStream(file);
                 if (bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
                     out.flush();
                     try {
                         out.getFD().sync(); // Force write to physical storage immediately
                     } catch (Throwable ignored) {} // Prevent SyncFailedException from aborting on custom FAT32 driver
-                    
-                    // Notify Sony AV indexer
-                    notifyAvindex(file.getAbsolutePath());
+                    out.close();
+                    out = null;
+
+                    // 4-tier registration with Sony AvindexStore
+                    StorageResolver.registerWithAvindex(context, file.getAbsolutePath());
                     return file.getAbsolutePath();
                 }
             } catch (Throwable t) {
                 Log.e(TAG, "Save failed in " + dir.getAbsolutePath(), t);
-                appState.setLastErrorMessage(t.getClass().getSimpleName());
+                appState.setLastErrorMessage(t.getClass().getSimpleName() + ": " + t.getMessage());
             } finally {
                 if (out != null) {
                     try {
@@ -429,72 +438,9 @@ public class CaptureController {
                 }
             }
         } else {
-            appState.setLastErrorMessage("No writable SD mount found");
+            appState.setLastErrorMessage("No writable SD mount found (" + StorageResolver.getLastDiagnostic() + ")");
         }
         return null;
-    }
-    
-    private void notifyAvindex(String path) {
-        if (path == null) return;
-        File file = new File(path);
-
-        // 1. Standard Android MediaScannerConnection (triggers background cataloging)
-        if (context != null) {
-            try {
-                android.media.MediaScannerConnection.scanFile(
-                    context,
-                    new String[]{ path },
-                    new String[]{ "image/jpeg" },
-                    null
-                );
-            } catch (Throwable t) {
-                Log.w(TAG, "MediaScannerConnection failed", t);
-            }
-
-            // 2. Standard MediaScanner Broadcast Intent
-            try {
-                android.content.Intent scanIntent = new android.content.Intent(
-                    android.content.Intent.ACTION_MEDIA_SCANNER_SCAN_FILE,
-                    android.net.Uri.fromFile(file)
-                );
-                context.sendBroadcast(scanIntent);
-            } catch (Throwable ignored) {}
-
-            // 3. Sony Scalar Avindex Broadcast (notifies avindex daemon of new image)
-            try {
-                android.content.Intent sonyIntent = new android.content.Intent(
-                    "com.sony.scalar.providers.avindex.ACTION_DATABASE_UPDATED"
-                );
-                context.sendBroadcast(sonyIntent);
-            } catch (Throwable ignored) {}
-        }
-
-        // 4. Sony Scalar AvindexStore API Reflection (direct database registration)
-        try {
-            Class<?> cls = Class.forName("com.sony.scalar.provider.AvindexStore$Images$Media");
-            for (java.lang.reflect.Method m : cls.getMethods()) {
-                if ("notifyImageCreated".equals(m.getName())) {
-                    Class<?>[] pTypes = m.getParameterTypes();
-                    if (pTypes.length == 1 && pTypes[0] == String.class) {
-                        m.invoke(null, path);
-                        Log.i(TAG, "Notified AvindexStore: " + path);
-                        break;
-                    } else if (pTypes.length == 2 && context != null) {
-                        if (android.content.Context.class.isAssignableFrom(pTypes[0]) && pTypes[1] == String.class) {
-                            m.invoke(null, context, path);
-                            Log.i(TAG, "Notified AvindexStore with Context: " + path);
-                            break;
-                        } else if (android.content.ContentResolver.class.isAssignableFrom(pTypes[0]) && pTypes[1] == String.class) {
-                            m.invoke(null, context.getContentResolver(), path);
-                            Log.i(TAG, "Notified AvindexStore with ContentResolver: " + path);
-                            break;
-                        }
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            Log.d(TAG, "AvindexStore direct notification skipped or unsupported", t);
-        }
     }
 
     public void shutdown() {

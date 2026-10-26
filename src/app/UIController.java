@@ -273,12 +273,12 @@ public class UIController {
             }
 
             case FRONT_DIAL_CW:
-                if (cameraAdapter != null) cameraAdapter.incrementAperture(1);
+                if (cameraAdapter != null) cameraAdapter.adjustAperture(1);
                 if (qMenuView != null) qMenuView.highlightSegment(2); // Highlight Aperture
                 updateBottomHud();
                 return true;
             case FRONT_DIAL_CCW:
-                if (cameraAdapter != null) cameraAdapter.incrementAperture(-1);
+                if (cameraAdapter != null) cameraAdapter.adjustAperture(-1);
                 if (qMenuView != null) qMenuView.highlightSegment(2);
                 updateBottomHud();
                 return true;

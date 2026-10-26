@@ -98,16 +98,15 @@ public final class SonyKeyCodes {
     }
 
     private static void registerDefaultKeyCodes() {
-        // Core Shutter
+        // Core Shutter (A7R II firmware uses 515 for S1_1 half-press and 516 for S2 full-press)
         sKeyCodeMap.put(0x201, FujiAction.HALF_SHUTTER);
         sKeyCodeMap.put(0x202, FujiAction.FULL_SHUTTER);
         sKeyCodeMap.put(513, FujiAction.HALF_SHUTTER);
         sKeyCodeMap.put(514, FujiAction.FULL_SHUTTER);
+        sKeyCodeMap.put(515, FujiAction.HALF_SHUTTER);
+        sKeyCodeMap.put(516, FujiAction.FULL_SHUTTER);
 
-        // Menu & Navigation
-        sKeyCodeMap.put(515, FujiAction.MENU);
-        sKeyCodeMap.put(516, FujiAction.CENTER);
-        
+        // Navigation
         sKeyCodeMap.put(517, FujiAction.DPAD_UP);
         sKeyCodeMap.put(103, FujiAction.DPAD_UP);
         
@@ -121,11 +120,15 @@ public final class SonyKeyCodes {
         sKeyCodeMap.put(106, FujiAction.DPAD_RIGHT);
 
         // Dials
+        // Control Wheel (ISV_DIAL3)
         sKeyCodeMap.put(519, FujiAction.WHEEL_CW);
         sKeyCodeMap.put(520, FujiAction.WHEEL_CCW);
+        sKeyCodeMap.put(634, FujiAction.WHEEL_CW);
+        sKeyCodeMap.put(635, FujiAction.WHEEL_CCW);
         sKeyCodeMap.put(0x209, FujiAction.WHEEL_CW);
         sKeyCodeMap.put(0x20a, FujiAction.WHEEL_CCW);
 
+        // Front Dial (ISV_DIAL1)
         sKeyCodeMap.put(525, FujiAction.FRONT_DIAL_CW);
         sKeyCodeMap.put(534, FujiAction.FRONT_DIAL_CW);
         sKeyCodeMap.put(0x205, FujiAction.FRONT_DIAL_CW);
@@ -134,7 +137,9 @@ public final class SonyKeyCodes {
         sKeyCodeMap.put(535, FujiAction.FRONT_DIAL_CCW);
         sKeyCodeMap.put(0x206, FujiAction.FRONT_DIAL_CCW);
 
+        // Rear Dial (ISV_DIAL2)
         sKeyCodeMap.put(527, FujiAction.REAR_DIAL_CW);
+        sKeyCodeMap.put(529, FujiAction.REAR_DIAL_CW);
         sKeyCodeMap.put(536, FujiAction.REAR_DIAL_CW);
         sKeyCodeMap.put(0x207, FujiAction.REAR_DIAL_CW);
         
