@@ -78,6 +78,38 @@ public class SonyToFujiHardwareMapper {
         // Removed fake sony-* parameters
     }
 
+    // ------------------------------------------------------------------------
+    // Strict Reflection Resolver
+    // ------------------------------------------------------------------------
+    private static Method findAccessibleMethod(Object target, String name, Class<?>... paramTypes) throws NoSuchMethodException {
+        if (target == null) throw new NoSuchMethodException("Target is null for method " + name);
+        try {
+            Class<?> iface = Class.forName("com.sony.scalar.hardware.CameraEx$ParametersModifier");
+            if (iface.isInstance(target)) {
+                Method m = iface.getMethod(name, paramTypes);
+                m.setAccessible(true);
+                return m;
+            }
+        } catch (Throwable ignored) {}
+
+        Class<?> clazz = target.getClass();
+        while (clazz != null) {
+            try {
+                Method m = clazz.getDeclaredMethod(name, paramTypes);
+                m.setAccessible(true);
+                return m;
+            } catch (NoSuchMethodException e) {
+                try {
+                    Method m = clazz.getMethod(name, paramTypes);
+                    m.setAccessible(true);
+                    return m;
+                } catch (NoSuchMethodException ignored) {}
+            }
+            clazz = clazz.getSuperclass();
+        }
+        throw new NoSuchMethodException(name);
+    }
+
     private static void applySonyExModifiers(Object cameraEx, Camera.Parameters params, FujiRecipe recipe) {
         try {
             Class<?> camExClass = cameraEx.getClass();
@@ -85,6 +117,7 @@ public class SonyToFujiHardwareMapper {
             for (Method m : camExClass.getMethods()) {
                 if ("createParametersModifier".equals(m.getName()) && m.getParameterTypes().length == 1) {
                     createModMethod = m;
+                    createModMethod.setAccessible(true);
                     break;
                 }
             }
@@ -92,8 +125,6 @@ public class SonyToFujiHardwareMapper {
 
             Object modifier = createModMethod.invoke(cameraEx, params);
             if (modifier == null) return;
-
-            Class<?> modClass = modifier.getClass();
 
             // 1. Dynamic Range (DR) -> Sony DRO (Dynamic Range Optimizer)
             int droLevel = 1;
@@ -104,7 +135,7 @@ public class SonyToFujiHardwareMapper {
             }
             
             try {
-                Method setDroMethod = modClass.getMethod("setDro", int.class);
+                Method setDroMethod = findAccessibleMethod(modifier, "setDro", int.class);
                 setDroMethod.invoke(modifier, droLevel);
             } catch (Throwable ignored) {}
 
@@ -113,16 +144,14 @@ public class SonyToFujiHardwareMapper {
             int sonyGM = -recipe.wbShiftB;
 
             try {
-                Method setWbShift = modClass.getMethod("setColorTempShift", int.class, int.class);
+                Method setWbShift = findAccessibleMethod(modifier, "setColorTempShift", int.class, int.class);
                 setWbShift.invoke(modifier, sonyAB, sonyGM);
             } catch (Throwable ignored) {}
 
             // Update params from modifier
             try {
-                Method getParams = modClass.getMethod("getParameters");
+                Method getParams = findAccessibleMethod(modifier, "getParameters");
                 Camera.Parameters newParams = (Camera.Parameters) getParams.invoke(modifier);
-                // Copy values back to params? The reference might be the same, but let's be safe
-                // The caller will call camera.setParameters(params), so we rely on modifier updating params inline
             } catch (Throwable ignored) {}
 
         } catch (Throwable t) {
