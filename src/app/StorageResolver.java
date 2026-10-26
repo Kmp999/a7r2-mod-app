@@ -1,8 +1,11 @@
 package com.fujilite.a7r2;
 
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.media.ExifInterface;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Environment;
@@ -163,6 +166,7 @@ public final class StorageResolver {
 
                 if (compressed && file.exists() && file.length() > 0) {
                     String savedPath = file.getAbsolutePath();
+                    writeExifMetadata(savedPath);
                     sLastDiagnostic = "OK: " + savedPath + " (" + (file.length() / 1024) + "KB)";
                     Log.i(TAG, "Successfully saved photo: " + sLastDiagnostic);
 
@@ -180,6 +184,25 @@ public final class StorageResolver {
         sLastDiagnostic = "FAIL: All " + candidates.size() + " mount attempts failed";
         Log.e(TAG, sLastDiagnostic);
         return null;
+    }
+
+    /**
+     * Writes standard DCF / Sony EXIF metadata into the saved JPEG.
+     */
+    public static void writeExifMetadata(String filePath) {
+        if (filePath == null) return;
+        try {
+            ExifInterface exif = new ExifInterface(filePath);
+            exif.setAttribute(ExifInterface.TAG_MAKE, "SONY");
+            exif.setAttribute(ExifInterface.TAG_MODEL, "ILCE-7RM2");
+            String dt = new java.text.SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(new java.util.Date());
+            exif.setAttribute(ExifInterface.TAG_DATETIME, dt);
+            exif.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_NORMAL));
+            exif.saveAttributes();
+            Log.d(TAG, "EXIF metadata written for DCF compliance: " + filePath);
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed writing EXIF tags: " + t.getMessage());
+        }
     }
 
     /**
@@ -245,7 +268,27 @@ public final class StorageResolver {
             } catch (Throwable ignored) {}
         }
 
-        // 4. Sony Scalar AvindexStore API Reflection
+        // 4. Sony Scalar AvindexStore Content Provider Insert & API Reflection
+        if (context != null) {
+            try {
+                Class<?> cls = Class.forName("com.sony.scalar.provider.AvindexStore$Images$Media");
+                java.lang.reflect.Field uriField = cls.getField("EXTERNAL_CONTENT_URI");
+                Uri uri = (Uri) uriField.get(null);
+                if (uri != null) {
+                    ContentValues cv = new ContentValues();
+                    cv.put("_data", filePath);
+                    cv.put("_display_name", file.getName());
+                    cv.put("mime_type", "image/jpeg");
+                    cv.put("date_added", Long.valueOf(System.currentTimeMillis() / 1000));
+                    cv.put("date_modified", Long.valueOf(System.currentTimeMillis() / 1000));
+                    context.getContentResolver().insert(uri, cv);
+                    Log.i(TAG, "AvindexStore content provider insert succeeded for " + filePath);
+                }
+            } catch (Throwable t) {
+                Log.d(TAG, "AvindexStore ContentProvider insert unavailable: " + t.getMessage());
+            }
+        }
+
         try {
             Class<?> cls = Class.forName("com.sony.scalar.provider.AvindexStore$Images$Media");
             for (Method m : cls.getMethods()) {
@@ -270,6 +313,62 @@ public final class StorageResolver {
             }
         } catch (Throwable t) {
             Log.d(TAG, "AvindexStore reflection not available: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Finds the latest saved JPEG photo across all candidate DCIM directories.
+     */
+    public static File getLatestSavedPhoto() {
+        List<File> candidates = getCandidateDcimDirs();
+        File latestFile = null;
+        long latestTime = 0;
+
+        for (File dir : candidates) {
+            if (!dir.exists() || !dir.isDirectory()) continue;
+            File[] files = dir.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                if (f.isFile() && f.length() > 0) {
+                    String name = f.getName().toUpperCase(Locale.US);
+                    if (name.endsWith(".JPG") || name.endsWith(".JPEG")) {
+                        long mod = f.lastModified();
+                        if (mod > latestTime) {
+                            latestTime = mod;
+                            latestFile = f;
+                        }
+                    }
+                }
+            }
+        }
+        return latestFile;
+    }
+
+    /**
+     * Safely decodes a photo file into a display-safe Bitmap (e.g. 640x480 max).
+     */
+    public static Bitmap loadPhotoForReview(File photoFile, int maxDim) {
+        if (photoFile == null || !photoFile.exists()) return null;
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(photoFile.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+
+            int sampleSize = 1;
+            int maxSide = Math.max(bounds.outWidth, bounds.outHeight);
+            while (maxSide / (sampleSize * 2) >= maxDim) {
+                sampleSize *= 2;
+            }
+
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = sampleSize;
+            opts.inPreferredConfig = Bitmap.Config.RGB_565;
+            opts.inPurgeable = true;
+            return BitmapFactory.decodeFile(photoFile.getAbsolutePath(), opts);
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to decode photo for review: " + photoFile.getAbsolutePath(), t);
+            return null;
         }
     }
 

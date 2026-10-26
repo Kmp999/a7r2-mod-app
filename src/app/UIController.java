@@ -196,6 +196,11 @@ public class UIController {
         // Mode 1: Quick Photo Review Overlay is Active
         if (qMenuView != null && qMenuView.isReviewing()) {
             qMenuView.clearQuickReview();
+            if (action == SonyKeyCodes.FujiAction.FULL_SHUTTER) {
+                if (callback != null) callback.onTriggerCapture();
+            } else if (action == SonyKeyCodes.FujiAction.HALF_SHUTTER) {
+                if (cameraAdapter != null) cameraAdapter.autoFocus();
+            }
             return true;
         }
 
@@ -203,7 +208,18 @@ public class UIController {
         boolean qOpen = (qMenuView != null && qMenuView.isQMenuOpen()) || (callback != null && callback.isQMenuOpen());
         if (qOpen) {
             switch (action) {
+                case FULL_SHUTTER:
+                    if (qMenuView != null) qMenuView.setQMenuOpen(false);
+                    if (callback != null && callback.isQMenuOpen()) callback.onToggleQMenu();
+                    if (callback != null) callback.onTriggerCapture();
+                    return true;
+
                 case HALF_SHUTTER:
+                    if (qMenuView != null) qMenuView.setQMenuOpen(false);
+                    if (callback != null && callback.isQMenuOpen()) callback.onToggleQMenu();
+                    if (cameraAdapter != null) cameraAdapter.autoFocus();
+                    return true;
+
                 case C4_TRASH:
                 case MENU:
                     if (qMenuView != null) qMenuView.setQMenuOpen(false);

@@ -98,13 +98,13 @@ public final class SonyKeyCodes {
     }
 
     private static void registerDefaultKeyCodes() {
-        // Core Shutter (A7R II firmware uses 515 for S1_1 half-press and 516 for S2 full-press)
-        sKeyCodeMap.put(0x201, FujiAction.HALF_SHUTTER);
-        sKeyCodeMap.put(0x202, FujiAction.FULL_SHUTTER);
-        sKeyCodeMap.put(513, FujiAction.HALF_SHUTTER);
-        sKeyCodeMap.put(514, FujiAction.FULL_SHUTTER);
-        sKeyCodeMap.put(515, FujiAction.HALF_SHUTTER);
-        sKeyCodeMap.put(516, FujiAction.FULL_SHUTTER);
+        // Core Shutter & Playback controls
+        sKeyCodeMap.put(0x201, FujiAction.HALF_SHUTTER); // 513
+        sKeyCodeMap.put(513,   FujiAction.HALF_SHUTTER);
+        sKeyCodeMap.put(0x202, FujiAction.FULL_SHUTTER); // 514
+        sKeyCodeMap.put(514,   FujiAction.FULL_SHUTTER);
+        sKeyCodeMap.put(0x204, FujiAction.PLAY);         // 516: Playback button
+        sKeyCodeMap.put(516,   FujiAction.PLAY);
 
         // Navigation
         sKeyCodeMap.put(517, FujiAction.DPAD_UP);

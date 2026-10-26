@@ -94,7 +94,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             @Override
             public void onDismissRequest() {
-                if (qMenuView != null) qMenuView.setQMenuOpen(false);
+                if (qMenuView != null) {
+                    qMenuView.setQMenuOpen(false);
+                    if (appState != null) appState.setQMenuVisible(false);
+                    ui.removeCallbacks(applyHardwareParamsRunnable);
+                    applyHardwareParamsRunnable.run();
+                    if (cameraAdapter != null) cameraAdapter.resumePreview();
+                }
             }
         });
         qMenuView.setFocusable(false);
@@ -114,7 +120,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @Override
             public void onToggleQMenu() {
                 if (qMenuView != null) {
-                    qMenuView.setQMenuOpen(!qMenuView.isQMenuOpen());
+                    boolean target = !qMenuView.isQMenuOpen();
+                    qMenuView.setQMenuOpen(target);
+                    if (appState != null) appState.setQMenuVisible(target);
+                    if (!target) {
+                        ui.removeCallbacks(applyHardwareParamsRunnable);
+                        applyHardwareParamsRunnable.run();
+                        if (cameraAdapter != null) cameraAdapter.resumePreview();
+                    }
                 }
             }
 
@@ -179,7 +192,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @Override
             public void onToggleQuickReview() {
                 if (qMenuView != null) {
-                    if (qMenuView.isReviewing()) qMenuView.clearQuickReview();
+                    if (qMenuView.isReviewing()) {
+                        qMenuView.clearQuickReview();
+                        if (cameraAdapter != null) cameraAdapter.resumePreview();
+                        return;
+                    }
+
+                    // Attempt 1: Native Sony Scalar Review Intent
+                    try {
+                        java.io.File latest = StorageResolver.getLatestSavedPhoto();
+                        android.content.Intent reviewIntent = new android.content.Intent("com.sony.scalar.intent.action.REVIEW");
+                        if (latest != null) {
+                            reviewIntent.setDataAndType(android.net.Uri.fromFile(latest), "image/jpeg");
+                        }
+                        startActivity(reviewIntent);
+                        return;
+                    } catch (Throwable t) {
+                        Log.d(TAG, "Native Sony review intent unavailable; using in-app review: " + t.getMessage());
+                    }
+
+                    // Attempt 2: Bulletproof In-App Quick Review
+                    java.io.File latest = StorageResolver.getLatestSavedPhoto();
+                    if (latest != null && latest.exists()) {
+                        Bitmap bmp = StorageResolver.loadPhotoForReview(latest, 640);
+                        if (bmp != null) {
+                            qMenuView.setQuickReviewBitmap(bmp, "REPLAY: " + latest.getName() + "\nPRESS PLAY / SHUTTER TO EXIT");
+                            return;
+                        }
+                    }
+
+                    if (uiController != null) {
+                        uiController.updateStatusAsync("No photos found in DCIM");
+                    }
                 }
             }
 
@@ -230,24 +274,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    private final Runnable applyHardwareParamsRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (cameraAdapter != null) {
+                SonyToFujiHardwareMapper.applyRecipeToHardware(
+                    cameraAdapter.getCameraEx(),
+                    cameraAdapter.getNormalCamera(),
+                    appState.getActiveRecipe()
+                );
+            }
+        }
+    };
+
     private void onRecipeUpdated(FujiRecipe r) {
         if (qMenuView != null) {
             qMenuView.setRecipe(r);
             qMenuView.showCarouselBanner(r.filmSim.label);
         }
 
-        // 1. Stage 1: Hardware mapping to Sony ISP (0ms)
-        if (cameraAdapter != null) {
-            SonyToFujiHardwareMapper.applyRecipeToHardware(
-                cameraAdapter.getCameraEx(),
-                cameraAdapter.getNormalCamera(),
-                r
-            );
-        }
-
-        // 2. Stage 2: Pre-compute 17x17x17 LUT (~2ms)
+        // 1. Stage 1: Pre-compute 17x17x17 LUT (~2ms)
         precomputeActiveLut();
         uiController.updateBottomHud();
+
+        // 2. Stage 2: Hardware mapping to Sony ISP (Debounced during Q-Menu interaction to prevent driver stalls)
+        ui.removeCallbacks(applyHardwareParamsRunnable);
+        if (qMenuView != null && qMenuView.isQMenuOpen()) {
+            ui.postDelayed(applyHardwareParamsRunnable, 300);
+        } else {
+            applyHardwareParamsRunnable.run();
+        }
     }
 
     private void precomputeActiveLut() {
@@ -287,11 +343,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int action = event.getAction();
         SonyKeyCodes.FujiAction fujiAction = SonyKeyCodes.resolveAction(rawCode, event);
 
-        // Strict Hardware Shutter Debouncing (catches 514, 516, 0x202, 513, 515, 0x201)
+        // Strict Hardware Shutter Debouncing (catches 514, 0x202, 513, 0x201)
         if (fujiAction == SonyKeyCodes.FujiAction.FULL_SHUTTER) {
             if (action == KeyEvent.ACTION_DOWN) {
                 if (event.getRepeatCount() > 0 || isS2PhysicallyHeld) return true; // Block hardware burst loop
                 isS2PhysicallyHeld = true;
+
+                // Seamless dismissal: if reviewing or in Q-Menu, exit overlay immediately to shoot
+                if (qMenuView != null && qMenuView.isReviewing()) {
+                    qMenuView.clearQuickReview();
+                }
+                if (qMenuView != null && qMenuView.isQMenuOpen()) {
+                    qMenuView.setQMenuOpen(false);
+                    if (appState != null) appState.setQMenuVisible(false);
+                    ui.removeCallbacks(applyHardwareParamsRunnable);
+                    applyHardwareParamsRunnable.run();
+                    if (cameraAdapter != null) cameraAdapter.resumePreview();
+                }
+
                 if (captureController != null) captureController.triggerCapture();
                 return true;
             } else if (action == KeyEvent.ACTION_UP) {
@@ -305,6 +374,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (action == KeyEvent.ACTION_DOWN) {
                 if (event.getRepeatCount() > 0 || isS1Held) return true;
                 isS1Held = true;
+
+                // Half-press dismisses review or Q-Menu immediately back to Live View
+                if (qMenuView != null && qMenuView.isReviewing()) {
+                    qMenuView.clearQuickReview();
+                }
+                if (qMenuView != null && qMenuView.isQMenuOpen()) {
+                    qMenuView.setQMenuOpen(false);
+                    if (appState != null) appState.setQMenuVisible(false);
+                    ui.removeCallbacks(applyHardwareParamsRunnable);
+                    applyHardwareParamsRunnable.run();
+                    if (cameraAdapter != null) cameraAdapter.resumePreview();
+                }
+
                 if (cameraAdapter instanceof SonyPmcaAdapter) {
                     ((SonyPmcaAdapter) cameraAdapter).autoFocus();
                 }

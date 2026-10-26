@@ -103,6 +103,19 @@ public class CaptureController {
 
     private volatile ResultListener resultListener;
 
+    private final Runnable captureWatchdogRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (isCapturing.compareAndSet(true, false)) {
+                Log.w(TAG, "Capture watchdog triggered (>2500ms without onPictureTaken); releasing hardware lock");
+                setState(CameraState.IDLE_PREVIEW);
+                appState.setProcessing(false);
+                restorePreviewWithWatchdog(3);
+                uiController.updateStatusAsync("Ready");
+            }
+        }
+    };
+
     public void setResultListener(ResultListener l) {
         this.resultListener = l;
     }
@@ -124,10 +137,15 @@ public class CaptureController {
         appState.setProcessing(true);
         uiController.updateStatusAsync("Capturing...");
 
+        // Arm failsafe watchdog in case hardware/HAL fails to invoke onPictureTaken
+        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+        watchdogHandler.postDelayed(captureWatchdogRunnable, 2500);
+
         try {
             cameraAdapter.takePicture(new Camera.PictureCallback() {
                 @Override
                 public void onPictureTaken(final byte[] jpegData, Camera camera) {
+                    watchdogHandler.removeCallbacks(captureWatchdogRunnable);
                     try {
                         // 1. Immediately cancel BIONZ X shutter cycle to prevent Infinite Capture Loop
                         if (cameraAdapter instanceof SonyPmcaAdapter) {
@@ -156,6 +174,7 @@ public class CaptureController {
             });
             return true;
         } catch (Throwable t) {
+            watchdogHandler.removeCallbacks(captureWatchdogRunnable);
             Log.e(TAG, "takePicture failed, attempting preview restore", t);
             if (cameraAdapter instanceof SonyPmcaAdapter) {
                 ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
@@ -420,6 +439,7 @@ public class CaptureController {
     }
 
     public void shutdown() {
+        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
         processingExecutor.shutdown();
         ioExecutor.shutdown();
     }
