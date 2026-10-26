@@ -62,6 +62,14 @@ public class FujiQMenuView extends View {
     private String topStatus = "FUJIFILM LIVE";
     private String carouselBanner = null;
     private long carouselBannerEndTime = 0;
+    
+    // On-Screen Diagnostic
+    private String debugTelemetry = "";
+
+    public void setDebugTelemetry(String msg) {
+        this.debugTelemetry = msg;
+        postInvalidate();
+    }
 
     // Zero-GC Live View Canvas Buffer
     private Bitmap liveViewBitmap = null;
