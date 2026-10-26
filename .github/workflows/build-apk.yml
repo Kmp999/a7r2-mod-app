@@ -68,6 +68,7 @@ jobs:
           $AAPT package -f \
             -M AndroidManifest.xml \
             -S res \
+            -A assets \
             -I $PLATFORM \
             -F bin/unaligned.apk
 

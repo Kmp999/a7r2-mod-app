@@ -62,6 +62,30 @@ public class ColorEngine {
         }
     }
 
+    /** Precomputes 17x17x17 3D LUT overlaying recipe parameters on top of a base film stock LUT table. */
+    public static boolean precomputeLut17WithBaseSafe(byte[] baseLutTable, short[] ccmQ8, byte[] rCurve, byte[] gCurve, byte[] bCurve) {
+        if (!sNativeAvailable) return false;
+        try {
+            precomputeLut17WithBase(baseLutTable, ccmQ8, rCurve, gCurve, bCurve);
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "precomputeLut17WithBase failed", t);
+            return false;
+        }
+    }
+
+    /** Directly loads a 14,739-byte 17x17x17 3D LUT table into native memory. */
+    public static boolean loadLut17TableSafe(byte[] lutTable) {
+        if (!sNativeAvailable || lutTable == null || lutTable.length < 14739) return false;
+        try {
+            loadLut17Table(lutTable);
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "loadLut17Table failed", t);
+            return false;
+        }
+    }
+
     /** Applies precomputed 17x17x17 3D LUT to packed RGB_565 buffer in-place. */
     public static boolean applyLut17RGB565Safe(short[] rgb565, int pixelCount) {
         if (!sNativeAvailable) return false;
@@ -117,6 +141,16 @@ public class ColorEngine {
      * Precomputes 17x17x17 3D LUT from matrix and tone curves.
      */
     public static native void precomputeLut17(short[] ccmQ8, byte[] toneCurveR, byte[] toneCurveG, byte[] toneCurveB);
+
+    /**
+     * Precomputes 17x17x17 3D LUT overlaying matrix and tone curves on a base film stock LUT table.
+     */
+    public static native void precomputeLut17WithBase(byte[] baseLutTable, short[] ccmQ8, byte[] toneCurveR, byte[] toneCurveG, byte[] toneCurveB);
+
+    /**
+     * Loads 17x17x17 3D LUT table directly into native memory.
+     */
+    public static native void loadLut17Table(byte[] lutTable);
 
     /**
      * Applies 17x17x17 3D LUT in-place to RGB_565 buffer.

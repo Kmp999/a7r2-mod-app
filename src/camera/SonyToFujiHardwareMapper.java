@@ -52,16 +52,43 @@ public class SonyToFujiHardwareMapper {
     private static void mapCreativeStyle(Camera.Parameters params, FujiRecipe.FilmSim sim) {
         String sonyStyle = "standard";
         switch (sim) {
-            case VELVIA: sonyStyle = "vivid"; break;
+            case VELVIA:
+            case CINEMA_LANDSCAPE:
+            case NEON_CYBERPUNK:
+                sonyStyle = "vivid";
+                break;
             case ASTIA:
             case PRO_NEG_STD:
-            case PRO_NEG_HI: sonyStyle = "portrait"; break;
+            case PRO_NEG_HI:
+            case KODAK_PORTRA_5205:
+            case VINTAGE_PINK:
+                sonyStyle = "portrait";
+                break;
             case ETERNA:
-            case CLASSIC_CHROME: sonyStyle = "neutral"; break;
-            case ACROS: sonyStyle = "black-white"; break;
+            case CLASSIC_CHROME:
+            case FUJI_ETERNA_250D:
+            case FUJI_3510:
+            case FUJI_3513DI:
+            case KODAK_VISION_5218:
+            case KODAK_2383_D60:
+            case KODAK_2383_D55:
+            case KODAK_2383_D65:
+            case KODAK_FILMSTOCK_50:
+            case TEAL_ORANGE:
+            case TENSION_GREEN:
+                sonyStyle = "neutral";
+                break;
+            case ACROS:
+                sonyStyle = "black-white";
+                break;
             case PROVIA:
             case CLASSIC_NEG:
-            default: sonyStyle = "standard"; break;
+            case FUJI_REALA_500D:
+            case FUJI_F125:
+            case AEROLUX:
+            default:
+                sonyStyle = "standard";
+                break;
         }
 
         // ONLY use standard parameter if it works, removing fake keys to prevent RuntimeException

@@ -308,12 +308,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void precomputeActiveLut() {
         FujiRecipe r = appState.getActiveRecipe();
-        ColorEngine.precomputeLut17Safe(
-            r.computeCcmQ8(),
-            r.generateToneCurve('R'),
-            r.generateToneCurve('G'),
-            r.generateToneCurve('B')
-        );
+        byte[] baseLut = LutManager.getLutTable(this, r.filmSim.lutFile);
+        if (baseLut != null) {
+            ColorEngine.precomputeLut17WithBaseSafe(
+                baseLut,
+                r.computeCcmQ8(),
+                r.generateToneCurve('R'),
+                r.generateToneCurve('G'),
+                r.generateToneCurve('B')
+            );
+        } else {
+            ColorEngine.precomputeLut17Safe(
+                r.computeCcmQ8(),
+                r.generateToneCurve('R'),
+                r.generateToneCurve('G'),
+                r.generateToneCurve('B')
+            );
+        }
     }
 
     private void cycleLook(int delta) {

@@ -8,10 +8,13 @@ public class AppState {
         ASYNC_FULLRES
     }
 
-    // Film simulations matching FujiRecipe
+    // Film simulations matching FujiRecipe (Fujifilm, Kodak, Cinema stocks)
     public static final String[] PRESET_NAMES = {
         "Provia", "Velvia", "Astia", "Classic Chr", "Classic Neg",
-        "Pro Neg Hi", "Pro Neg Std", "Eterna", "Acros"
+        "Pro Neg Hi", "Pro Neg Std", "Eterna", "Acros",
+        "Reala 500D", "Eterna 250D", "F125", "Fuji 3510", "3513DI D60",
+        "Portra 5205", "Vision 5218", "Kodak 2383", "2383 D55", "2383 D65", "Filmstock 50",
+        "AeroLux IR", "Teal & Orange", "Tension Green", "Landscape", "Vintage Pink", "Neon Cyber"
     };
 
     private FujiRecipe activeRecipe = new FujiRecipe();

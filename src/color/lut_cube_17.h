@@ -52,6 +52,43 @@ static inline void lut17_precompute(Lut17Context* lut,
     }
 }
 
+/**
+ * Pre-computes 17x17x17 3D LUT starting from a base film simulation table (e.g. Kodak 2383, Fuji 3510, etc.)
+ * and overlays custom recipe parameters (Color Correction Matrix + 1D Tone curves).
+ */
+static inline void lut17_precompute_with_base(Lut17Context* lut,
+                                              const uint8_t* base_table,
+                                              const int16_t ccm_q8[9],
+                                              const uint8_t tone_curve_r[256],
+                                              const uint8_t tone_curve_g[256],
+                                              const uint8_t tone_curve_b[256]) {
+    if (base_table == NULL) {
+        lut17_precompute(lut, ccm_q8, tone_curve_r, tone_curve_g, tone_curve_b);
+        return;
+    }
+    int idx = 0;
+    int i;
+    for (i = 0; i < LUT_TOTAL_NODES; i++) {
+        int r_val = base_table[idx];
+        int g_val = base_table[idx + 1];
+        int b_val = base_table[idx + 2];
+
+        // 1. Color Correction Matrix Q8.8
+        int r_mat = (ccm_q8[0] * r_val + ccm_q8[1] * g_val + ccm_q8[2] * b_val + 128) >> 8;
+        int g_mat = (ccm_q8[3] * r_val + ccm_q8[4] * g_val + ccm_q8[5] * b_val + 128) >> 8;
+        int b_mat = (ccm_q8[6] * r_val + ccm_q8[7] * g_val + ccm_q8[8] * b_val + 128) >> 8;
+
+        if (r_mat < 0) r_mat = 0; else if (r_mat > 255) r_mat = 255;
+        if (g_mat < 0) g_mat = 0; else if (g_mat > 255) g_mat = 255;
+        if (b_mat < 0) b_mat = 0; else if (b_mat > 255) b_mat = 255;
+
+        // 2. 1D Tone Curves
+        lut->table[idx++] = tone_curve_r[r_mat];
+        lut->table[idx++] = tone_curve_g[g_mat];
+        lut->table[idx++] = tone_curve_b[b_mat];
+    }
+}
+
 #define LUT17_OFFSET(rr, gg, bb) (((bb) * 289 + (gg) * 17 + (rr)) * 3)
 
 /**

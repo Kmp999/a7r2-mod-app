@@ -13,18 +13,43 @@ public class FujiRecipe {
     public static final int SLOT_COUNT = 7; // C1 - C7
 
     public enum FilmSim {
-        PROVIA("PROVIA/STD"),
-        VELVIA("VELVIA/VIVID"),
-        ASTIA("ASTIA/SOFT"),
-        CLASSIC_CHROME("CLASSIC CHR"),
-        CLASSIC_NEG("CLASSIC NEG"),
-        PRO_NEG_HI("PRO Neg. Hi"),
-        PRO_NEG_STD("PRO Neg. Std"),
-        ETERNA("ETERNA/CIN"),
-        ACROS("ACROS (B&W)");
+        // --- Fujifilm Official Simulations ---
+        PROVIA("PROVIA/STD", "Provia.lut"),
+        VELVIA("VELVIA/VIVID", "Velvia.lut"),
+        ASTIA("ASTIA/SOFT", "Astia.lut"),
+        CLASSIC_CHROME("CLASSIC CHR", "Classic_Chrome.lut"),
+        CLASSIC_NEG("CLASSIC NEG", "Classic_Neg.lut"),
+        PRO_NEG_HI("PRO Neg. Hi", "Pro_Neg_Hi.lut"),
+        PRO_NEG_STD("PRO Neg. Std", "Pro_Neg_Ttd.lut"),
+        ETERNA("ETERNA/CIN", "Eterna.lut"),
+        ACROS("ACROS (B&W)", null),
+
+        // --- Fujifilm Motion Picture & Print Stocks ---
+        FUJI_REALA_500D("FUJI REALA", "Fuji_REALA_500D_Kodak_2393.lut"),
+        FUJI_ETERNA_250D("ETERNA 250D", "Fuji_ETERNA_250D_Kodak_2395.lut"),
+        FUJI_F125("FUJI F125", "Fuji_F125_Kodak_2393.lut"),
+        FUJI_3510("FUJI 3510", "Fuji_3510.lut"),
+        FUJI_3513DI("FUJI 3513DI", "Fujifilm_3513DI_D60.lut"),
+
+        // --- Kodak Motion Picture & Still Stocks ---
+        KODAK_PORTRA_5205("PORTRA 5205", "Kodak_5205_Fuji_3510.lut"),
+        KODAK_VISION_5218("VISION 5218", "Kodak_5218_Kodak_2395.lut"),
+        KODAK_2383_D60("KODAK 2383", "Kodak_2383_D60.lut"),
+        KODAK_2383_D55("KODAK 2383 D55", "Kodak_2383_D55.lut"),
+        KODAK_2383_D65("KODAK 2383 D65", "Kodak_2383_D65.lut"),
+        KODAK_FILMSTOCK_50("FILMSTOCK 50", "Filmstock_50.lut"),
+
+        // --- Creative Cinema & Other Looks ---
+        AEROLUX("AEROLUX IR", "AeroLux_LUT.lut"),
+        TEAL_ORANGE("TEAL & ORANGE", "Teal_Orange_Contrast.lut"),
+        TENSION_GREEN("TENSION GREEN", "Tension_Green.lut"),
+        CINEMA_LANDSCAPE("LANDSCAPE", "Color_Grading_Landscape.lut"),
+        VINTAGE_PINK("VINTAGE PINK", "Color_Grading_pink.lut"),
+        NEON_CYBERPUNK("NEON CYBER", "neon1.lut");
 
         public final String label;
-        FilmSim(String l) { this.label = l; }
+        public final String lutFile;
+        FilmSim(String l, String lut) { this.label = l; this.lutFile = lut; }
     }
 
     public enum DynamicRange {
@@ -251,6 +276,59 @@ public class FujiRecipe {
                 r00 = 77;  r01 = 150; r02 = 29;
                 r10 = 77;  r11 = 150; r12 = 29;
                 r20 = 77;  r21 = 150; r22 = 29;
+                break;
+            case FUJI_REALA_500D:
+                r00 = 258; r01 = 0;   r02 = 2;
+                r10 = 0;   r11 = 256; r12 = 4;
+                r20 = 4;   r21 = 2;   r22 = 254;
+                break;
+            case FUJI_ETERNA_250D:
+            case FUJI_F125:
+            case FUJI_3510:
+            case FUJI_3513DI:
+                r00 = 225; r01 = 18;  r02 = 15;
+                r10 = 14;  r11 = 230; r12 = 14;
+                r20 = 16;  r21 = 18;  r22 = 225;
+                break;
+            case KODAK_PORTRA_5205:
+                r00 = 265; r01 = 8;   r02 = -8;
+                r10 = -4;  r11 = 260; r12 = 4;
+                r20 = -10; r21 = 12;  r22 = 245;
+                break;
+            case KODAK_VISION_5218:
+                r00 = 250; r01 = 12;  r02 = 6;
+                r10 = 0;   r11 = 255; r12 = 8;
+                r20 = 14;  r21 = -8;  r22 = 260;
+                break;
+            case KODAK_2383_D60:
+            case KODAK_2383_D55:
+            case KODAK_2383_D65:
+            case KODAK_FILMSTOCK_50:
+                r00 = 268; r01 = 4;   r02 = -16;
+                r10 = -8;  r11 = 262; r12 = 2;
+                r20 = -18; r21 = 8;   r22 = 270;
+                break;
+            case TEAL_ORANGE:
+                r00 = 275; r01 = 15;  r02 = -35;
+                r10 = -15; r11 = 255; r12 = 16;
+                r20 = -30; r21 = 25;  r22 = 265;
+                break;
+            case AEROLUX:
+                r00 = 120; r01 = 220; r02 = -80;
+                r10 = 10;  r11 = 250; r12 = -10;
+                r20 = -10; r21 = -10; r22 = 270;
+                break;
+            case TENSION_GREEN:
+                r00 = 230; r01 = 30;  r02 = -10;
+                r10 = 25;  r11 = 275; r12 = -40;
+                r20 = -15; r21 = 30;  r22 = 235;
+                break;
+            case CINEMA_LANDSCAPE:
+            case VINTAGE_PINK:
+            case NEON_CYBERPUNK:
+                r00 = 260; r01 = 10;  r02 = -10;
+                r10 = -10; r11 = 260; r12 = 10;
+                r20 = 10;  r21 = -10; r22 = 260;
                 break;
             case PROVIA:
             default:
