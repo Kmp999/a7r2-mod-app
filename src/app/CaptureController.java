@@ -48,6 +48,7 @@ public class CaptureController {
 
     private static final String OUTPUT_DIR = "/sdcard/DCIM/100MSDCF/";
 
+    private final android.content.Context context;
     private final CameraAdapter cameraAdapter;
     private final UIController uiController;
     private final AppState appState;
@@ -57,6 +58,11 @@ public class CaptureController {
     private final JavaColorEngine javaEngine = new JavaColorEngine();
 
     public CaptureController(CameraAdapter adapter, UIController uiController, AppState state) {
+        this(null, adapter, uiController, state);
+    }
+
+    public CaptureController(android.content.Context context, CameraAdapter adapter, UIController uiController, AppState state) {
+        this.context = (context != null) ? context.getApplicationContext() : null;
         this.cameraAdapter = adapter;
         this.uiController = uiController;
         this.appState = state;
@@ -358,70 +364,137 @@ public class CaptureController {
         return sample;
     }
 
+    private File resolveWritableDcimDir() {
+        // Sony ScalarOS Real SD Card Path Resolution (Priority Order)
+        String[] roots = {
+            "/mnt/sd0",         // Primary physical SD card slot on Sony A7R II
+            "/mnt/sd1",         // Secondary slot fallback
+            "/mnt/ext_sd",
+            "/storage/sdcard0",
+            "/mnt/sdcard",
+            Environment.getExternalStorageDirectory().getAbsolutePath()
+        };
+        for (String root : roots) {
+            File rootDir = new File(root);
+            if (!rootDir.exists() || !rootDir.isDirectory()) continue;
+            File dcimDir = new File(rootDir, "DCIM/100MSDCF");
+            if (!dcimDir.exists()) {
+                dcimDir.mkdirs();
+            }
+            // Real write test (canWrite() is unreliable on Sony FAT32 mounts)
+            File probe = new File(dcimDir, ".fuji_probe");
+            try {
+                FileOutputStream fos = new FileOutputStream(probe);
+                fos.write(1);
+                fos.close();
+                probe.delete();
+                return dcimDir; // Confirmed physically writable!
+            } catch (Throwable ignored) {
+                // Try next mount point
+            }
+        }
+        return null;
+    }
+
     /** Saves graded JPEG to SD-card using robust PMCA-specific multi-path resolution. */
     private String saveJpeg(Bitmap bitmap) {
-        String name = "FUJI_" + System.currentTimeMillis() + ".JPG";
+        // DCF-Compliant 8.3 Filename
+        // Must be exactly 4 chars + 4 digits + .JPG for AvindexStore to catalog it
+        String name = String.format("FUJI%04d.JPG", (System.currentTimeMillis() % 10000));
         
-        // On PMCA Linux, Environment.getExternalStorageState() often falsely reports "removed" or "unmounted"
-        // because of the avindex daemon. We must probe actual filesystem paths manually.
-        String[] dirs = {
-            "/mnt/sdcard/DCIM/100MSDCF/",
-            "/storage/sdcard0/DCIM/100MSDCF/",
-            "/sdcard/DCIM/100MSDCF/",
-            Environment.getExternalStorageDirectory().getAbsolutePath() + "/DCIM/100MSDCF/",
-            "/mnt/sdcard/"
-        };
-        
-        for (String d : dirs) {
+        File dir = resolveWritableDcimDir();
+        if (dir != null) {
             FileOutputStream out = null;
             try {
-                File dir = new File(d);
-                if (!dir.exists()) {
-                    dir.mkdirs();
-                }
-                
-                // Ensure directory is writable before attempting file creation
-                if (dir.exists() && dir.canWrite()) {
-                    File file = new File(dir, name);
-                    out = new FileOutputStream(file);
-                    if (bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
-                        out.flush();
+                File file = new File(dir, name);
+                out = new FileOutputStream(file);
+                if (bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
+                    out.flush();
+                    try {
                         out.getFD().sync(); // Force write to physical storage immediately
-                        
-                        // Notify Sony AV indexer (Reflection fallback for Camera apps)
-                        notifyAvindex(file.getAbsolutePath());
-                        return file.getAbsolutePath();
-                    }
+                    } catch (Throwable ignored) {} // Prevent SyncFailedException from aborting on custom FAT32 driver
+                    
+                    // Notify Sony AV indexer
+                    notifyAvindex(file.getAbsolutePath());
+                    return file.getAbsolutePath();
                 }
             } catch (Throwable t) {
-                Log.e(TAG, "Save failed in " + d, t);
+                Log.e(TAG, "Save failed in " + dir.getAbsolutePath(), t);
+                appState.setLastErrorMessage(t.getClass().getSimpleName());
             } finally {
                 if (out != null) {
                     try {
                         out.close();
-                    } catch (Throwable ignored) {
-                    }
+                    } catch (Throwable ignored) {}
                 }
             }
+        } else {
+            appState.setLastErrorMessage("No writable SD mount found");
         }
         return null;
     }
     
     private void notifyAvindex(String path) {
+        if (path == null) return;
+        File file = new File(path);
+
+        // 1. Standard Android MediaScannerConnection (triggers background cataloging)
+        if (context != null) {
+            try {
+                android.media.MediaScannerConnection.scanFile(
+                    context,
+                    new String[]{ path },
+                    new String[]{ "image/jpeg" },
+                    null
+                );
+            } catch (Throwable t) {
+                Log.w(TAG, "MediaScannerConnection failed", t);
+            }
+
+            // 2. Standard MediaScanner Broadcast Intent
+            try {
+                android.content.Intent scanIntent = new android.content.Intent(
+                    android.content.Intent.ACTION_MEDIA_SCANNER_SCAN_FILE,
+                    android.net.Uri.fromFile(file)
+                );
+                context.sendBroadcast(scanIntent);
+            } catch (Throwable ignored) {}
+
+            // 3. Sony Scalar Avindex Broadcast (notifies avindex daemon of new image)
+            try {
+                android.content.Intent sonyIntent = new android.content.Intent(
+                    "com.sony.scalar.providers.avindex.ACTION_DATABASE_UPDATED"
+                );
+                context.sendBroadcast(sonyIntent);
+            } catch (Throwable ignored) {}
+        }
+
+        // 4. Sony Scalar AvindexStore API Reflection (direct database registration)
         try {
             Class<?> cls = Class.forName("com.sony.scalar.provider.AvindexStore$Images$Media");
-            java.lang.reflect.Method notifyMethod = null;
             for (java.lang.reflect.Method m : cls.getMethods()) {
                 if ("notifyImageCreated".equals(m.getName())) {
-                    notifyMethod = m;
-                    break;
+                    Class<?>[] pTypes = m.getParameterTypes();
+                    if (pTypes.length == 1 && pTypes[0] == String.class) {
+                        m.invoke(null, path);
+                        Log.i(TAG, "Notified AvindexStore: " + path);
+                        break;
+                    } else if (pTypes.length == 2 && context != null) {
+                        if (android.content.Context.class.isAssignableFrom(pTypes[0]) && pTypes[1] == String.class) {
+                            m.invoke(null, context, path);
+                            Log.i(TAG, "Notified AvindexStore with Context: " + path);
+                            break;
+                        } else if (android.content.ContentResolver.class.isAssignableFrom(pTypes[0]) && pTypes[1] == String.class) {
+                            m.invoke(null, context.getContentResolver(), path);
+                            Log.i(TAG, "Notified AvindexStore with ContentResolver: " + path);
+                            break;
+                        }
+                    }
                 }
             }
-            if (notifyMethod != null) {
-                // Not passing Context here; signature varies. We just attempt reflection invocation if possible.
-                // Depending on API, might require ContentResolver.
-            }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.d(TAG, "AvindexStore direct notification skipped or unsupported", t);
+        }
     }
 
     public void shutdown() {

@@ -274,6 +274,12 @@ public class SonyPmcaAdapter implements CameraAdapter {
             public void run() {
                 if (!isPolling) return;
 
+                // Ignore hardware poller overwrites for 800ms after user manually turns the dial
+                if (System.currentTimeMillis() - lastManualIsoChangeTime < 800) {
+                    pollerHandler.postDelayed(this, 100);
+                    return;
+                }
+
                 String s = getShutterSpeed();
                 String a = getAperture();
                 String i = getIso();
@@ -435,26 +441,28 @@ public class SonyPmcaAdapter implements CameraAdapter {
         2000, 2500, 3200, 4000, 5000, 6400, 8000, 10000, 12800, 16000, 20000, 25600
     };
     private int currentIsoIndex = 8; // Default ISO 400
+    private long lastManualIsoChangeTime = 0; // Lock for exposure poller
 
     public void adjustIso(int direction) {
         if (normalCamera == null || cameraEx == null) return;
         try {
-            // Step 1: Get parameters and create modifier
+            // Step 1: Get parameters and create modifier directly
             Camera.Parameters params = normalCamera.getParameters();
-            Object modifier = getModifier();
+            Object modifier = null;
+            Method createModMethod = null;
+            for (Method m : cameraEx.getClass().getMethods()) {
+                if ("createParametersModifier".equals(m.getName()) && m.getParameterTypes().length == 1) {
+                    createModMethod = m;
+                    createModMethod.setAccessible(true);
+                    break;
+                }
+            }
+            if (createModMethod != null) {
+                modifier = createModMethod.invoke(cameraEx, params);
+            }
             if (modifier == null || getISOSensitivityMethod == null || setISOSensitivityMethod == null) return;
 
-            // Step 2: Check scene mode and unlock manual control if necessary
-            String sceneMode = params.getSceneMode();
-            if (Camera.Parameters.SCENE_MODE_AUTO.equals(sceneMode) || "superior-auto".equals(sceneMode)) {
-                params.setSceneMode("manual-exposure");
-                normalCamera.setParameters(params);
-                params = normalCamera.getParameters(); // Refresh
-                modifier = getModifier(); // Recreate modifier with new params
-                if (modifier == null) return;
-            }
-
-            // Step 3: Get supported ISO list and find target
+            // Step 2: Query supported ISOs directly
             Method getSupportedIsoMethod = null;
             for (Method m : modifier.getClass().getMethods()) {
                 if ("getSupportedISOSensitivities".equals(m.getName())) {
@@ -463,26 +471,48 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 }
             }
 
-            int targetIso;
-            if (getSupportedIsoMethod != null) {
-                @SuppressWarnings("unchecked")
-                List<Integer> supported = (List<Integer>) getSupportedIsoMethod.invoke(modifier);
-                if (supported != null && !supported.isEmpty()) {
-                    Integer currentIsoObj = (Integer) getISOSensitivityMethod.invoke(modifier);
-                    int currentIso = currentIsoObj != null ? currentIsoObj.intValue() : 0;
-                    int idx = supported.indexOf(currentIso);
-                    
-                    if (idx == -1) idx = 0; // Default to Auto if not found
+            int targetIso = -1;
+            boolean fallbackToModeChange = false;
 
-                    int nextIdx = Math.max(0, Math.min(supported.size() - 1, idx + direction));
-                    targetIso = supported.get(nextIdx);
-                } else {
-                    currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + direction));
-                    targetIso = ISO_STEPS[currentIsoIndex];
+            if (getSupportedIsoMethod != null) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    List<Integer> supported = (List<Integer>) getSupportedIsoMethod.invoke(modifier);
+                    if (supported != null && !supported.isEmpty()) {
+                        // Filter the returned list through our known steps for sanity
+                        java.util.ArrayList<Integer> validSteps = new java.util.ArrayList<Integer>();
+                        for (int s : ISO_STEPS) {
+                            if (supported.contains(s)) validSteps.add(s);
+                        }
+                        if (validSteps.isEmpty()) validSteps.addAll(supported);
+
+                        Integer currentIsoObj = (Integer) getISOSensitivityMethod.invoke(modifier);
+                        int currentIso = currentIsoObj != null ? currentIsoObj.intValue() : 0;
+                        int idx = validSteps.indexOf(currentIso);
+                        if (idx == -1) idx = 0;
+
+                        int nextIdx = Math.max(0, Math.min(validSteps.size() - 1, idx + direction));
+                        targetIso = validSteps.get(nextIdx);
+                    }
+                } catch (Throwable t) {
+                    fallbackToModeChange = true;
                 }
             } else {
-                 currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + direction));
-                 targetIso = ISO_STEPS[currentIsoIndex];
+                fallbackToModeChange = true;
+            }
+
+            // Step 3: Optional fallback if ISO control throws or is unsupported in current mode
+            if (fallbackToModeChange || targetIso == -1) {
+                String sceneMode = params.getSceneMode();
+                if (Camera.Parameters.SCENE_MODE_AUTO.equals(sceneMode) || "superior-auto".equals(sceneMode)) {
+                    params.setSceneMode("manual-exposure");
+                    normalCamera.setParameters(params);
+                    params = normalCamera.getParameters(); // Refresh
+                    modifier = createModMethod.invoke(cameraEx, params); // Recreate
+                    if (modifier == null) return;
+                }
+                currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + direction));
+                targetIso = ISO_STEPS[currentIsoIndex];
             }
 
             // Step 4: Set ISO and commit the SAME params object immediately
@@ -491,7 +521,8 @@ public class SonyPmcaAdapter implements CameraAdapter {
             Camera.Parameters modifiedParams = (Camera.Parameters) getParams.invoke(modifier);
             normalCamera.setParameters(modifiedParams);
             
-            // Refresh cached value for HUD
+            // Acquire lock and refresh cached value for HUD
+            lastManualIsoChangeTime = System.currentTimeMillis();
             cachedIso = (targetIso == 0) ? "ISO AUTO" : "ISO " + targetIso;
 
         } catch (Throwable t) {

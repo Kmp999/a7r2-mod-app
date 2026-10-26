@@ -61,13 +61,18 @@ static inline void lut17_precompute(Lut17Context* lut,
 static inline void lut17_interpolate_pixel(const Lut17Context* lut,
                                            uint8_t r, uint8_t g, uint8_t b,
                                            uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
-    int r0 = r >> 4;
-    int g0 = g >> 4;
-    int b0 = b >> 4;
+    // Map 0..255 to 0..256 so that 255 reaches index 16 exactly
+    int r256 = r + (r >> 7);
+    int g256 = g + (g >> 7);
+    int b256 = b + (b >> 7);
 
-    int r_frac = r & 0x0F;
-    int g_frac = g & 0x0F;
-    int b_frac = b & 0x0F;
+    int r0 = r256 >> 4;
+    int g0 = g256 >> 4;
+    int b0 = b256 >> 4;
+
+    int r_frac = r256 & 0x0F;
+    int g_frac = g256 & 0x0F;
+    int b_frac = b256 & 0x0F;
 
     int r1 = (r0 < 16) ? r0 + 1 : 16;
     int g1 = (g0 < 16) ? g0 + 1 : 16;
@@ -121,6 +126,68 @@ static inline void lut17_process_rgb565(const Lut17Context* lut, uint16_t* buffe
         lut17_interpolate_pixel(lut, r, g, b, &or_val, &og_val, &ob_val);
 
         buffer[i] = (uint16_t)(((or_val >> 3) << 11) | ((og_val >> 2) << 5) | (ob_val >> 3));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Stage 2B: Fast Native Spatial Grain Pass (64x64 Tileable Midtone-Weighted)
+// ----------------------------------------------------------------------------
+#define GRAIN_TILE_DIM 64
+#define GRAIN_TILE_MASK 63
+
+// Fast LCG pseudo-random 64x64 tileable noise table
+static inline int8_t get_grain_noise(int x, int y) {
+    // Spatial hash for deterministic 64x64 repeat with zero storage footprint
+    uint32_t h = (uint32_t)((x & GRAIN_TILE_MASK) * 73856093 ^ (y & GRAIN_TILE_MASK) * 19349663);
+    h = (h ^ (h >> 13)) * 1664525;
+    return (int8_t)((h >> 16) & 0x1F) - 16; // -16 to +15 centered noise
+}
+
+static inline uint8_t clamp_u8_fast(int v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+/**
+ * Applies 17^3 3D LUT and 64x64 midtone-modulated Grain in a single high-speed pass.
+ * @param grain_strength 0 = Off, 1 = Weak (~8), 2 = Strong (~16)
+ */
+static inline void lut17_process_rgb565_with_grain(const Lut17Context* lut,
+                                                   uint16_t* buffer,
+                                                   int width, int height,
+                                                   int grain_strength) {
+    if (!lut || !buffer || width <= 0 || height <= 0) return;
+
+    int scale = (grain_strength == 2) ? 16 : (grain_strength == 1) ? 8 : 0;
+    int idx = 0;
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            uint16_t px = buffer[idx];
+
+            uint8_t r = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);
+            uint8_t g = (uint8_t)(((px >> 5) & 0x3F) * 255 / 63);
+            uint8_t b = (uint8_t)((px & 0x1F) * 255 / 31);
+
+            uint8_t or_val, og_val, ob_val;
+            lut17_interpolate_pixel(lut, r, g, b, &or_val, &og_val, &ob_val);
+
+            if (scale > 0) {
+                // Approximate Rec.601 luma: (R*77 + G*150 + B*29) >> 8
+                int luma = (or_val * 77 + og_val * 150 + ob_val * 29) >> 8;
+                // Parabolic midtone weight envelope: peaks at mid-grey 128, rolls off at 0 and 255
+                int midtone_weight = (luma * (255 - luma)) >> 8; // 0..63
+                int8_t raw_noise = get_grain_noise(x, y);
+                int delta = (raw_noise * scale * midtone_weight) >> 8;
+
+                or_val = clamp_u8_fast(or_val + delta);
+                og_val = clamp_u8_fast(og_val + delta);
+                ob_val = clamp_u8_fast(ob_val + delta);
+            }
+
+            buffer[idx++] = (uint16_t)(((or_val >> 3) << 11) | ((og_val >> 2) << 5) | (ob_val >> 3));
+        }
     }
 }
 

@@ -190,7 +190,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         });
 
-        captureController = new CaptureController(cameraAdapter, uiController, appState);
+        captureController = new CaptureController(this, cameraAdapter, uiController, appState);
 
         captureController.setResultListener(new CaptureController.ResultListener() {
             @Override
@@ -261,6 +261,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         onRecipeUpdated(recipe);
     }
 
+    private boolean isS2PhysicallyHeld = false;
+    private boolean isS1Held = false;
+
     /**
      * Critical PMCA Key & Dial Interceptor.
      * Intercepts all physical buttons and dials on Sony A7R II before any Android view focus logic.
@@ -275,13 +278,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int rawCode = (scanCode >= 512 || keyCode == 0) ? scanCode : keyCode;
 
         int action = event.getAction();
-        if (action == KeyEvent.ACTION_DOWN) {
-            if (event.getRepeatCount() > 0) {
-                // Drop repeat events for shutter buttons to prevent Infinite Capture Loop
-                if (rawCode == SonyKeyCodes.SONY_KEY_SHUTTER || rawCode == SonyKeyCodes.SONY_KEY_SHUTTER_HALF) {
-                    return true;
-                }
+        
+        // Strict Hardware Shutter Debouncing
+        if (rawCode == SonyKeyCodes.SONY_KEY_SHUTTER) { // S2 Full Press
+            if (action == KeyEvent.ACTION_DOWN) {
+                if (event.getRepeatCount() > 0 || isS2PhysicallyHeld) return true; // Block hardware burst loop
+                isS2PhysicallyHeld = true;
+                if (captureController != null) captureController.triggerCapture();
+                return true;
+            } else if (action == KeyEvent.ACTION_UP) {
+                isS2PhysicallyHeld = false;
+                return true;
             }
+        }
+        
+        if (rawCode == SonyKeyCodes.SONY_KEY_SHUTTER_HALF) { // S1_1 Half Press
+            if (action == KeyEvent.ACTION_DOWN) {
+                if (event.getRepeatCount() > 0 || isS1Held) return true;
+                isS1Held = true;
+                if (cameraAdapter instanceof SonyPmcaAdapter) {
+                    ((SonyPmcaAdapter) cameraAdapter).autoFocus();
+                }
+                return true;
+            } else if (action == KeyEvent.ACTION_UP) {
+                isS1Held = false;
+                if (cameraAdapter instanceof SonyPmcaAdapter) {
+                    ((SonyPmcaAdapter) cameraAdapter).cancelAutoFocus();
+                }
+                return true;
+            }
+        }
+
+        if (action == KeyEvent.ACTION_DOWN) {
             if (uiController != null && uiController.handleRawKeyDown(rawCode, event)) {
                 return true;
             }

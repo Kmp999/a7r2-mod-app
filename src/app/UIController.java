@@ -295,12 +295,31 @@ public class UIController {
                 return true;
 
             case WHEEL_CW:
+                if (wheelControlsIso) {
+                    if (cameraAdapter != null) cameraAdapter.stepIso(1);
+                    if (qMenuView != null) qMenuView.highlightSegment(3); // Highlight ISO
+                } else {
+                    if (cameraAdapter != null) cameraAdapter.incrementEV(1);
+                    if (qMenuView != null) qMenuView.highlightSegment(4); // Highlight EV
+                }
+                updateBottomHud();
+                return true;
+            case WHEEL_CCW:
+                if (wheelControlsIso) {
+                    if (cameraAdapter != null) cameraAdapter.stepIso(-1);
+                    if (qMenuView != null) qMenuView.highlightSegment(3); // Highlight ISO
+                } else {
+                    if (cameraAdapter != null) cameraAdapter.incrementEV(-1);
+                    if (qMenuView != null) qMenuView.highlightSegment(4); // Highlight EV
+                }
+                updateBottomHud();
+                return true;
+
             case DPAD_RIGHT:
                 if (cameraAdapter != null) cameraAdapter.stepIso(1);
                 if (qMenuView != null) qMenuView.highlightSegment(3); // Highlight ISO
                 updateBottomHud();
                 return true;
-            case WHEEL_CCW:
             case DPAD_LEFT:
                 if (cameraAdapter != null) cameraAdapter.stepIso(-1);
                 if (qMenuView != null) qMenuView.highlightSegment(3);

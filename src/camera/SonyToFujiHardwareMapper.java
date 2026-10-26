@@ -32,7 +32,10 @@ public class SonyToFujiHardwareMapper {
             // 2. Hardware Contrast, Sharpness, Saturation
             mapToningAndSharpness(params, recipe);
 
-            // 3. Deep CameraEx ParametersModifier for DRO and WB shift
+            // 3. Dynamic Range Hardware Exposure Protection (-1.0 EV for DR200, -2.0 EV for DR400)
+            mapDynamicRangeHardware(params, recipe);
+
+            // 4. Deep CameraEx ParametersModifier for DRO and WB shift
             if (cameraEx != null) {
                 applySonyExModifiers(cameraEx, params, recipe);
             }
@@ -76,6 +79,29 @@ public class SonyToFujiHardwareMapper {
         int sonySharpness = clamp((recipe.sharpness * 3) / 4, -3, 3);
         
         // Removed fake sony-* parameters
+    }
+
+    private static void mapDynamicRangeHardware(Camera.Parameters params, FujiRecipe recipe) {
+        float step = params.getExposureCompensationStep();
+        if (step <= 0f) step = 0.33333334f;
+        int currentEvIndex = params.getExposureCompensation();
+
+        // Calculate EV pull to protect sensor highlights:
+        // DR200: -1.0 EV hardware pull; DR400: -2.0 EV hardware pull
+        int evOffset = 0;
+        if (recipe.dynamicRange == FujiRecipe.DynamicRange.DR200) {
+            evOffset = -Math.round(1.0f / step);
+        } else if (recipe.dynamicRange == FujiRecipe.DynamicRange.DR400) {
+            evOffset = -Math.round(2.0f / step);
+        }
+
+        if (evOffset != 0) {
+            int targetEvIndex = clamp(currentEvIndex + evOffset,
+                params.getMinExposureCompensation(),
+                params.getMaxExposureCompensation());
+            params.setExposureCompensation(targetEvIndex);
+            Log.d(TAG, "Applied hardware DR EV protection: " + evOffset + " steps");
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -137,6 +163,22 @@ public class SonyToFujiHardwareMapper {
             try {
                 Method setDroMethod = findAccessibleMethod(modifier, "setDro", int.class);
                 setDroMethod.invoke(modifier, droLevel);
+            } catch (Throwable ignored) {}
+
+            // Enforce minimum ISO baseline for dynamic range expansion (DR200: min ISO 200, DR400: min ISO 400)
+            int minIso = (recipe.dynamicRange == FujiRecipe.DynamicRange.DR400) ? 400 :
+                         (recipe.dynamicRange == FujiRecipe.DynamicRange.DR200) ? 200 : 100;
+            try {
+                Method getIso = findAccessibleMethod(modifier, "getISOSensitivity");
+                Method setIso = findAccessibleMethod(modifier, "setISOSensitivity", int.class);
+                Object curIsoObj = getIso.invoke(modifier);
+                if (curIsoObj instanceof Integer) {
+                    int curIso = ((Integer) curIsoObj).intValue();
+                    if (curIso > 0 && curIso < minIso) {
+                        setIso.invoke(modifier, minIso);
+                        Log.i(TAG, "Enforced min ISO " + minIso + " for " + recipe.dynamicRange.label);
+                    }
+                }
             } catch (Throwable ignored) {}
 
             // 2. WB Fine Shift

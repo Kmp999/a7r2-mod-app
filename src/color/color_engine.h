@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "fixed_point_matrix.h"
 #include "tone_curve_lut.h"
+#include "lut_cube_17.h"
 #include "../util/error.h"
 
 #ifdef __cplusplus
@@ -16,6 +17,7 @@ extern "C" {
 #define COLOR_MODE_MATRIX_LUT_SATURATION 3
 #define COLOR_MODE_MATRIX_LUT_SPLIT_TONE 4
 #define COLOR_MODE_SAFE_FASTEST 5
+#define COLOR_MODE_FUSED_3D_LUT 6
 
 // Preset IDs
 typedef enum {
@@ -30,8 +32,13 @@ typedef enum {
 typedef struct {
     Matrix3x3 matrix;
     ToneCurveLUT lut;
+    Lut17Context lut17;
     int mode;
     PresetId current_preset;
+    
+    // Spatial fx parameters
+    int grain_strength;
+    int clarity_strength;
 } ColorEngineContext;
 
 // Initialize the color engine with a specific preset and mode
