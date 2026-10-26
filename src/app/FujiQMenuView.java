@@ -204,7 +204,11 @@ public class FujiQMenuView extends View {
 
     private void updateTopStatus() {
         if (recipe != null) {
-            topStatus = recipe.filmSim.label + "  |  " + recipe.dynamicRange.label + "  |  C" + (recipe.recipeSlotIndex + 1);
+            String sdDiag = StorageResolver.getLastDiagnostic();
+            topStatus = recipe.filmSim.label + " | " + recipe.dynamicRange.label + " | C" + (recipe.recipeSlotIndex + 1);
+            if (sdDiag != null && !"Not initialized".equals(sdDiag)) {
+                topStatus += " | " + sdDiag;
+            }
         }
     }
 

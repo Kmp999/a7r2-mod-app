@@ -109,16 +109,16 @@ public class CaptureController {
         this.resultListener = l;
     }
 
-    public void triggerCapture() {
+    public boolean triggerSingleCapture() {
         long now = System.currentTimeMillis();
         if (!isCapturing.compareAndSet(false, true)) {
-            Log.d(TAG, "Capture ignored: Pipeline currently busy");
-            return;
+            Log.w(TAG, "Capture ignored: another shot is currently in progress");
+            return false;
         }
         if (now - lastCaptureTime < MIN_SHOT_INTERVAL_MS) {
             isCapturing.set(false);
             Log.d(TAG, "Capture ignored: In cooldown (<" + MIN_SHOT_INTERVAL_MS + "ms)");
-            return;
+            return false;
         }
         lastCaptureTime = now;
 
@@ -130,30 +130,33 @@ public class CaptureController {
             cameraAdapter.takePicture(new Camera.PictureCallback() {
                 @Override
                 public void onPictureTaken(final byte[] jpegData, Camera camera) {
-                    // Step 1: Immediately cancel BIONZ X shutter cycle to prevent Infinite Capture Loop
-                    if (cameraAdapter instanceof SonyPmcaAdapter) {
-                        ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
-                        ((SonyPmcaAdapter) cameraAdapter).cancelAutoFocus();
-                    }
-
-                    // Step 2: Instant EVF Viewfinder recovery via Watchdog (<150ms target)
-                    setState(CameraState.RESTORING_PREVIEW);
-                    restorePreviewWithWatchdog(3);
-
-                    // Step 3: Offload heavy processing to grading executor
-                    processingExecutor.execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            try {
-                                processJpeg(jpegData);
-                            } finally {
-                                isCapturing.set(false);
-                                setState(CameraState.IDLE_PREVIEW);
-                            }
+                    try {
+                        // 1. Immediately cancel BIONZ X shutter cycle to prevent Infinite Capture Loop
+                        if (cameraAdapter instanceof SonyPmcaAdapter) {
+                            ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
+                            ((SonyPmcaAdapter) cameraAdapter).cancelAutoFocus();
                         }
-                    });
+
+                        // 2. Instant EVF Viewfinder recovery via Watchdog (<150ms target)
+                        setState(CameraState.RESTORING_PREVIEW);
+                        restorePreviewWithWatchdog(3);
+
+                        // 3. Offload heavy processing to grading executor
+                        if (jpegData != null && jpegData.length > 0) {
+                            processingExecutor.execute(new Runnable() {
+                                @Override
+                                public void run() {
+                                    processJpeg(jpegData);
+                                }
+                            });
+                        }
+                    } finally {
+                        // 4. Release capture hardware lock immediately so subsequent shutter presses don't freeze
+                        isCapturing.set(false);
+                    }
                 }
             });
+            return true;
         } catch (Throwable t) {
             Log.e(TAG, "takePicture failed, attempting preview restore", t);
             if (cameraAdapter instanceof SonyPmcaAdapter) {
@@ -163,7 +166,12 @@ public class CaptureController {
             isCapturing.set(false);
             setState(CameraState.IDLE_PREVIEW);
             appState.setProcessing(false);
+            return false;
         }
+    }
+
+    public void triggerCapture() {
+        triggerSingleCapture();
     }
 
     public void onShutterKeyUp() {

@@ -12,18 +12,18 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Set;
 
 /**
- * StorageResolver for Sony PMCA / ScalarOS (A7R II).
+ * 3-Tier StorageResolver for Sony PMCA / ScalarOS (ILCE-7RM2 / A7R II).
  *
- * Resolves the true physical SD card by:
- *  1. Parsing /proc/mounts to find mounted FAT32/exFAT partitions (e.g. /mnt/sd0).
- *  2. Performing real physical write-probes (creating, syncing, and deleting a test file).
- *  3. Enforcing DCF 8.3 naming (FUJI0001.JPG) required by Sony's AvindexStore catalog.
- *  4. 4-tier registration with Sony's media indexing service for immediate camera playback.
+ * Tier 1: Sony Scalar AvindexStore.getExternalMediaMountedPath(id) reflection.
+ * Tier 2: Kernel /proc/mounts scanner (excluding /tmp*, /system, /data, /cache).
+ * Tier 3: Hardcoded Sony Alpha fallback list (/storage/sdcard0, /mnt/sd0, etc).
+ *
+ * Enforces DCF 8.3 filenames (FUJI0001.JPG) and 4-tier AvindexStore cataloging.
  */
 public final class StorageResolver {
     private static final String TAG = "StorageResolver";
@@ -35,21 +35,44 @@ public final class StorageResolver {
     private StorageResolver() {}
 
     /**
-     * Resolves and verifies the real writable DCIM directory on the physical SD card.
+     * Resolves the verified writable DCIM directory on the physical SD card of Sony A7R II.
      */
     public static synchronized File findSonySdCardMount() {
         if (sCachedWritableDcimDir != null && sCachedWritableDcimDir.exists()) {
-            // Fast verify that cached directory is still writable
             if (verifyWritable(sCachedWritableDcimDir)) {
                 return sCachedWritableDcimDir;
             }
             sCachedWritableDcimDir = null;
         }
 
-        List<String> candidates = new ArrayList<String>();
-        StringBuilder diagBuilder = new StringBuilder();
+        Set<String> candidatePaths = new LinkedHashSet<String>();
 
-        // 1. Parse /proc/mounts to find actual mounted vfat / exfat / texfat / sdcardfs partitions
+        // --------------------------------------------------------------------
+        // Tầng 1: Sử dụng Reflection gọi Sony Scalar AvindexStore API chính thức
+        // --------------------------------------------------------------------
+        try {
+            Class<?> avindexClass = Class.forName("com.sony.scalar.provider.AvindexStore");
+            Method getMediaIdsMethod = avindexClass.getMethod("getExternalMediaIds");
+            String[] mediaIds = (String[]) getMediaIdsMethod.invoke(null);
+            if (mediaIds != null && mediaIds.length > 0) {
+                Method getMountedPathMethod = avindexClass.getMethod("getExternalMediaMountedPath", String.class);
+                for (String id : mediaIds) {
+                    String mountedPath = (String) getMountedPathMethod.invoke(null, id);
+                    if (mountedPath != null && mountedPath.length() > 0) {
+                        candidatePaths.add(mountedPath + "/DCIM/100MSDCF");
+                        candidatePaths.add(mountedPath + "/DCIM");
+                        candidatePaths.add(mountedPath);
+                        Log.i(TAG, "Tier 1: Found Avindex mounted media path: " + mountedPath);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.d(TAG, "Tier 1: Sony AvindexStore media reflection not available: " + t.getMessage());
+        }
+
+        // --------------------------------------------------------------------
+        // Tầng 2: Quét toàn bộ /proc/mounts của Linux Kernel
+        // --------------------------------------------------------------------
         BufferedReader reader = null;
         try {
             reader = new BufferedReader(new FileReader("/proc/mounts"));
@@ -61,81 +84,65 @@ public final class StorageResolver {
                     String fsType = parts[2].toLowerCase(Locale.US);
                     String options = parts[3].toLowerCase(Locale.US);
 
-                    // Look for FAT/exFAT SD card partitions mounted Read-Write
-                    boolean isFsCandidate = fsType.contains("fat") || fsType.contains("sdcard")
-                                         || fsType.contains("fuse") || fsType.contains("ntfs")
-                                         || mountPoint.contains("sd");
-                    boolean isRw = options.startsWith("rw") || options.contains(",rw");
-                    boolean isExcluded = mountPoint.equals("/system") || mountPoint.equals("/data")
-                                      || mountPoint.equals("/cache") || mountPoint.equals("/proc")
-                                      || mountPoint.equals("/sys") || mountPoint.equals("/dev");
+                    // Bỏ qua các phân vùng hệ thống và thư mục tạm ảo nội bộ
+                    // (/tmp/setting/lens là nơi lưu calibration lens, không phải thẻ nhớ!)
+                    if (mountPoint.equals("/system") || mountPoint.equals("/data")
+                        || mountPoint.equals("/cache") || mountPoint.equals("/proc")
+                        || mountPoint.equals("/sys") || mountPoint.equals("/dev")
+                        || mountPoint.startsWith("/tmp")) {
+                        continue;
+                    }
 
-                    if (isFsCandidate && isRw && !isExcluded) {
-                        if (!candidates.contains(mountPoint)) {
-                            candidates.add(mountPoint);
+                    // Nhận diện phân vùng có cờ ghi (rw) và liên quan đến thẻ nhớ
+                    if (options.startsWith("rw") || options.contains(",rw")) {
+                        if (fsType.contains("fat") || fsType.contains("fuse") || fsType.contains("ntfs")
+                            || fsType.contains("sd") || mountPoint.contains("sd")
+                            || mountPoint.contains("storage") || mountPoint.contains("media")) {
+                            candidatePaths.add(mountPoint + "/DCIM/100MSDCF");
+                            candidatePaths.add(mountPoint + "/DCIM");
+                            candidatePaths.add(mountPoint);
                         }
                     }
                 }
             }
-        } catch (Throwable t) {
-            Log.w(TAG, "Failed to parse /proc/mounts", t);
+        } catch (Throwable ignored) {
         } finally {
             if (reader != null) {
                 try { reader.close(); } catch (Throwable ignored) {}
             }
         }
 
-        // 2. Add Sony PMCA and Android standard fallback mount points
-        String[] standardFallbacks = {
-            "/mnt/sd0",                 // Primary Sony Alpha physical SD slot
-            "/mnt/sd1",                 // Secondary slot
-            "/mnt/ext_sd",
-            "/storage/sdcard0",
-            "/mnt/sdcard",
-            "/mnt/media_rw/sdcard0"
-        };
-        for (String fb : standardFallbacks) {
-            if (!candidates.contains(fb)) {
-                candidates.add(fb);
-            }
-        }
+        // --------------------------------------------------------------------
+        // Tầng 3: Các đường dẫn chuẩn của Sony ScalarOS và Android
+        // --------------------------------------------------------------------
+        candidatePaths.add("/storage/sdcard0/DCIM/100MSDCF");
+        candidatePaths.add("/mnt/sd0/DCIM/100MSDCF");
+        candidatePaths.add("/mnt/media_rw/sdcard0/DCIM/100MSDCF");
+        candidatePaths.add("/mnt/ext_sd/DCIM/100MSDCF");
+        candidatePaths.add("/mnt/sdcard/DCIM/100MSDCF");
         if (Environment.getExternalStorageDirectory() != null) {
-            String extPath = Environment.getExternalStorageDirectory().getAbsolutePath();
-            if (!candidates.contains(extPath)) {
-                candidates.add(extPath);
-            }
+            candidatePaths.add(new File(Environment.getExternalStorageDirectory(), "DCIM/100MSDCF").getAbsolutePath());
         }
 
-        diagBuilder.append("Probed ").append(candidates.size()).append(" mounts: ");
-
-        // 3. Probe each candidate for writable DCIM directory
-        for (String rootPath : candidates) {
-            File root = new File(rootPath);
-            if (!root.exists() || !root.isDirectory()) continue;
-
-            File[] targets = new File[] {
-                new File(root, "DCIM/100MSDCF"),
-                new File(root, "DCIM/101MSDCF"),
-                new File(root, "DCIM"),
-                root
-            };
-
-            for (File dir : targets) {
-                if (!dir.exists()) {
-                    try { dir.mkdirs(); } catch (Throwable ignored) {}
-                }
-                if (dir.exists() && dir.isDirectory()) {
-                    if (verifyWritable(dir)) {
-                        sCachedWritableDcimDir = dir;
-                        sLastDiagnostic = "OK: " + dir.getAbsolutePath();
-                        Log.i(TAG, "Verified writable SD mount: " + dir.getAbsolutePath());
-                        return dir;
-                    }
+        // --------------------------------------------------------------------
+        // Kiểm tra quyền ghi thực tế bằng file test .probe
+        // --------------------------------------------------------------------
+        for (String path : candidatePaths) {
+            File dir = new File(path);
+            if (!dir.exists()) {
+                try { dir.mkdirs(); } catch (Throwable ignored) {}
+            }
+            if (dir.exists() && dir.isDirectory()) {
+                if (verifyWritable(dir)) {
+                    sCachedWritableDcimDir = dir;
+                    sLastDiagnostic = "OK: " + dir.getAbsolutePath();
+                    Log.i(TAG, "Selected verified writable SD directory: " + dir.getAbsolutePath());
+                    return dir;
                 }
             }
         }
 
-        sLastDiagnostic = "FAIL: No writable mount among " + candidates.toString();
+        sLastDiagnostic = "FAIL: No writable mount among " + candidatePaths.toString();
         Log.e(TAG, sLastDiagnostic);
         return null;
     }
@@ -145,11 +152,10 @@ public final class StorageResolver {
      */
     private static boolean verifyWritable(File dir) {
         if (dir == null || !dir.exists()) return false;
-        File testFile = new File(dir, ".fuji_probe_" + (System.currentTimeMillis() % 1000));
+        File testFile = new File(dir, ".probe_" + System.currentTimeMillis());
         FileOutputStream fos = null;
         try {
             fos = new FileOutputStream(testFile);
-            // Write standard JPEG SOI/EOI magic markers
             fos.write(new byte[]{ (byte)0xFF, (byte)0xD8, (byte)0xFF, (byte)0xD9 });
             fos.flush();
             try {
@@ -173,12 +179,10 @@ public final class StorageResolver {
 
     /**
      * Generates a strict DCF-compliant 8.3 filename (e.g. FUJI0001.JPG).
-     * Required by Sony's AvindexStore catalog database.
      */
     public static synchronized String generateDcfFilename(File dir) {
         if (dir == null) return "FUJI0001.JPG";
 
-        // Find next non-colliding filename
         for (int i = 0; i < 9999; i++) {
             int num = (sFileSequence++) % 10000;
             if (num == 0) num = 1;

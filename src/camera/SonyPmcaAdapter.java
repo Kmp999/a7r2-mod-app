@@ -435,6 +435,53 @@ public class SonyPmcaAdapter implements CameraAdapter {
         }
     }
 
+    public boolean isWithinManualLockout() {
+        return (System.currentTimeMillis() - lastManualIsoChangeTime) < 800;
+    }
+
+    /**
+     * Sets ISO directly with valid scene-mode validation and 800ms poller freeze.
+     */
+    public synchronized boolean setHardwareIso(int targetIso) {
+        if (normalCamera == null || cameraEx == null) return false;
+        try {
+            Camera.Parameters params = normalCamera.getParameters();
+            List<String> supportedModes = params.getSupportedSceneModes();
+            if (supportedModes != null && supportedModes.contains("manual-exposure")) {
+                params.setSceneMode("manual-exposure");
+            }
+
+            Object mod = createModifier(params);
+            if (mod != null) {
+                Method setIsoMethod = findAccessibleMethod(mod, "setISOSensitivity", int.class);
+                setIsoMethod.invoke(mod, targetIso);
+                Method getParams = mod.getClass().getMethod("getParameters");
+                Camera.Parameters modified = (Camera.Parameters) getParams.invoke(mod);
+                normalCamera.setParameters(modified);
+                lastManualIsoChangeTime = System.currentTimeMillis();
+                cachedIso = (targetIso == 0) ? "ISO AUTO" : "ISO " + targetIso;
+                return true;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to set ISO: " + targetIso, t);
+        }
+        return false;
+    }
+
+    private Object createModifier(Camera.Parameters params) {
+        if (cameraEx == null || params == null) return null;
+        try {
+            if (createModifierMethod != null) {
+                return createModifierMethod.invoke(cameraEx, params);
+            }
+            Method m = cameraEx.getClass().getMethod("createParametersModifier", Camera.Parameters.class);
+            m.setAccessible(true);
+            return m.invoke(cameraEx, params);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     // Standard ISO ladder on Sony Alpha 7R II
     public static final int[] ISO_STEPS = {
         0, 50, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600,
