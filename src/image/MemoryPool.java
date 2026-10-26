@@ -20,7 +20,7 @@ public final class MemoryPool {
     private static final String TAG = "MemoryPool";
 
     public static final int SLOT_COUNT = 3;
-    public static final int BUFFER_CAPACITY = 4 * 1024 * 1024; // 4 MB
+    public static final int BUFFER_CAPACITY = 12 * 1024 * 1024; // 12 MB in Native C RAM
 
     public static final int STATE_FREE = 0;
     public static final int STATE_DECODING_GRADING = 1;

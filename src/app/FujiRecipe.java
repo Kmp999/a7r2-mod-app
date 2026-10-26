@@ -317,10 +317,12 @@ public class FujiRecipe {
 
         double contrastFactor = 1.0 + ((double) contrastBoost / 100.0);
 
+        // Fast algebraic sigmoid: eliminates 768 expensive Math.exp() calls on Dalvik ARM
         for (int i = 0; i < 256; i++) {
             double x = i / 255.0;
             double centered = (x - 0.5) * contrastFactor;
-            double s = 1.0 / (1.0 + Math.exp(-6.0 * centered));
+            double z = centered * 3.0;
+            double s = 0.5 + 0.5 * (z / (1.0 + Math.abs(z)));
 
             // Shadow adjustment below 0.35
             if (x < 0.35) {

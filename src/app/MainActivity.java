@@ -208,7 +208,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         cameraPreview.getHolder().addCallback(this);
 
-        // Precompute initial 17x17x17 LUT
+        // Initialize native color engine and precompute initial 17x17x17 LUT
+        ColorEngine.initEngineSafe(appState.getCurrentPresetId(), ColorEngine.MODE_SAFE_FASTEST);
         precomputeActiveLut();
         uiController.updateBottomHud();
         

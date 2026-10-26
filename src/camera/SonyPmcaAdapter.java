@@ -490,97 +490,53 @@ public class SonyPmcaAdapter implements CameraAdapter {
     private int currentIsoIndex = 8; // Default ISO 400
     private long lastManualIsoChangeTime = 0; // Lock for exposure poller
 
-    public void adjustIso(int direction) {
+    public void stepIso(int delta) {
         if (normalCamera == null || cameraEx == null) return;
         try {
-            // Step 1: Get parameters and create modifier directly
             Camera.Parameters params = normalCamera.getParameters();
-            Object modifier = null;
-            Method createModMethod = null;
-            for (Method m : cameraEx.getClass().getMethods()) {
-                if ("createParametersModifier".equals(m.getName()) && m.getParameterTypes().length == 1) {
-                    createModMethod = m;
-                    createModMethod.setAccessible(true);
-                    break;
-                }
-            }
-            if (createModMethod != null) {
-                modifier = createModMethod.invoke(cameraEx, params);
-            }
-            if (modifier == null || getISOSensitivityMethod == null || setISOSensitivityMethod == null) return;
+            Object modifier = createModifier(params);
+            if (modifier == null) return;
 
-            // Step 2: Query supported ISOs directly
-            Method getSupportedIsoMethod = null;
-            for (Method m : modifier.getClass().getMethods()) {
-                if ("getSupportedISOSensitivities".equals(m.getName())) {
-                    getSupportedIsoMethod = m;
-                    break;
-                }
-            }
+            Method getSupportedMethod = null;
+            Method getIsoMethod = null;
+            try { getSupportedMethod = findAccessibleMethod(modifier, "getSupportedISOSensitivities"); } catch (Throwable ignored) {}
+            try { getIsoMethod = findAccessibleMethod(modifier, "getISOSensitivity"); } catch (Throwable ignored) {}
 
-            int targetIso = -1;
-            boolean fallbackToModeChange = false;
-
-            if (getSupportedIsoMethod != null) {
-                try {
-                    @SuppressWarnings("unchecked")
-                    List<Integer> supported = (List<Integer>) getSupportedIsoMethod.invoke(modifier);
-                    if (supported != null && !supported.isEmpty()) {
-                        // Filter the returned list through our known steps for sanity
-                        java.util.ArrayList<Integer> validSteps = new java.util.ArrayList<Integer>();
-                        for (int s : ISO_STEPS) {
-                            if (supported.contains(s)) validSteps.add(s);
-                        }
-                        if (validSteps.isEmpty()) validSteps.addAll(supported);
-
-                        Integer currentIsoObj = (Integer) getISOSensitivityMethod.invoke(modifier);
-                        int currentIso = currentIsoObj != null ? currentIsoObj.intValue() : 0;
-                        int idx = validSteps.indexOf(currentIso);
-                        if (idx == -1) idx = 0;
-
-                        int nextIdx = Math.max(0, Math.min(validSteps.size() - 1, idx + direction));
-                        targetIso = validSteps.get(nextIdx);
+            int targetIso = 400;
+            if (getSupportedMethod != null && getIsoMethod != null) {
+                @SuppressWarnings("unchecked")
+                List<Integer> supported = (List<Integer>) getSupportedMethod.invoke(modifier);
+                if (supported != null && !supported.isEmpty()) {
+                    java.util.ArrayList<Integer> validSteps = new java.util.ArrayList<Integer>();
+                    for (int s : ISO_STEPS) {
+                        if (supported.contains(s)) validSteps.add(s);
                     }
-                } catch (Throwable t) {
-                    fallbackToModeChange = true;
+                    if (validSteps.isEmpty()) validSteps.addAll(supported);
+
+                    Integer currentIsoObj = (Integer) getIsoMethod.invoke(modifier);
+                    int currentIso = currentIsoObj != null ? currentIsoObj.intValue() : 0;
+                    int idx = validSteps.indexOf(currentIso);
+                    if (idx == -1) idx = 0;
+
+                    int nextIdx = Math.max(0, Math.min(validSteps.size() - 1, idx + delta));
+                    targetIso = validSteps.get(nextIdx);
+                } else {
+                    currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + delta));
+                    targetIso = ISO_STEPS[currentIsoIndex];
                 }
             } else {
-                fallbackToModeChange = true;
-            }
-
-            // Step 3: Optional fallback if ISO control throws or is unsupported in current mode
-            if (fallbackToModeChange || targetIso == -1) {
-                List<String> supportedModes = params.getSupportedSceneModes();
-                if (supportedModes != null && supportedModes.contains("manual-exposure")) {
-                    params.setSceneMode("manual-exposure");
-                    normalCamera.setParameters(params);
-                    params = normalCamera.getParameters(); // Refresh
-                    if (createModMethod != null) {
-                        modifier = createModMethod.invoke(cameraEx, params); // Recreate
-                    }
-                    if (modifier == null) return;
-                }
-                currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + direction));
+                currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + delta));
                 targetIso = ISO_STEPS[currentIsoIndex];
             }
 
-            // Step 4: Set ISO and commit the SAME params object immediately
-            setISOSensitivityMethod.invoke(modifier, targetIso);
-            Method getParams = modifier.getClass().getMethod("getParameters");
-            Camera.Parameters modifiedParams = (Camera.Parameters) getParams.invoke(modifier);
-            normalCamera.setParameters(modifiedParams);
-            
-            // Acquire lock and refresh cached value for HUD
-            lastManualIsoChangeTime = System.currentTimeMillis();
-            cachedIso = (targetIso == 0) ? "ISO AUTO" : "ISO " + targetIso;
-
+            setHardwareIso(targetIso);
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to adjust ISO natively", t);
+            Log.e(TAG, "stepIso failed", t);
         }
     }
 
-    public void stepIso(int delta) {
-        adjustIso(delta);
+    public void adjustIso(int direction) {
+        stepIso(direction);
     }
 
     // ------------------------------------------------------------------------

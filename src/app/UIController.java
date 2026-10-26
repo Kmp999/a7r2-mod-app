@@ -36,7 +36,7 @@ public class UIController {
     private HudMode hudMode = HudMode.FULL;
 
     // Control wheel mode: false = EV compensation, true = ISO sensitivity
-    private boolean wheelControlsIso = false;
+    private boolean wheelControlsIso = true;
 
     // Zero-GC Pre-allocated char buffer for bottom telemetry HUD
     private final StringBuilder hudStringBuilder = new StringBuilder(128);
@@ -273,18 +273,24 @@ public class UIController {
             }
 
             case FRONT_DIAL_CW:
-            case FRONT_DIAL_CCW:
-                // Firmware BIONZ X automatically updates Aperture in M/A mode.
-                // Do not invoke adjustAperture() here to prevent 2-step jump or hardware conflict.
+                if (cameraAdapter != null) cameraAdapter.adjustAperture(1);
                 if (qMenuView != null) qMenuView.highlightSegment(2); // Highlight Aperture
+                updateBottomHud();
+                return true;
+            case FRONT_DIAL_CCW:
+                if (cameraAdapter != null) cameraAdapter.adjustAperture(-1);
+                if (qMenuView != null) qMenuView.highlightSegment(2);
                 updateBottomHud();
                 return true;
 
             case REAR_DIAL_CW:
-            case REAR_DIAL_CCW:
-                // Firmware BIONZ X automatically updates Shutter Speed in M/S mode.
-                // Do not invoke adjustShutterSpeed() here to prevent 2-step jump or hardware conflict.
+                if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(1);
                 if (qMenuView != null) qMenuView.highlightSegment(1); // Highlight Shutter Speed
+                updateBottomHud();
+                return true;
+            case REAR_DIAL_CCW:
+                if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(-1);
+                if (qMenuView != null) qMenuView.highlightSegment(1);
                 updateBottomHud();
                 return true;
 

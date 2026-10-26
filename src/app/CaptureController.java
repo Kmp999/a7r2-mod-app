@@ -233,6 +233,7 @@ public class CaptureController {
 
             final int w = bitmap.getWidth();
             final int h = bitmap.getHeight();
+            final int requiredBytes = w * h * 2;
 
             // 3. Pre-compute LUT from active recipe if native engine is active
             if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
@@ -245,46 +246,43 @@ public class CaptureController {
                 );
             }
 
-            // 4. Color grading via Triple-Slot Direct MemoryPool (Zero-Copy)
-            final ByteBuffer directBuf = MemoryPool.acquireFreeSlot();
-            boolean graded = false;
-
-            if (directBuf != null && USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
-                bitmap.copyPixelsToBuffer(directBuf);
-                directBuf.rewind();
-                graded = ColorEngine.applyLut17DirectRGB565Safe(directBuf, w, h);
-                if (graded) {
-                    directBuf.rewind();
-                    bitmap.copyPixelsFromBuffer(directBuf);
-                }
+            // 4. Color grading via Native Direct ByteBuffer (Zero Dalvik Heap Overhead)
+            ByteBuffer directBuf = MemoryPool.acquireFreeSlot();
+            boolean isTempBuf = false;
+            if (directBuf == null || directBuf.capacity() < requiredBytes) {
+                directBuf = ByteBuffer.allocateDirect(requiredBytes);
+                isTempBuf = true;
             }
 
-            // Fallback to array processing if direct buffer was unavailable or JNI failed
-            if (!graded) {
-                short[] pixels = new short[w * h];
-                ShortBuffer buffer = ShortBuffer.wrap(pixels);
-                bitmap.copyPixelsToBuffer(buffer);
+            directBuf.clear();
+            bitmap.copyPixelsToBuffer(directBuf);
+            directBuf.rewind();
 
-                if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
-                    graded = ColorEngine.applyLut17RGB565Safe(pixels, w * h);
-                }
-                if (!graded) {
-                    javaEngine.init(appState.getCurrentPresetId());
-                    javaEngine.processRGB565(pixels, w, h);
-                }
-                buffer.rewind();
-                bitmap.copyPixelsFromBuffer(buffer);
+            boolean graded = false;
+            if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
+                graded = ColorEngine.applyLut17DirectRGB565Safe(directBuf, w, h);
+            }
+
+            if (graded) {
+                directBuf.rewind();
+                bitmap.copyPixelsFromBuffer(directBuf);
+                Log.i(TAG, "Color grading applied successfully to " + w + "x" + h + " bitmap");
+            } else {
+                Log.w(TAG, "Native LUT grading was skipped or failed");
             }
 
             final long gradeDuration = System.currentTimeMillis() - start;
             appState.setLastProcessingTimeMs(gradeDuration);
 
             // 5. Triple-Slot SD Card I/O Decoupling: Offload save operation to background IO thread
-            if (directBuf != null) {
+            if (!isTempBuf && directBuf != null) {
                 MemoryPool.markForIO(directBuf);
             }
 
+            final ByteBuffer finalBuf = directBuf;
+            final boolean finalIsTemp = isTempBuf;
             final String presetName = appState.getCurrentPresetName();
+
             ioExecutor.execute(new Runnable() {
                 @Override
                 public void run() {
@@ -292,8 +290,8 @@ public class CaptureController {
                         String savedPath = saveJpeg(bitmap);
                         deliverResult(bitmap, presetName, w, h, gradeDuration, savedPath);
                     } finally {
-                        if (directBuf != null) {
-                            MemoryPool.releaseSlot(directBuf);
+                        if (!finalIsTemp && finalBuf != null) {
+                            MemoryPool.releaseSlot(finalBuf);
                         }
                     }
                 }
