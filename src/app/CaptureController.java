@@ -82,12 +82,10 @@ public class CaptureController {
             @Override
             public Thread newThread(Runnable r) {
                 Thread t = new Thread(r, "FujiLite-SD-IO");
-                t.setPriority(Thread.MIN_PRIORITY); // Background priority for SD write
+                t.setPriority(Thread.NORM_PRIORITY);
                 return t;
             }
         });
-
-        MemoryPool.initPool();
     }
 
     public CameraState getState() {
@@ -414,39 +412,11 @@ public class CaptureController {
 
     /** Saves graded JPEG to SD-card using robust StorageResolver. */
     private String saveJpeg(Bitmap bitmap) {
-        File dir = StorageResolver.findSonySdCardMount();
-        if (dir != null) {
-            String name = StorageResolver.generateDcfFilename(dir);
-            File file = new File(dir, name);
-            FileOutputStream out = null;
-            try {
-                out = new FileOutputStream(file);
-                if (bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
-                    out.flush();
-                    try {
-                        out.getFD().sync(); // Force write to physical storage immediately
-                    } catch (Throwable ignored) {} // Prevent SyncFailedException from aborting on custom FAT32 driver
-                    out.close();
-                    out = null;
-
-                    // 4-tier registration with Sony AvindexStore
-                    StorageResolver.registerWithAvindex(context, file.getAbsolutePath());
-                    return file.getAbsolutePath();
-                }
-            } catch (Throwable t) {
-                Log.e(TAG, "Save failed in " + dir.getAbsolutePath(), t);
-                appState.setLastErrorMessage(t.getClass().getSimpleName() + ": " + t.getMessage());
-            } finally {
-                if (out != null) {
-                    try {
-                        out.close();
-                    } catch (Throwable ignored) {}
-                }
-            }
-        } else {
-            appState.setLastErrorMessage("No writable SD mount found (" + StorageResolver.getLastDiagnostic() + ")");
+        String path = StorageResolver.saveJpegToSd(context, bitmap);
+        if (path == null) {
+            appState.setLastErrorMessage(StorageResolver.getLastDiagnostic());
         }
-        return null;
+        return path;
     }
 
     public void shutdown() {
