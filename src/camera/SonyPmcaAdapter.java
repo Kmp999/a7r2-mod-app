@@ -665,35 +665,48 @@ public class SonyPmcaAdapter implements CameraAdapter {
     }
 
     public void incrementAperture(int step) {
+        if (normalCamera == null) return;
         try {
-            Object modifier = getModifier();
-            if (modifier != null && getSupportedApertureMethod != null && setApertureMethod != null) {
-                List<?> supported = (List<?>) getSupportedApertureMethod.invoke(modifier);
-                Object cur = getApertureMethod.invoke(modifier);
-                if (supported != null && !supported.isEmpty() && cur != null) {
-                    int idx = supported.indexOf(cur);
-                    if (idx >= 0) {
-                        int next = Math.max(0, Math.min(supported.size() - 1, idx + step));
-                        Object nextVal = supported.get(next);
-                        if (nextVal instanceof Integer) {
-                            setMethod.invoke(modifier, ((Integer) nextVal).intValue());
+            Camera.Parameters params = normalCamera.getParameters();
+            Object modifier = createModifier(params);
+            if (modifier != null) {
+                Method getSupportedMethod = null;
+                Method getCurMethod = null;
+                Method setMethod = null;
+                try { getSupportedMethod = findAccessibleMethod(modifier, "getSupportedApertures"); } catch (Throwable ignored) {}
+                try { getCurMethod = findAccessibleMethod(modifier, "getAperture"); } catch (Throwable ignored) {}
+                try { setMethod = findAccessibleMethod(modifier, "setAperture", int.class); } catch (Throwable ignored) {}
 
-                            Camera.Parameters toApply = params;
-                            try {
-                                Method getParams = modifier.getClass().getMethod("getParameters");
-                                Object p = getParams.invoke(modifier);
-                                if (p instanceof Camera.Parameters) toApply = (Camera.Parameters) p;
-                            } catch (Throwable ignored) {}
+                if (getSupportedMethod != null && getCurMethod != null && setMethod != null) {
+                    List<?> supported = (List<?>) getSupportedMethod.invoke(modifier);
+                    Object cur = getCurMethod.invoke(modifier);
+                    if (supported != null && !supported.isEmpty() && cur instanceof Integer) {
+                        int idx = supported.indexOf(cur);
+                        if (idx >= 0) {
+                            int next = Math.max(0, Math.min(supported.size() - 1, idx + step));
+                            Object nextVal = supported.get(next);
+                            if (nextVal instanceof Integer) {
+                                setMethod.invoke(modifier, ((Integer) nextVal).intValue());
 
-                            normalCamera.setParameters(toApply);
-                            int val = ((Integer) nextVal).intValue();
-                            cachedAperture = (val <= 0) ? "F--" : String.format(java.util.Locale.US, "F%.1f", val / 100.0f);
-                            return;
+                                Camera.Parameters toApply = params;
+                                try {
+                                    Method getParams = modifier.getClass().getMethod("getParameters");
+                                    Object p = getParams.invoke(modifier);
+                                    if (p instanceof Camera.Parameters) toApply = (Camera.Parameters) p;
+                                } catch (Throwable ignored) {}
+
+                                normalCamera.setParameters(toApply);
+                                int val = ((Integer) nextVal).intValue();
+                                cachedAperture = (val <= 0) ? "F--" : String.format(java.util.Locale.US, "F%.1f", val / 100.0f);
+                                return;
+                            }
                         }
                     }
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(TAG, "incrementAperture failed", t);
+        }
 
         cachedAperture = (step > 0) ? "F4.0" : "F2.0";
     }
