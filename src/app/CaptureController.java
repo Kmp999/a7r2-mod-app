@@ -346,7 +346,14 @@ public class CaptureController {
     }
 
     private void deliverResult(Bitmap bitmap, String preset, int w, int h, long ms) {
+        deliverResult(bitmap, preset, w, h, ms, null);
+    }
+
+    private void deliverResult(Bitmap bitmap, String preset, int w, int h, long ms, String savedPath) {
         String baseInfo = preset + "  42.4MP (SOOC)  " + ms + " ms";
+        if (savedPath != null) {
+            baseInfo += "\nSAVED: " + savedPath;
+        }
         ResultListener l = resultListener;
         if (l != null) {
             l.onResult(bitmap, baseInfo);
