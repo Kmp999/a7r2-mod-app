@@ -129,6 +129,65 @@ public final class StorageResolver {
     }
 
     /**
+     * Saves raw 42.4 MP JPEG bytes directly from BIONZ X to the first writable SD card directory.
+     * Zero-Copy / Zero-Decode: Preserves 100% of native 7952x5304 resolution and hardware ISP metadata.
+     * Returns the absolute path of the saved file, or null if all attempts fail.
+     */
+    public static String saveRawJpegToSd(Context context, byte[] rawJpegData) {
+        if (rawJpegData == null || rawJpegData.length == 0) {
+            sLastDiagnostic = "FAIL: Raw JPEG data is empty";
+            return null;
+        }
+
+        List<File> candidates = getCandidateDcimDirs();
+        if (candidates.isEmpty()) {
+            sLastDiagnostic = "FAIL: No SD mount candidates found";
+            Log.e(TAG, sLastDiagnostic);
+            return null;
+        }
+
+        for (File dir : candidates) {
+            try {
+                if (!dir.exists()) {
+                    dir.mkdirs();
+                }
+                if (!dir.exists() || !dir.isDirectory()) {
+                    continue;
+                }
+
+                String filename = generateDcfFilename(dir);
+                File file = new File(dir, filename);
+                FileOutputStream out = new FileOutputStream(file);
+                out.write(rawJpegData);
+                out.flush();
+                try {
+                    out.getFD().sync();
+                } catch (Throwable ignored) {}
+                out.close();
+
+                if (file.exists() && file.length() > 0) {
+                    String savedPath = file.getAbsolutePath();
+                    writeExifMetadata(savedPath);
+                    sLastDiagnostic = "OK (42.4MP): " + savedPath + " (" + (file.length() / 1024) + "KB)";
+                    Log.i(TAG, "Successfully saved full-res 42.4MP photo: " + sLastDiagnostic);
+
+                    // Register with Sony AvindexStore for physical playback
+                    registerWithAvindex(context, savedPath);
+                    return savedPath;
+                } else {
+                    file.delete();
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Raw write failed in " + dir.getAbsolutePath() + ": " + t.getMessage());
+            }
+        }
+
+        sLastDiagnostic = "FAIL: All " + candidates.size() + " mount attempts failed";
+        Log.e(TAG, sLastDiagnostic);
+        return null;
+    }
+
+    /**
      * Saves a JPEG bitmap directly to the first writable SD card directory with fallback.
      * Returns the absolute path of the saved file, or null if all attempts fail.
      */
