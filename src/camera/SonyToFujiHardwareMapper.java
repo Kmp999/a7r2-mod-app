@@ -121,6 +121,9 @@ public class SonyToFujiHardwareMapper {
                 case DR400: droLevel = 5; break;
             }
 
+            // Must turn off Auto-HDR to prevent 3-shot sequence and 2s delays.
+            params.set("sony-auto-hdr", "off");
+            
             try {
                 Method setDroMethod = modClass.getMethod("setDro", int.class);
                 setDroMethod.invoke(modifier, droLevel);

@@ -405,157 +405,109 @@ public class SonyPmcaAdapter implements CameraAdapter {
     };
     private int currentIsoIndex = 8; // Default ISO 400
 
-    public void stepIso(int delta) {
-        currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + delta));
-        int targetIso = ISO_STEPS[currentIsoIndex];
-        setISOSensitivity(targetIso);
-    }
+    public void adjustIso(int direction) {
+        if (normalCamera == null || cameraEx == null) return;
+        try {
+            // Step 1: Get parameters and create modifier
+            Camera.Parameters params = normalCamera.getParameters();
+            Object modifier = getModifier();
+            if (modifier == null || getISOSensitivityMethod == null || setISOSensitivityMethod == null) return;
 
-    // ------------------------------------------------------------------------
-    // Hardware Exposure Control (Shutter Speed, Aperture, ISO, EV)
-    // ------------------------------------------------------------------------
+            // Step 2: Check scene mode and unlock manual control if necessary
+            String sceneMode = params.getSceneMode();
+            if (Camera.Parameters.SCENE_MODE_AUTO.equals(sceneMode) || "superior-auto".equals(sceneMode)) {
+                params.setSceneMode("manual-exposure");
+                normalCamera.setParameters(params);
+                params = normalCamera.getParameters(); // Refresh
+                modifier = getModifier(); // Recreate modifier with new params
+                if (modifier == null) return;
+            }
 
-    public void adjustShutterSpeed(int step) {
-        ensureManualOrShutterPriority();
-        if (cameraEx != null) {
-            try {
-                Method m = cameraEx.getClass().getMethod("adjustShutterSpeed", int.class);
-                m.invoke(cameraEx, step);
-                getShutterSpeed();
-                return;
-            } catch (Throwable ignored) {}
+            // Step 3: Get supported ISO list and find target
+            Method getSupportedIsoMethod = null;
+            for (Method m : modifier.getClass().getMethods()) {
+                if ("getSupportedISOSensitivities".equals(m.getName())) {
+                    getSupportedIsoMethod = m;
+                    break;
+                }
+            }
+
+            int targetIso;
+            if (getSupportedIsoMethod != null) {
+                @SuppressWarnings("unchecked")
+                List<Integer> supported = (List<Integer>) getSupportedIsoMethod.invoke(modifier);
+                if (supported != null && !supported.isEmpty()) {
+                    Integer currentIsoObj = (Integer) getISOSensitivityMethod.invoke(modifier);
+                    int currentIso = currentIsoObj != null ? currentIsoObj.intValue() : 0;
+                    int idx = supported.indexOf(currentIso);
+                    
+                    if (idx == -1) idx = 0; // Default to Auto if not found
+
+                    int nextIdx = Math.max(0, Math.min(supported.size() - 1, idx + direction));
+                    targetIso = supported.get(nextIdx);
+                } else {
+                    // Fallback to static ISO ladder if reflection returns empty
+                    currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + direction));
+                    targetIso = ISO_STEPS[currentIsoIndex];
+                }
+            } else {
+                 // Fallback to static ISO ladder
+                 currentIsoIndex = Math.max(0, Math.min(ISO_STEPS.length - 1, currentIsoIndex + direction));
+                 targetIso = ISO_STEPS[currentIsoIndex];
+            }
+
+            // Step 4: Set ISO and commit the SAME params object immediately
+            setISOSensitivityMethod.invoke(modifier, targetIso);
+            Method getParams = modifier.getClass().getMethod("getParameters");
+            Camera.Parameters modifiedParams = (Camera.Parameters) getParams.invoke(modifier);
+            normalCamera.setParameters(modifiedParams);
+            
+            // Refresh cached value for HUD
+            cachedIso = (targetIso == 0) ? "ISO AUTO" : "ISO " + targetIso;
+
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to adjust ISO natively", t);
         }
-        incrementShutterSpeed(step);
     }
 
-    public void ensureManualOrShutterPriority() {
+    public void stepIso(int delta) {
+        adjustIso(delta);
+    }
+
+    /**
+     * Enforces Single Shot drive mode to permanently defeat the Infinite Capture Loop.
+     * Also explicitly disables Auto-HDR, Bracketing, and Multi-Frame NR which cause 3-shot sequences.
+     */
+    public void setDriveModeSingle() {
         if (normalCamera == null) return;
         try {
             Camera.Parameters params = normalCamera.getParameters();
-            String mode = params.get("sony-exposure-mode");
-            if ("program-auto".equals(mode) || "aperture-priority".equals(mode)) {
-                params.set("sony-exposure-mode", "manual-exposure");
-                normalCamera.setParameters(params);
+            
+            // Defeat Auto-HDR and MFNR which cause multi-shot delays
+            params.set("sony-auto-hdr", "off");
+            params.set("sony-iso-mfnr", "off");
+            
+            // Set noise reduction to normal
+            if (params.get("sony-high-iso-nr") != null) {
+                 params.set("sony-high-iso-nr", "normal");
             }
-        } catch (Throwable ignored) {}
-    }
-
-    public void incrementShutterSpeed(int step) {
-        try {
+            
+            normalCamera.setParameters(params);
+            
             Object modifier = getModifier();
-            if (modifier != null && getSupportedShutterSpeedMethod != null && setShutterSpeedMethod != null) {
-                List<?> supported = (List<?>) getSupportedShutterSpeedMethod.invoke(modifier);
-                Object cur = getShutterSpeedMethod.invoke(modifier);
-                if (supported != null && !supported.isEmpty() && cur != null) {
-                    int idx = supported.indexOf(cur);
-                    if (idx >= 0) {
-                        int next = Math.max(0, Math.min(supported.size() - 1, idx + step));
-                        Object nextVal = supported.get(next);
-                        Class<?> pairCls = nextVal.getClass();
-                        Object first = pairCls.getField("first").get(nextVal);
-                        Object second = pairCls.getField("second").get(nextVal);
-                        if (first instanceof Integer && second instanceof Integer) {
-                            setShutterSpeedMethod.invoke(modifier, ((Integer) first).intValue(), ((Integer) second).intValue());
-                            commitModifier(modifier);
-                            cachedShutter = formatShutterSpeed(((Integer) first).intValue(), ((Integer) second).intValue());
-                            return;
-                        }
-                    }
+            if (modifier != null && setDriveModeMethod != null) {
+                Class<?>[] pTypes = setDriveModeMethod.getParameterTypes();
+                if (pTypes.length > 0 && pTypes[0] == int.class) {
+                    setDriveModeMethod.invoke(modifier, 0); // DRIVE_MODE_SINGLE = 0
+                } else if (pTypes.length > 0 && pTypes[0] == String.class) {
+                    setDriveModeMethod.invoke(modifier, "single");
                 }
-            }
-        } catch (Throwable ignored) {}
-
-        // Fallback simulation
-        cachedShutter = (step > 0) ? "1/250" : "1/60";
-    }
-
-    public String getShutterSpeed() {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null && getShutterSpeedMethod != null) {
-                Object cur = getShutterSpeedMethod.invoke(modifier);
-                if (cur != null) {
-                    Class<?> pairCls = cur.getClass();
-                    Object first = pairCls.getField("first").get(cur);
-                    Object second = pairCls.getField("second").get(cur);
-                    if (first instanceof Integer && second instanceof Integer) {
-                        cachedShutter = formatShutterSpeed(((Integer) first).intValue(), ((Integer) second).intValue());
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-        return cachedShutter;
-    }
-
-    private String formatShutterSpeed(int num, int den) {
-        if (num <= 0 || den <= 0) return "AUTO";
-        if (num == 1) return "1/" + den;
-        if (den == 1) return num + "\"";
-        float sec = (float) num / (float) den;
-        return String.format("%.1f\"", sec);
-    }
-
-    public void incrementAperture(int step) {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null && getSupportedApertureMethod != null && setApertureMethod != null) {
-                List<?> supported = (List<?>) getSupportedApertureMethod.invoke(modifier);
-                Object cur = getApertureMethod.invoke(modifier);
-                if (supported != null && !supported.isEmpty() && cur != null) {
-                    int idx = supported.indexOf(cur);
-                    if (idx >= 0) {
-                        int next = Math.max(0, Math.min(supported.size() - 1, idx + step));
-                        Object nextVal = supported.get(next);
-                        if (nextVal instanceof Integer) {
-                            setApertureMethod.invoke(modifier, ((Integer) nextVal).intValue());
-                            commitModifier(modifier);
-                            cachedAperture = String.format("F%.1f", ((Integer) nextVal).intValue() / 100.0f);
-                            return;
-                        }
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        cachedAperture = (step > 0) ? "F4.0" : "F2.0";
-    }
-
-    public String getAperture() {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null && getApertureMethod != null) {
-                Object cur = getApertureMethod.invoke(modifier);
-                if (cur instanceof Integer) {
-                    cachedAperture = String.format("F%.1f", ((Integer) cur).intValue() / 100.0f);
-                }
-            }
-        } catch (Throwable ignored) {}
-        return cachedAperture;
-    }
-
-    public void setISOSensitivity(int iso) {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null && setISOSensitivityMethod != null) {
-                setISOSensitivityMethod.invoke(modifier, iso);
                 commitModifier(modifier);
-                cachedIso = (iso == 0) ? "ISO AUTO" : "ISO " + iso;
+                Log.i(TAG, "Drive mode enforced: Single-Shot. HDR/MFNR disabled.");
             }
-        } catch (Throwable ignored) {}
-    }
-
-    public String getIso() {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null && getISOSensitivityMethod != null) {
-                Object cur = getISOSensitivityMethod.invoke(modifier);
-                if (cur instanceof Integer) {
-                    int iso = ((Integer) cur).intValue();
-                    cachedIso = (iso == 0) ? "ISO AUTO" : "ISO " + iso;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return cachedIso;
+        } catch (Throwable t) {
+            Log.w(TAG, "setDriveModeSingle failed", t);
+        }
     }
 
     public void incrementEV(int step) {
