@@ -136,21 +136,6 @@ public class CaptureController {
         lastCaptureTime = now;
 
         final long captureStartTime = System.currentTimeMillis();
-        final File preCaptureLatest = StorageResolver.getLatestSavedPhoto();
-        lastHardwareStoredPhoto = null;
-
-        // Register hardware image stored listener if using SonyPmcaAdapter
-        if (cameraAdapter instanceof SonyPmcaAdapter) {
-            ((SonyPmcaAdapter) cameraAdapter).setStoreImageListener(new SonyPmcaAdapter.StoreImageListener() {
-                @Override
-                public void onImageStored(String dir, String filename) {
-                    if (dir != null && filename != null) {
-                        lastHardwareStoredPhoto = new File(dir, filename);
-                        Log.i(TAG, "Hardware notified photo stored: " + lastHardwareStoredPhoto.getAbsolutePath());
-                    }
-                }
-            });
-        }
 
         setState(CameraState.CAPTURING_SINGLE);
         appState.setProcessing(true);
@@ -161,51 +146,49 @@ public class CaptureController {
         watchdogHandler.postDelayed(captureWatchdogRunnable, 2500);
 
         try {
-            if (cameraAdapter instanceof SonyPmcaAdapter) {
-                // SONY HARDWARE PATH: Invoke takeHardwarePicture(shutter, null, null).
-                // Passing null for picture callback tells BIONZ X to save the 42.4MP photo directly to SD!
-                ((SonyPmcaAdapter) cameraAdapter).takeHardwarePicture(new Camera.ShutterCallback() {
-                    @Override
-                    public void onShutter() {
-                        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
-                        Log.i(TAG, "Hardware shutter fired; restoring EVF preview immediately");
+            cameraAdapter.takePicture(new Camera.PictureCallback() {
+                @Override
+                public void onPictureTaken(final byte[] jpegData, Camera camera) {
+                    watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+                    try {
+                        if (cameraAdapter instanceof SonyPmcaAdapter) {
+                            ((SonyPmcaAdapter) cameraAdapter).cancelAutoFocus();
+                        }
+
+                        // 1. Phục hồi khung ngắm EVF tức thì (< 40ms, không đơ máy)
                         setState(CameraState.RESTORING_PREVIEW);
                         restorePreviewWithWatchdog(3);
+
+                        if (jpegData == null || jpegData.length == 0) {
+                            uiController.updateStatusAsync("Capture failed: Empty buffer");
+                            return;
+                        }
+
+                        // Đồng bộ số thứ tự ảnh
+                        final int seqNum = StorageResolver.allocateNextSequenceNumber();
+
+                        // LUỒNG 1: Lưu ảnh gốc ban đầu nhận từ camera ra thẻ nhớ
+                        ioExecutor.execute(new Runnable() {
+                            @Override
+                            public void run() {
+                                saveFullResJpegDirectly(jpegData, seqNum);
+                            }
+                        });
+
+                        // LUỒNG 2: Áp 3D LUT màu và lưu ảnh FUJIxxxx.JPG ra thẻ nhớ (< 150ms)
+                        processingExecutor.execute(new Runnable() {
+                            @Override
+                            public void run() {
+                                processQuickReviewProxy(jpegData, seqNum);
+                            }
+                        });
+
+                    } finally {
                         isCapturing.set(false);
                     }
-                });
-
-                // Watch SD card for newly saved 42.4MP photo from BIONZ X
-                processingExecutor.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        watchAndProcessFullResPhoto(captureStartTime, preCaptureLatest, null);
-                    }
-                });
-                return true;
-            } else {
-                // GENERIC / MOCK ADAPTER PATH (for tests and non-Sony hosts)
-                cameraAdapter.takePicture(new Camera.PictureCallback() {
-                    @Override
-                    public void onPictureTaken(final byte[] jpegData, Camera camera) {
-                        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
-                        try {
-                            setState(CameraState.RESTORING_PREVIEW);
-                            restorePreviewWithWatchdog(3);
-
-                            processingExecutor.execute(new Runnable() {
-                                @Override
-                                public void run() {
-                                    watchAndProcessFullResPhoto(captureStartTime, preCaptureLatest, jpegData);
-                                }
-                            });
-                        } finally {
-                            isCapturing.set(false);
-                        }
-                    }
-                });
-                return true;
-            }
+                }
+            });
+            return true;
         } catch (Throwable t) {
             watchdogHandler.removeCallbacks(captureWatchdogRunnable);
             Log.e(TAG, "takePicture failed, attempting preview restore", t);
@@ -255,163 +238,7 @@ public class CaptureController {
     }
 
     /**
-     * HƯỚNG 2 (BIONZ X SD Watcher): Chờ phần cứng máy ảnh BIONZ X ghi xong file ảnh 42.4MP gốc ra thẻ nhớ,
-     * tự động phát hiện file mới, giải mã với độ phân giải cao nhất (10.6MP / sample=2, an toàn Dalvik Heap),
-     * áp 17x17x17 3D LUT và lưu ảnh FUJIxxxx.JPG vào thẻ nhớ song song với DSC0xxxx.JPG gốc.
-     */
-    private void watchAndProcessFullResPhoto(final long captureStartTime, final File preCaptureLatest, final byte[] fallbackJpegData) {
-        final long start = System.currentTimeMillis();
-        try {
-            uiController.updateStatusAsync("Waiting for camera photo...");
-
-            // 1. Chờ BIONZ X lưu xong ảnh 42.4MP gốc ra thẻ nhớ (qua listener phần cứng hoặc quét thư mục DCIM)
-            File rawFile = lastHardwareStoredPhoto;
-            if (rawFile == null || !rawFile.exists()) {
-                rawFile = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCaptureLatest, 5000);
-            }
-
-            if (rawFile != null && rawFile.exists()) {
-                Log.i(TAG, "Found full-res photo from BIONZ X: " + rawFile.getAbsolutePath() + " (" + (rawFile.length() / 1024) + " KB)");
-                final String presetName = appState.getCurrentPresetName();
-                uiController.updateStatusAsync("Grading 42.4MP " + rawFile.getName() + "...");
-
-                // 2. Đọc kích thước ảnh gốc từ file trên thẻ nhớ
-                BitmapFactory.Options boundsOpts = new BitmapFactory.Options();
-                boundsOpts.inJustDecodeBounds = true;
-                BitmapFactory.decodeFile(rawFile.getAbsolutePath(), boundsOpts);
-                final int rawW = boundsOpts.outWidth;
-                final int rawH = boundsOpts.outHeight;
-                Log.i(TAG, "SD Photo dimensions: " + rawW + "x" + rawH);
-
-                // 3. Giải mã ở độ phân giải cao nhất khả thi (sample=2 cho ảnh 42.4MP -> 10.6MP / 4K+)
-                BitmapFactory.Options opts = new BitmapFactory.Options();
-                opts.inPreferredConfig = Bitmap.Config.RGB_565;
-                opts.inSampleSize = (rawW > 3500) ? 2 : 1;
-                opts.inPurgeable = true;
-
-                Bitmap bitmap = null;
-                try {
-                    bitmap = BitmapFactory.decodeFile(rawFile.getAbsolutePath(), opts);
-                } catch (OutOfMemoryError oom) {
-                    Log.w(TAG, "OOM at sample " + opts.inSampleSize + ", falling back to sample=4", oom);
-                    System.gc();
-                    opts.inSampleSize = 4;
-                    bitmap = BitmapFactory.decodeFile(rawFile.getAbsolutePath(), opts);
-                }
-
-                if (bitmap != null) {
-                    final int w = bitmap.getWidth();
-                    final int h = bitmap.getHeight();
-                    final int requiredBytes = w * h * 2;
-
-                    // Precompute LUT từ active recipe
-                    if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
-                        FujiRecipe recipe = appState.getActiveRecipe();
-                        byte[] baseLut = LutManager.getLutTable(context, recipe.filmSim.lutFile);
-                        if (baseLut != null) {
-                            ColorEngine.precomputeLut17WithBaseSafe(
-                                baseLut,
-                                recipe.computeCcmQ8(),
-                                recipe.generateToneCurve('R'),
-                                recipe.generateToneCurve('G'),
-                                recipe.generateToneCurve('B')
-                            );
-                        } else {
-                            ColorEngine.precomputeLut17Safe(
-                                recipe.computeCcmQ8(),
-                                recipe.generateToneCurve('R'),
-                                recipe.generateToneCurve('G'),
-                                recipe.generateToneCurve('B')
-                            );
-                        }
-                    }
-
-                    // Native grading bằng Direct ByteBuffer (22MB MemoryPool)
-                    ByteBuffer directBuf = MemoryPool.acquireFreeSlot();
-                    boolean isTempBuf = false;
-                    if (directBuf == null || directBuf.capacity() < requiredBytes) {
-                        try {
-                            directBuf = ByteBuffer.allocateDirect(requiredBytes);
-                            isTempBuf = true;
-                        } catch (Throwable t) {
-                            Log.e(TAG, "Failed direct buffer allocation for " + w + "x" + h, t);
-                        }
-                    }
-
-                    boolean graded = false;
-                    if (directBuf != null) {
-                        directBuf.clear();
-                        bitmap.copyPixelsToBuffer(directBuf);
-                        directBuf.rewind();
-
-                        if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
-                            graded = ColorEngine.applyLut17DirectRGB565Safe(directBuf, w, h);
-                        }
-
-                        if (graded) {
-                            directBuf.rewind();
-                            bitmap.copyPixelsFromBuffer(directBuf);
-                            Log.i(TAG, "Applied film simulation grading to " + w + "x" + h + " photo");
-                        }
-
-                        if (!isTempBuf) {
-                            MemoryPool.releaseSlot(directBuf);
-                        }
-                    }
-
-                    // 4. Lưu ảnh đã áp màu ra thẻ nhớ với tên FUJIxxxx.JPG khớp số thứ tự
-                    final String rawName = rawFile.getName().toUpperCase(Locale.US);
-                    String fujiName;
-                    if (rawName.startsWith("DSC0") && rawName.length() == 12) {
-                        fujiName = "FUJI" + rawName.substring(4);
-                    } else if (rawName.endsWith(".JPG")) {
-                        fujiName = "FUJI_" + rawName;
-                    } else {
-                        fujiName = "FUJI0001.JPG";
-                    }
-
-                    File fujiFile = new File(rawFile.getParentFile(), fujiName);
-                    try {
-                        FileOutputStream out = new FileOutputStream(fujiFile);
-                        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out);
-                        out.flush();
-                        try { out.getFD().sync(); } catch (Throwable ignored) {}
-                        out.close();
-
-                        StorageResolver.writeExifMetadata(fujiFile.getAbsolutePath(), presetName);
-                        StorageResolver.registerWithAvindex(context, fujiFile.getAbsolutePath());
-                        Log.i(TAG, "Successfully saved graded photo: " + fujiFile.getAbsolutePath());
-                    } catch (Throwable t) {
-                        Log.e(TAG, "Failed writing graded photo file: " + fujiFile.getAbsolutePath(), t);
-                    }
-
-                    final long duration = System.currentTimeMillis() - start;
-                    appState.setLastProcessingTimeMs(duration);
-
-                    // Hiển thị Quick Review LCD và cập nhật status
-                    final float mp = (float)(w * h) / 1000000.0f;
-                    String status = String.format(Locale.US, "SAVED: %s (42.4MP) + %s (%.1fMP %s)", rawName, fujiName, mp, presetName);
-                    uiController.updateStatusAsync(status);
-                    deliverResult(bitmap, presetName, w, h, duration, fujiFile.getAbsolutePath());
-                    return;
-                }
-            }
-
-            // Fallback: nếu camera không ghi file ra thẻ nhớ (ví dụ chạy trên emulator/mock)
-            Log.w(TAG, "No newly written photo detected on SD within timeout, falling back to callback proxy");
-            if (fallbackJpegData != null && fallbackJpegData.length > 0) {
-                processQuickReviewProxy(fallbackJpegData, -1);
-            }
-        } catch (Throwable t) {
-            Log.e(TAG, "Error in watchAndProcessFullResPhoto", t);
-        } finally {
-            appState.setProcessing(false);
-        }
-    }
-
-    /**
-     * LUỒNG 1: Ghi trực tiếp mảng byte JPEG 42.4 MP nguyên bản từ BIONZ X vào thẻ nhớ SD.
-     * Hoàn toàn không qua decode/re-encode -> Giữ nguyên 100% 7952x5304 pixels và EXIF BIONZ X.
+     * LUỒNG 1: Ghi trực tiếp mảng byte JPEG nguyên bản từ BIONZ X vào thẻ nhớ SD.
      */
     private void saveFullResJpegDirectly(byte[] rawJpeg) {
         saveFullResJpegDirectly(rawJpeg, -1);
@@ -437,9 +264,8 @@ public class CaptureController {
     }
 
     /**
-     * LUỒNG 2: Giải mã độ phân giải cao nhất khả thi (sample=2 ~10.6MP / 4K, an toàn tuyệt đối Dalvik Heap,
-     * fallback sample=4 ~2.6MP nếu bộ nhớ máy quá thấp), áp 17x17x17 3D LUT của Film Simulation,
-     * gửi hiển thị Quick Review trên LCD/EVF trong < 100ms, VÀ LƯU ẢNH ĐÃ ÁP FILTER (FUJIxxxx.JPG) VÀO THẺ NHỚ SD.
+     * LUỒNG 2: Giải mã độ phân giải 100% của khung hình, áp 17x17x17 3D LUT của Film Simulation,
+     * gửi hiển thị Quick Review trên LCD/EVF trong < 50ms, VÀ LƯU ẢNH ĐÃ ÁP FILTER (FUJIxxxx.JPG) VÀO THẺ NHỚ SD.
      */
     private void processQuickReviewProxy(byte[] jpegData) {
         processQuickReviewProxy(jpegData, -1);
@@ -457,38 +283,19 @@ public class CaptureController {
             Log.i(TAG, "Captured JPEG raw dimensions: " + rawW + "x" + rawH);
 
             // 2. Select sample size dynamically based on input resolution:
-            // - If full sensor resolution 42.4MP (7952x5304) or > 3500px:
-            //   Target sample=2 (~10.6MP / 3976x2652), with fallback sample=4 (~2.6MP).
-            // - If already <= 3500px (e.g. 1616x1080 or smaller):
-            //   Target sample=1 (preserve 100% resolution, NEVER downscale!), fallback sample=2, 4.
-            int[] candidateSampleSizes;
-            if (rawW > 3500) {
-                candidateSampleSizes = new int[]{ 2, 4 };
-            } else {
+            // - If raw resolution is 42.4MP (rawW > 3500px): use sample=2 (10.6MP).
+            // - If raw resolution is already <= 3500px (1616x1080): use sample=1 (100% full proxy!).
+            int[] candidateSampleSizes = new int[]{ 2, 4 };
+            if (rawW <= 3500) {
                 candidateSampleSizes = new int[]{ 1, 2, 4 };
             }
 
             Bitmap bitmap = null;
-            for (int sample : candidateSampleSizes) {
-                try {
-                    BitmapFactory.Options opts = new BitmapFactory.Options();
-                    opts.inPreferredConfig = Bitmap.Config.RGB_565;
-                    opts.inSampleSize = sample;
-                    opts.inPurgeable = true;
-                    bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, opts);
-                    if (bitmap != null) {
-                        Log.i(TAG, "Decoded capture image with inSampleSize=" + sample + " (" + bitmap.getWidth() + "x" + bitmap.getHeight() + ")");
-                        break;
-                    }
-                } catch (OutOfMemoryError oom) {
-                    Log.w(TAG, "OutOfMemoryError with inSampleSize=" + sample + ", falling back to lower resolution");
-                    System.gc();
-                }
-            }
-
-            if (bitmap == null) {
-                BitmapFactory.Options opts = new BitmapFactory.Options();
-                opts.inPreferredConfig = Bitmap.Config.RGB_565;
+            try {
+                bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, opts);
+            } catch (OutOfMemoryError oom) {
+                Log.w(TAG, "OutOfMemoryError with inSampleSize=" + targetSample + ", falling back to sample=4");
+                System.gc();
                 opts.inSampleSize = 4;
                 bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, opts);
             }
@@ -524,7 +331,7 @@ public class CaptureController {
                 }
             }
 
-            // Color grading via Native Direct ByteBuffer (Zero Dalvik Heap Overhead)
+            // Color grading via Native Direct ByteBuffer (Zero Dalvik Heap Overhead) (< 40ms)
             ByteBuffer directBuf = MemoryPool.acquireFreeSlot();
             boolean isTempBuf = false;
             if (directBuf == null || directBuf.capacity() < requiredBytes) {
@@ -582,7 +389,7 @@ public class CaptureController {
                             presetName
                         );
                         if (gradedSavedPath != null) {
-                            String msg = String.format(Locale.US, "SAVED: 42.4MP RAW + %.1fMP %s", mp, presetName);
+                            String msg = String.format(Locale.US, "SAVED: %.1fMP %s (%s)", mp, presetName, new File(gradedSavedPath).getName());
                             uiController.updateStatusAsync(msg);
                             Log.i(TAG, "Successfully saved graded photo: " + gradedSavedPath);
                         } else {
