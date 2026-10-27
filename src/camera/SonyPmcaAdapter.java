@@ -34,6 +34,15 @@ public class SonyPmcaAdapter implements CameraAdapter {
     private Method getISOSensitivityMethod;
     private Method setDriveModeMethod;
 
+    public interface StoreImageListener {
+        void onImageStored(String dir, String filename);
+    }
+    private volatile StoreImageListener storeImageListener;
+
+    public void setStoreImageListener(StoreImageListener listener) {
+        this.storeImageListener = listener;
+    }
+
     // Local cached hardware states for Zero-GC HUD updates
     private String cachedShutter = "1/125";
     private String cachedAperture = "F2.8";
@@ -196,6 +205,42 @@ public class SonyPmcaAdapter implements CameraAdapter {
             setApListener.invoke(cameraEx, apProxy);
 
             Log.i(TAG, "Hardware dial listeners registered successfully via Proxy");
+
+            // Hardware StoreImageCompleteListener (notifies when BIONZ X finishes writing full-res image to SD)
+            try {
+                Class<?> storeListenerCls = Class.forName("com.sony.scalar.hardware.CameraEx$StoreImageCompleteListener");
+                Object storeProxy = java.lang.reflect.Proxy.newProxyInstance(
+                    storeListenerCls.getClassLoader(),
+                    new Class<?>[]{storeListenerCls},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, Method method, Object[] args) {
+                            if ("onDone".equals(method.getName()) && args != null && args.length >= 2) {
+                                try {
+                                    Object info = args[1];
+                                    if (info != null) {
+                                        String dir = (String) info.getClass().getField("DirectoryName").get(info);
+                                        String fn = (String) info.getClass().getField("FileName").get(info);
+                                        Log.i(TAG, "Hardware StoreImageCompleteListener: " + dir + "/" + fn);
+                                        if (storeImageListener != null) {
+                                            storeImageListener.onImageStored(dir, fn);
+                                        }
+                                    }
+                                } catch (Throwable t) {
+                                    Log.w(TAG, "Failed reading StoreImageInfo", t);
+                                }
+                            }
+                            return null;
+                        }
+                    }
+                );
+                Method setStoreListener = cls.getMethod("setStoreImageCompleteListener", storeListenerCls);
+                setStoreListener.setAccessible(true);
+                setStoreListener.invoke(cameraEx, storeProxy);
+                Log.i(TAG, "StoreImageCompleteListener registered successfully");
+            } catch (Throwable t) {
+                Log.w(TAG, "StoreImageCompleteListener unsupported or failed to register", t);
+            }
         } catch (Throwable t) {
             Log.w(TAG, "Hardware listener registration unsupported on this body", t);
         }
