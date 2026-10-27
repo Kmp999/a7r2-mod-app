@@ -399,9 +399,38 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public void takePicture(Camera.PictureCallback jpegCallback) {
         if (!ensureOpen()) return;
         try {
-            normalCamera.takePicture(null, null, jpegCallback);
+            if (jpegCallback == null) {
+                normalCamera.takePicture(null, null, null);
+            } else {
+                normalCamera.takePicture(null, null, jpegCallback);
+            }
         } catch (Throwable t) {
             Log.e(TAG, "takePicture failed", t);
+        }
+    }
+
+    /**
+     * Triggers full-resolution hardware capture by passing (shutter, null, null).
+     * On Sony PMCA bodies (A7R II), passing null for raw and jpeg callbacks directs BIONZ X
+     * to save the original 42.4MP image directly to the SD card, while passing a non-null
+     * jpegCallback restricts capture to a 1.7MP proxy.
+     */
+    public void takeHardwarePicture(final Camera.ShutterCallback shutterCallback) {
+        if (!ensureOpen()) return;
+        try {
+            normalCamera.takePicture(shutterCallback, null, null);
+            Log.i(TAG, "Hardware takePicture(shutter, null, null) invoked");
+        } catch (Throwable t) {
+            Log.w(TAG, "takePicture(shutter, null, null) failed; attempting (null, null, null)", t);
+            try {
+                normalCamera.takePicture(null, null, null);
+                Log.i(TAG, "Hardware takePicture(null, null, null) invoked");
+                if (shutterCallback != null) {
+                    shutterCallback.onShutter();
+                }
+            } catch (Throwable t2) {
+                Log.e(TAG, "takePicture(null, null, null) failed", t2);
+            }
         }
     }
 

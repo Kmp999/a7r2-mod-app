@@ -136,6 +136,7 @@ public class CaptureController {
         lastCaptureTime = now;
 
         final long captureStartTime = System.currentTimeMillis();
+        final File preCaptureLatest = StorageResolver.getLatestSavedPhoto();
         lastHardwareStoredPhoto = null;
 
         // Register hardware image stored listener if using SonyPmcaAdapter
@@ -160,35 +161,51 @@ public class CaptureController {
         watchdogHandler.postDelayed(captureWatchdogRunnable, 2500);
 
         try {
-            cameraAdapter.takePicture(new Camera.PictureCallback() {
-                @Override
-                public void onPictureTaken(final byte[] jpegData, Camera camera) {
-                    watchdogHandler.removeCallbacks(captureWatchdogRunnable);
-                    try {
-                        // Cancel AF without cancelling BIONZ X SD write
-                        if (cameraAdapter instanceof SonyPmcaAdapter) {
-                            ((SonyPmcaAdapter) cameraAdapter).cancelAutoFocus();
-                        }
-
-                        // Instant EVF Viewfinder recovery (<40ms target)
+            if (cameraAdapter instanceof SonyPmcaAdapter) {
+                // SONY HARDWARE PATH: Invoke takeHardwarePicture(shutter, null, null).
+                // Passing null for picture callback tells BIONZ X to save the 42.4MP photo directly to SD!
+                ((SonyPmcaAdapter) cameraAdapter).takeHardwarePicture(new Camera.ShutterCallback() {
+                    @Override
+                    public void onShutter() {
+                        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+                        Log.i(TAG, "Hardware shutter fired; restoring EVF preview immediately");
                         setState(CameraState.RESTORING_PREVIEW);
                         restorePreviewWithWatchdog(3);
-
-                        // Watch for BIONZ X full-res photo on SD card, decode at 10.6MP, and grade
-                        processingExecutor.execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                watchAndProcessFullResPhoto(captureStartTime, jpegData);
-                            }
-                        });
-
-                    } finally {
-                        // Release capture hardware lock so user can compose next shot
                         isCapturing.set(false);
                     }
-                }
-            });
-            return true;
+                });
+
+                // Watch SD card for newly saved 42.4MP photo from BIONZ X
+                processingExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        watchAndProcessFullResPhoto(captureStartTime, preCaptureLatest, null);
+                    }
+                });
+                return true;
+            } else {
+                // GENERIC / MOCK ADAPTER PATH (for tests and non-Sony hosts)
+                cameraAdapter.takePicture(new Camera.PictureCallback() {
+                    @Override
+                    public void onPictureTaken(final byte[] jpegData, Camera camera) {
+                        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+                        try {
+                            setState(CameraState.RESTORING_PREVIEW);
+                            restorePreviewWithWatchdog(3);
+
+                            processingExecutor.execute(new Runnable() {
+                                @Override
+                                public void run() {
+                                    watchAndProcessFullResPhoto(captureStartTime, preCaptureLatest, jpegData);
+                                }
+                            });
+                        } finally {
+                            isCapturing.set(false);
+                        }
+                    }
+                });
+                return true;
+            }
         } catch (Throwable t) {
             watchdogHandler.removeCallbacks(captureWatchdogRunnable);
             Log.e(TAG, "takePicture failed, attempting preview restore", t);
@@ -242,7 +259,7 @@ public class CaptureController {
      * tự động phát hiện file mới, giải mã với độ phân giải cao nhất (10.6MP / sample=2, an toàn Dalvik Heap),
      * áp 17x17x17 3D LUT và lưu ảnh FUJIxxxx.JPG vào thẻ nhớ song song với DSC0xxxx.JPG gốc.
      */
-    private void watchAndProcessFullResPhoto(final long captureStartTime, final byte[] fallbackJpegData) {
+    private void watchAndProcessFullResPhoto(final long captureStartTime, final File preCaptureLatest, final byte[] fallbackJpegData) {
         final long start = System.currentTimeMillis();
         try {
             uiController.updateStatusAsync("Waiting for camera photo...");
@@ -250,7 +267,7 @@ public class CaptureController {
             // 1. Chờ BIONZ X lưu xong ảnh 42.4MP gốc ra thẻ nhớ (qua listener phần cứng hoặc quét thư mục DCIM)
             File rawFile = lastHardwareStoredPhoto;
             if (rawFile == null || !rawFile.exists()) {
-                rawFile = StorageResolver.waitForNewCameraPhoto(captureStartTime, 4000);
+                rawFile = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCaptureLatest, 5000);
             }
 
             if (rawFile != null && rawFile.exists()) {

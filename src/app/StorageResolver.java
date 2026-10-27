@@ -477,15 +477,19 @@ public final class StorageResolver {
 
     /**
      * Polls DCIM directories for a newly saved camera photo (modified on or after startTime).
-     * Waits up to timeoutMs, checking every 200ms.
+     * Waits up to timeoutMs, checking every 150-200ms.
      * Returns the newly saved File, or null if timed out.
      */
     public static File waitForNewCameraPhoto(long startTime, long timeoutMs) {
+        return waitForNewCameraPhoto(startTime, null, timeoutMs);
+    }
+
+    public static File waitForNewCameraPhoto(long startTime, File preCaptureLatest, long timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline) {
             List<File> candidates = getCandidateDcimDirs();
             File newest = null;
-            long newestTime = startTime - 2000; // Allow up to 2s clock skew
+            long newestTime = startTime - 3000; // Allow up to 3s clock skew
             for (File dir : candidates) {
                 if (dir.exists() && dir.isDirectory()) {
                     File[] files = dir.listFiles();
@@ -493,8 +497,11 @@ public final class StorageResolver {
                         for (File f : files) {
                             String name = f.getName().toUpperCase(Locale.US);
                             if (name.startsWith("DSC") && name.endsWith(".JPG")) {
+                                if (preCaptureLatest != null && f.getAbsolutePath().equals(preCaptureLatest.getAbsolutePath()) && f.length() == preCaptureLatest.length()) {
+                                    continue;
+                                }
                                 long mod = f.lastModified();
-                                if (mod >= newestTime && f.length() > 500 * 1024) {
+                                if (mod >= newestTime && f.length() > 200 * 1024) {
                                     newestTime = mod;
                                     newest = f;
                                 }
@@ -506,14 +513,14 @@ public final class StorageResolver {
             if (newest != null) {
                 // Ensure file write has settled
                 long initialSize = newest.length();
-                try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
                 long currentSize = newest.length();
-                if (currentSize == initialSize && currentSize > 500 * 1024) {
+                if (currentSize == initialSize && currentSize > 200 * 1024) {
                     return newest;
                 }
             }
             try {
-                Thread.sleep(200);
+                Thread.sleep(150);
             } catch (InterruptedException ignored) {
                 break;
             }
