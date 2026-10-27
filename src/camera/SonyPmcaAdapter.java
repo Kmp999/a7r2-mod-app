@@ -80,6 +80,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
                     activePath = "CameraEx";
                     initReflectionCache(cls);
                     setDriveModeSingle();
+                    configureFullResolutionCapture();
                     return true;
                 }
                 Log.e(TAG, "getNormalCamera() returned " + (nc == null ? "null" : nc.getClass().getName()));
@@ -96,6 +97,9 @@ public class SonyPmcaAdapter implements CameraAdapter {
         try {
             normalCamera = Camera.open();
             activePath = normalCamera != null ? "Camera" : "none";
+            if (normalCamera != null) {
+                configureFullResolutionCapture();
+            }
             return normalCamera != null;
         } catch (Throwable t) {
             Log.e(TAG, "Standard Camera.open() failed", t);
@@ -436,6 +440,65 @@ public class SonyPmcaAdapter implements CameraAdapter {
             }
         } catch (Throwable t) {
             Log.w(TAG, "setDriveModeSingle failed", t);
+        }
+    }
+
+    /**
+     * Configures the camera sensor and BIONZ X ISP for full-resolution (42.4MP) JPEG capture.
+     * Prevents Sony PMCA HAL from defaulting to proxy / VGA resolution (1616x1080).
+     */
+    public void configureFullResolutionCapture() {
+        if (normalCamera == null) return;
+
+        // 1. Standard Android Camera.Parameters: select maximum supported picture resolution
+        try {
+            Camera.Parameters params = normalCamera.getParameters();
+            List<Camera.Size> sizes = params.getSupportedPictureSizes();
+            if (sizes != null && !sizes.isEmpty()) {
+                Camera.Size max = sizes.get(0);
+                for (Camera.Size s : sizes) {
+                    long currentArea = (long) s.width * s.height;
+                    long maxArea = (long) max.width * max.height;
+                    if (currentArea > maxArea) {
+                        max = s;
+                    }
+                }
+                Log.i(TAG, "Configured Camera picture-size to maximum: " + max.width + "x" + max.height);
+                params.setPictureSize(max.width, max.height);
+                normalCamera.setParameters(params);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed setting maximum picture size on standard Camera parameters", t);
+        }
+
+        // 2. Sony CameraEx ParametersModifier: set image size to Large, aspect ratio 3:2, format JPEG
+        if (cameraEx != null) {
+            try {
+                Object mod = getModifier();
+                if (mod != null) {
+                    try {
+                        Method m = findAccessibleMethod(mod, "setImageSize", String.class);
+                        m.invoke(mod, "large");
+                        Log.i(TAG, "CameraEx modifier.setImageSize('large') applied");
+                    } catch (Throwable ignored) {}
+
+                    try {
+                        Method m = findAccessibleMethod(mod, "setImageAspectRatio", String.class);
+                        m.invoke(mod, "3:2");
+                        Log.i(TAG, "CameraEx modifier.setImageAspectRatio('3:2') applied");
+                    } catch (Throwable ignored) {}
+
+                    try {
+                        Method m = findAccessibleMethod(mod, "setPictureStorageFormat", String.class);
+                        m.invoke(mod, "jpeg");
+                        Log.i(TAG, "CameraEx modifier.setPictureStorageFormat('jpeg') applied");
+                    } catch (Throwable ignored) {}
+
+                    commitModifier(mod);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Failed configuring CameraEx parameters modifier for full resolution", t);
+            }
         }
     }
 

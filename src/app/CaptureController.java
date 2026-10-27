@@ -283,8 +283,27 @@ public class CaptureController {
     private void processQuickReviewProxy(final byte[] jpegData, final int seqNum) {
         final long start = System.currentTimeMillis();
         try {
+            // 1. Inspect raw JPEG dimensions without allocating pixel buffers
+            BitmapFactory.Options boundsOpts = new BitmapFactory.Options();
+            boundsOpts.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, boundsOpts);
+            final int rawW = boundsOpts.outWidth;
+            final int rawH = boundsOpts.outHeight;
+            Log.i(TAG, "Captured JPEG raw dimensions: " + rawW + "x" + rawH);
+
+            // 2. Select sample size dynamically based on input resolution:
+            // - If full sensor resolution 42.4MP (7952x5304) or > 3500px:
+            //   Target sample=2 (~10.6MP / 3976x2652), with fallback sample=4 (~2.6MP).
+            // - If already <= 3500px (e.g. 1616x1080 or smaller):
+            //   Target sample=1 (preserve 100% resolution, NEVER downscale!), fallback sample=2, 4.
+            int[] candidateSampleSizes;
+            if (rawW > 3500) {
+                candidateSampleSizes = new int[]{ 2, 4 };
+            } else {
+                candidateSampleSizes = new int[]{ 1, 2, 4 };
+            }
+
             Bitmap bitmap = null;
-            int[] candidateSampleSizes = new int[]{ 2, 4 };
             for (int sample : candidateSampleSizes) {
                 try {
                     BitmapFactory.Options opts = new BitmapFactory.Options();
