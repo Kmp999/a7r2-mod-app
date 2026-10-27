@@ -34,5 +34,24 @@ class TestDualPath42MP(unittest.TestCase):
         content = self.capture_file.read_text(encoding="utf-8")
         self.assertIn("restorePreviewWithWatchdog", content)
 
+    def test_storage_resolver_saves_graded_jpeg_with_fuji_prefix(self):
+        """Verify StorageResolver has saveGradedJpegToSd and sequence allocation."""
+        content = self.storage_file.read_text(encoding="utf-8")
+        self.assertIn("saveGradedJpegToSd", content)
+        self.assertIn("allocateNextSequenceNumber", content)
+        self.assertIn('"FUJI"', content)
+
+    def test_capture_controller_saves_graded_photo_to_sd(self):
+        """Verify CaptureController dispatches saving the graded photo to SD card."""
+        content = self.capture_file.read_text(encoding="utf-8")
+        self.assertIn("StorageResolver.saveGradedJpegToSd", content)
+        self.assertIn("candidateSampleSizes = new int[]{ 2, 4 }", content)
+
+    def test_manifest_enables_large_heap(self):
+        """Verify AndroidManifest.xml specifies android:largeHeap='true' for 10.6MP processing."""
+        manifest_file = self.root / "AndroidManifest.xml"
+        manifest_content = manifest_file.read_text(encoding="utf-8")
+        self.assertIn('android:largeHeap="true"', manifest_content)
+
 if __name__ == '__main__':
     unittest.main()

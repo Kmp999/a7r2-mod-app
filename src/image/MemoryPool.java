@@ -10,7 +10,8 @@ import java.nio.ByteBuffer;
 public final class MemoryPool {
     private static final String TAG = "MemoryPool";
 
-    public static final int BUFFER_CAPACITY = 6 * 1024 * 1024; // 6 MB (fits 2.6MP RGB_565 = ~5.3MB)
+    public static final int BUFFER_CAPACITY = 22 * 1024 * 1024; // 22 MB (fits 10.6MP RGB_565 = ~21.1MB)
+    public static final int BUFFER_CAPACITY_FALLBACK = 6 * 1024 * 1024; // 6 MB fallback (fits 2.6MP)
 
     private static ByteBuffer sBuffer = null;
     private static volatile boolean sInUse = false;
@@ -24,10 +25,16 @@ public final class MemoryPool {
         if (sBuffer == null) {
             try {
                 sBuffer = ByteBuffer.allocateDirect(BUFFER_CAPACITY);
-                Log.i(TAG, "Lazy direct grading buffer allocated (6 MB)");
+                Log.i(TAG, "Lazy direct grading buffer allocated (22 MB for 10.6MP)");
             } catch (Throwable t) {
-                Log.e(TAG, "Failed to allocate direct buffer", t);
-                return null;
+                Log.w(TAG, "Failed to allocate 22MB direct buffer; attempting 6MB fallback", t);
+                try {
+                    sBuffer = ByteBuffer.allocateDirect(BUFFER_CAPACITY_FALLBACK);
+                    Log.i(TAG, "Lazy direct grading buffer allocated (6 MB fallback)");
+                } catch (Throwable t2) {
+                    Log.e(TAG, "Failed to allocate fallback direct buffer", t2);
+                    return null;
+                }
             }
         }
         sInUse = true;

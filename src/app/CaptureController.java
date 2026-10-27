@@ -162,6 +162,9 @@ public class CaptureController {
                             return;
                         }
 
+                        // Pre-allocate matching sequence number for both raw and graded images
+                        final int seqNum = StorageResolver.allocateNextSequenceNumber();
+
                         // =====================================================================
                         // LUỒNG 1 (ASYNC I/O): LƯU TRỌN VẸN ẢNH GỐC 42.4 MP VÀO THẺ NHỚ SD (< 30ms)
                         // Không giải mã/nén lại: Bảo toàn 100% độ phân giải 7952x5304 & chất lượng BIONZ X
@@ -169,18 +172,19 @@ public class CaptureController {
                         ioExecutor.execute(new Runnable() {
                             @Override
                             public void run() {
-                                saveFullResJpegDirectly(jpegData);
+                                saveFullResJpegDirectly(jpegData, seqNum);
                             }
                         });
 
                         // =====================================================================
-                        // LUỒNG 2 (FAST PROXY): HIỂN THỊ XEM LẠI NHANH (< 50ms) TRÊN LCD/EVF
-                        // Giải mã sample=4 (~2.6MP, < 5MB RAM, an toàn tuyệt đối Dalvik Heap)
+                        // LUỒNG 2: GIẢI MÃ ĐỘ PHÂN GIẢI CAO NHẤT, ÁP BỘ LỌC MÀU & LƯU VÀO THẺ SD
+                        // Tự động chọn độ phân giải cao nhất (sample=2 ~10.6MP, fallback sample=4 ~2.6MP)
+                        // Áp 3D LUT -> Hiển thị LCD -> Ghi FUJIxxxx.JPG vào thẻ nhớ song song với ảnh gốc
                         // =====================================================================
                         processingExecutor.execute(new Runnable() {
                             @Override
                             public void run() {
-                                processQuickReviewProxy(jpegData);
+                                processQuickReviewProxy(jpegData, seqNum);
                             }
                         });
 
@@ -244,8 +248,12 @@ public class CaptureController {
      * Hoàn toàn không qua decode/re-encode -> Giữ nguyên 100% 7952x5304 pixels và EXIF BIONZ X.
      */
     private void saveFullResJpegDirectly(byte[] rawJpeg) {
+        saveFullResJpegDirectly(rawJpeg, -1);
+    }
+
+    private void saveFullResJpegDirectly(byte[] rawJpeg, int seqNum) {
         try {
-            String savedPath = StorageResolver.saveRawJpegToSd(context, rawJpeg);
+            String savedPath = StorageResolver.saveRawJpegToSd(context, rawJpeg, seqNum);
             if (savedPath != null) {
                 uiController.updateStatusAsync("SAVED 42.4MP: " + savedPath);
                 Log.i(TAG, "Successfully saved Full-Res 42.4MP image (" + (rawJpeg.length / 1024) + "KB) to: " + savedPath);
@@ -263,17 +271,45 @@ public class CaptureController {
     }
 
     /**
-     * LUỒNG 2: Giải mã proxy thu nhỏ (sample = 4, ~2.6MP, < 5MB RAM)
-     * Áp 17x17x17 3D LUT và gửi lên hiển thị Quick Review trên LCD/EVF trong < 50ms.
+     * LUỒNG 2: Giải mã độ phân giải cao nhất khả thi (sample=2 ~10.6MP / 4K, an toàn tuyệt đối Dalvik Heap,
+     * fallback sample=4 ~2.6MP nếu bộ nhớ máy quá thấp), áp 17x17x17 3D LUT của Film Simulation,
+     * gửi hiển thị Quick Review trên LCD/EVF trong < 100ms, VÀ LƯU ẢNH ĐÃ ÁP FILTER (FUJIxxxx.JPG) VÀO THẺ NHỚ SD.
      */
     private void processQuickReviewProxy(byte[] jpegData) {
+        processQuickReviewProxy(jpegData, -1);
+    }
+
+    private void processQuickReviewProxy(final byte[] jpegData, final int seqNum) {
         final long start = System.currentTimeMillis();
         try {
-            BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inPreferredConfig = Bitmap.Config.RGB_565;
-            opts.inSampleSize = 4; // ~2.6 MP, an toàn tuyệt đối với Dalvik Heap (< 5MB)
-            final Bitmap bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, opts);
+            Bitmap bitmap = null;
+            int[] candidateSampleSizes = new int[]{ 2, 4 };
+            for (int sample : candidateSampleSizes) {
+                try {
+                    BitmapFactory.Options opts = new BitmapFactory.Options();
+                    opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                    opts.inSampleSize = sample;
+                    opts.inPurgeable = true;
+                    bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, opts);
+                    if (bitmap != null) {
+                        Log.i(TAG, "Decoded capture image with inSampleSize=" + sample + " (" + bitmap.getWidth() + "x" + bitmap.getHeight() + ")");
+                        break;
+                    }
+                } catch (OutOfMemoryError oom) {
+                    Log.w(TAG, "OutOfMemoryError with inSampleSize=" + sample + ", falling back to lower resolution");
+                    System.gc();
+                }
+            }
+
             if (bitmap == null) {
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                opts.inSampleSize = 4;
+                bitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length, opts);
+            }
+
+            if (bitmap == null) {
+                Log.e(TAG, "Failed to decode capture image at all sample sizes");
                 return;
             }
 
@@ -307,29 +343,35 @@ public class CaptureController {
             ByteBuffer directBuf = MemoryPool.acquireFreeSlot();
             boolean isTempBuf = false;
             if (directBuf == null || directBuf.capacity() < requiredBytes) {
-                directBuf = ByteBuffer.allocateDirect(requiredBytes);
-                isTempBuf = true;
+                try {
+                    directBuf = ByteBuffer.allocateDirect(requiredBytes);
+                    isTempBuf = true;
+                } catch (Throwable t) {
+                    Log.e(TAG, "Failed to allocate direct buffer for grading " + w + "x" + h, t);
+                }
             }
-
-            directBuf.clear();
-            bitmap.copyPixelsToBuffer(directBuf);
-            directBuf.rewind();
 
             boolean graded = false;
-            if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
-                graded = ColorEngine.applyLut17DirectRGB565Safe(directBuf, w, h);
-            }
-
-            if (graded) {
+            if (directBuf != null) {
+                directBuf.clear();
+                bitmap.copyPixelsToBuffer(directBuf);
                 directBuf.rewind();
-                bitmap.copyPixelsFromBuffer(directBuf);
-                Log.i(TAG, "Color grading applied successfully to " + w + "x" + h + " proxy bitmap");
-            } else {
-                Log.w(TAG, "Native LUT grading was skipped or failed");
-            }
 
-            if (!isTempBuf && directBuf != null) {
-                MemoryPool.releaseSlot(directBuf);
+                if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
+                    graded = ColorEngine.applyLut17DirectRGB565Safe(directBuf, w, h);
+                }
+
+                if (graded) {
+                    directBuf.rewind();
+                    bitmap.copyPixelsFromBuffer(directBuf);
+                    Log.i(TAG, "Color grading applied successfully to " + w + "x" + h + " bitmap");
+                } else {
+                    Log.w(TAG, "Native LUT grading was skipped or failed");
+                }
+
+                if (!isTempBuf) {
+                    MemoryPool.releaseSlot(directBuf);
+                }
             }
 
             final long gradeDuration = System.currentTimeMillis() - start;
@@ -337,6 +379,37 @@ public class CaptureController {
 
             final String presetName = appState.getCurrentPresetName();
             deliverResult(bitmap, presetName, w, h, gradeDuration);
+
+            // =====================================================================
+            // LƯU ẢNH ĐÃ ÁP FILTER MÀU RA THẺ NHỚ SD (FUJIxxxx.JPG)
+            // Chạy async trên ioExecutor để không chặn UI thread
+            // =====================================================================
+            final Bitmap gradedBitmapToSave = bitmap;
+            final float mp = (float)(w * h) / 1000000.0f;
+            ioExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        String gradedSavedPath = StorageResolver.saveGradedJpegToSd(
+                            context,
+                            gradedBitmapToSave,
+                            seqNum,
+                            presetName
+                        );
+                        if (gradedSavedPath != null) {
+                            String msg = String.format(Locale.US, "SAVED: 42.4MP RAW + %.1fMP %s", mp, presetName);
+                            uiController.updateStatusAsync(msg);
+                            Log.i(TAG, "Successfully saved graded photo: " + gradedSavedPath);
+                        } else {
+                            String err = "SAVE GRADED FAILED: " + StorageResolver.getLastDiagnostic();
+                            appState.setLastErrorMessage(err);
+                            Log.e(TAG, err);
+                        }
+                    } catch (Throwable t) {
+                        Log.e(TAG, "Error saving graded JPEG", t);
+                    }
+                }
+            });
 
         } catch (Throwable t) {
             Log.e(TAG, "Error processing quick review proxy", t);
@@ -350,7 +423,8 @@ public class CaptureController {
     }
 
     private void deliverResult(Bitmap bitmap, String preset, int w, int h, long ms, String savedPath) {
-        String baseInfo = preset + "  42.4MP (SOOC)  " + ms + " ms";
+        float mp = (float)(w * h) / 1000000.0f;
+        String baseInfo = String.format(Locale.US, "%s  %.1fMP (GRADED)  %d ms", preset, mp, ms);
         if (savedPath != null) {
             baseInfo += "\nSAVED: " + savedPath;
         }
