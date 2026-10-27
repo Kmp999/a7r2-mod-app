@@ -286,9 +286,15 @@ public class CaptureController {
             // - If raw resolution is 42.4MP (rawW > 3500px): use sample=2 (10.6MP).
             // - If raw resolution is already <= 3500px (1616x1080): use sample=1 (100% full proxy!).
             int[] candidateSampleSizes = new int[]{ 2, 4 };
+            int targetSample = (rawW > 3500) ? 2 : 1;
             if (rawW <= 3500) {
                 candidateSampleSizes = new int[]{ 1, 2, 4 };
             }
+
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inPreferredConfig = Bitmap.Config.RGB_565;
+            opts.inSampleSize = targetSample;
+            opts.inPurgeable = true;
 
             Bitmap bitmap = null;
             try {
