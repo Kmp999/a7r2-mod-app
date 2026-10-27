@@ -283,11 +283,11 @@ public class CaptureController {
             Log.i(TAG, "Captured JPEG raw dimensions: " + rawW + "x" + rawH);
 
             // 2. Select sample size dynamically based on input resolution:
-            // - If raw resolution is 42.4MP (rawW > 3500px): use sample=2 (10.6MP).
-            // - If raw resolution is already <= 3500px (1616x1080): use sample=1 (100% full proxy!).
+            // - If raw resolution is 42.4MP (rawW > 5000px): use sample=2 (giving 10.6MP).
+            // - If raw resolution is 10.6MP (3984px) or smaller: use sample=1 (100% full quality, NEVER downscale!).
             int[] candidateSampleSizes = new int[]{ 2, 4 };
-            int targetSample = (rawW > 3500) ? 2 : 1;
-            if (rawW <= 3500) {
+            int targetSample = (rawW > 5000) ? 2 : 1;
+            if (rawW <= 5000) {
                 candidateSampleSizes = new int[]{ 1, 2, 4 };
             }
 
