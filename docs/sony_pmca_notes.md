@@ -38,3 +38,9 @@ The camera has two primary computing environments:
 - The Dalvik heap limit is ~64 MB. Allocating a single 42 MP uncompressed bitmap crashes Dalvik with an unrecoverable `OutOfMemoryError`.
 - Even in native C/JNI, copying 161 MB over memory buses on a mobile SoC of that era requires > 300 ms purely for memory transfers, leaving virtually no time for color computation.
 - Therefore, real-time / sub-500ms processing **must** operate on downscaled proxies (e.g. 1280x720 or 1920x1080) or direct YUV stream buffers.
+
+## 5. Phương án 2: 10.6 MP (4K UHD) Capture Mode
+- **Sensor Downscaling via Silicon:** By configuring `CameraEx.ParametersModifier.setImageSize("small")` and setting `Camera.Parameters.setPictureSize(3984, 2656)`, the hardware BIONZ X ASIC performs hardware-accelerated downscaling in silicon (<5ms), outputting a ~10.6 MP JPEG.
+- **Resolution of the 1616x1080 Proxy Mystery:** When standard Android `Camera.takePicture(null, null, callback)` is invoked without synchronizing camera parameters with BIONZ X hardware, the PMCA HAL defaults to returning a 1616x1080 proxy. Synchronizing the modifier ensures the full 10.6MP frame is delivered directly.
+- **Memory Footprint:** In `RGB_565`, 10.6MP requires `3984 * 2656 * 2 = ~20.1 MB`, which safely fits within the Dalvik `largeHeap` (64MB-128MB) limit alongside the 22MB native Direct ByteBuffer pool in `MemoryPool.java`.
+- **Latency Guarantee:** Live View / EVF preview is immediately restored (<30ms) via `restorePreviewWithWatchdog(3)` upon shutter completion while grading runs asynchronously in the background.

@@ -53,5 +53,18 @@ class TestDualPath42MP(unittest.TestCase):
         manifest_content = manifest_file.read_text(encoding="utf-8")
         self.assertIn('android:largeHeap="true"', manifest_content)
 
+    def test_10_6mp_dynamic_sampling(self):
+        """Verify CaptureController selects sample=1 for 10.6MP input to preserve full 4K detail."""
+        content = self.capture_file.read_text(encoding="utf-8")
+        self.assertIn("targetSample = (rawW > 5000) ? 2 : 1", content)
+        self.assertIn("rawW <= 5000", content)
+
+    def test_sony_adapter_configures_small_image_size(self):
+        """Verify SonyPmcaAdapter configures BIONZ X ImageSize to small (~10.6MP)."""
+        adapter_file = self.root / "src" / "camera" / "SonyPmcaAdapter.java"
+        adapter_content = adapter_file.read_text(encoding="utf-8")
+        self.assertIn('"small"', adapter_content)
+        self.assertIn("s.width >= 3500", adapter_content)
+
 if __name__ == '__main__':
     unittest.main()
