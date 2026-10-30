@@ -190,6 +190,14 @@ public class FujiQMenuView extends View {
         postInvalidate();
     }
 
+    public void showQuickReview(Bitmap bmp) {
+        setQuickReviewBitmap(bmp, "QUICK REVIEW\nPRESS PLAY / SHUTTER TO EXIT");
+    }
+
+    public void showQuickReview(Bitmap bmp, String info) {
+        setQuickReviewBitmap(bmp, info);
+    }
+
     public void clearQuickReview() {
         this.reviewBitmap = null;
         this.reviewInfo = null;

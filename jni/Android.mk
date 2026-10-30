@@ -23,6 +23,7 @@ LOCAL_SRC_FILES := \
     ../src/color/presets/eterna_like.c \
     ../src/image/image_buffer.c \
     ../src/image/downscaler.c \
+    ../src/image/native_jpeg_writer.c \
     ../src/perf/timestamp.c \
     ../src/perf/profiler.c \
     ../src/util/memory_pool.c

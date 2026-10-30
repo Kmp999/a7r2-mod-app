@@ -461,6 +461,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public void resumePreview() {
         if (normalCamera == null) return;
         try {
+            cancelTakePicture();
             normalCamera.startPreview();
         } catch (Throwable t) {
             Log.e(TAG, "resumePreview failed", t);

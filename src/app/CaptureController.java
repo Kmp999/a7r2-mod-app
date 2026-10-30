@@ -308,39 +308,80 @@ public class CaptureController {
             // 3. Apply Stage 2A & 2B Native C Color Engine (lut_cube_17.h) in native memory (~80ms)
             int grainStrength = recipe.grainEffect.ordinal();
             int clarityStrength = recipe.clarity;
-            ColorEngine.applyLutAndGrainBitmapSafe(srcBmp, grainStrength, clarityStrength);
-            final long t3_graded = System.currentTimeMillis();
 
-            // 4. Ultra-Fast Sub-400ms Pipeline:
-            // Operates directly on the 1616x1080 sensor frame, avoiding 21MB Dalvik OOM and 3-second GC pauses
             final int targetW = 3984;
             final int targetH = 2656;
-            Bitmap dst10MpBmp = null;
-            // dst10MpBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.RGB_565);
-            dst10MpBmp = srcBmp;
+            final String presetName = appState.getCurrentPresetName();
+            final File targetOutputFile = StorageResolver.getGradedOutputFile(seqNum);
+            final String targetPath = targetOutputFile.getAbsolutePath();
 
-            // 5. Save Graded FUJIxxxx.JPG to SD card (Quality = 94, DCF 8.3)
-            final int outW = dst10MpBmp.getWidth();
-            final int outH = dst10MpBmp.getHeight();
+            String gradedSavedPath = null;
+            int outW = targetW;
+            int outH = targetH;
+            boolean nativeSuccess = false;
+
+            // 4. Ultra-Fast Zero-GC Native Pipeline:
+            // Grades 1616x1080 sensor frame, upscales to 10.6MP (3984x2656) in native 22MB buffer,
+            // and encodes directly to JPEG on SD card as fuji_%04d.jpg in < 650ms total.
+            java.nio.ByteBuffer srcDirect = MemoryPool.acquireProxySlot();
+            java.nio.ByteBuffer dstDirect = MemoryPool.acquireFreeSlot();
+
+            if (srcDirect != null && dstDirect != null && ColorEngine.isNativeAvailable()) {
+                try {
+                    srcDirect.clear();
+                    srcBmp.copyPixelsToBuffer(srcDirect);
+                    srcDirect.rewind();
+
+                    nativeSuccess = ColorEngine.gradeUpscaleAndSave10MpNativeSafe(
+                        srcDirect, srcW, srcH,
+                        dstDirect, targetW, targetH,
+                        grainStrength, clarityStrength,
+                        targetPath
+                    );
+
+                    if (nativeSuccess) {
+                        srcDirect.rewind();
+                        srcBmp.copyPixelsFromBuffer(srcDirect); // Graded preview for instant LCD display
+                        gradedSavedPath = targetPath;
+                        StorageResolver.postProcessGradedFile(context, targetPath, seqNum, presetName);
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "Native 10.6MP capture pipeline error, falling back", t);
+                } finally {
+                    MemoryPool.releaseSlot(srcDirect);
+                    MemoryPool.releaseSlot(dstDirect);
+                }
+            }
+
+            // Fallback path if native C pipeline is unavailable
+            if (!nativeSuccess) {
+                ColorEngine.applyLutAndGrainBitmapSafe(srcBmp, grainStrength, clarityStrength);
+                Bitmap dst10MpBmp = null;
+                try {
+                    dst10MpBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.RGB_565);
+                } catch (Throwable oom) {
+                    dst10MpBmp = srcBmp;
+                }
+                outW = dst10MpBmp.getWidth();
+                outH = dst10MpBmp.getHeight();
+                gradedSavedPath = StorageResolver.saveGradedJpegToSd(context, dst10MpBmp, seqNum, presetName);
+                if (dst10MpBmp != null && dst10MpBmp != srcBmp && !dst10MpBmp.isRecycled()) {
+                    dst10MpBmp.recycle();
+                }
+            }
+
+            final long t4_saved = System.currentTimeMillis();
+            final long totalMs = t4_saved - captureStartTime;
             final float mp = (float)(outW * outH) / 1000000.0f;
 
-            final String presetName = appState.getCurrentPresetName();
-            final String gradedSavedPath = StorageResolver.saveGradedJpegToSd(context, dst10MpBmp, seqNum, presetName);
-            final long t4_saved = System.currentTimeMillis();
-
-            final long hwTimeMs = t2_decoded - captureStartTime;
-            final long gradeTimeMs = t3_graded - t2_decoded;
-            final long saveTimeMs = t4_saved - t3_graded;
-            final long totalMs = t4_saved - captureStartTime;
-
-            // 6. Precise Telemetry Toast & Log
-            final String telemetry = String.format(Locale.US, "SAVED %.1fMP: Total %dms (HW:%dms Grd:%dms SD:%dms)",
-                mp, totalMs, hwTimeMs, gradeTimeMs, saveTimeMs);
+            final String savedFileName = (gradedSavedPath != null) ? new File(gradedSavedPath).getName() : String.format(Locale.US, "fuji_%04d.jpg", seqNum);
+            final String telemetry = String.format(Locale.US, "SAVED %s (%dx%d | %.1fMP) in %dms",
+                savedFileName, outW, outH, mp, totalMs);
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
             // Deliver to UI Review
-            deliverResult(dst10MpBmp, presetName, outW, outH, totalMs, gradedSavedPath);
+            deliverResult(srcBmp, presetName, outW, outH, totalMs, gradedSavedPath);
 
         } catch (Throwable t) {
             Log.e(TAG, "Error in processAndUpscaleCapture", t);

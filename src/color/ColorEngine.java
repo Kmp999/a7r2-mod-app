@@ -249,4 +249,26 @@ public class ColorEngine {
 
     public static native boolean nativeUpscaleEdgeDirected(java.nio.ByteBuffer srcDirect, int srcW, int srcH,
                                                            java.nio.ByteBuffer dstDirect, int dstW, int dstH);
+
+    /**
+     * Combined Pipeline in Native C (Zero Dalvik Heap):
+     * Grades 1.7MP sensor buffer, upscales to 10.6MP (3984x2656), and writes baseline JPEG directly to disk.
+     */
+    public static boolean gradeUpscaleAndSave10MpNativeSafe(
+        java.nio.ByteBuffer srcDirect, int srcW, int srcH,
+        java.nio.ByteBuffer dstDirect, int dstW, int dstH,
+        int grainStrength, int clarityStrength, String outputPath) {
+        if (!sNativeAvailable || srcDirect == null || dstDirect == null || outputPath == null) return false;
+        try {
+            return gradeUpscaleAndSave10MpNative(srcDirect, srcW, srcH, dstDirect, dstW, dstH, grainStrength, clarityStrength, outputPath);
+        } catch (Throwable t) {
+            Log.e(TAG, "gradeUpscaleAndSave10MpNative failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean gradeUpscaleAndSave10MpNative(
+        java.nio.ByteBuffer srcDirect, int srcW, int srcH,
+        java.nio.ByteBuffer dstDirect, int dstW, int dstH,
+        int grainStrength, int clarityStrength, String outputPath);
 }

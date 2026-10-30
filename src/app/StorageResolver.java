@@ -152,12 +152,21 @@ public final class StorageResolver {
                 if (files != null) {
                     for (File f : files) {
                         String name = f.getName().toUpperCase(Locale.US);
-                        if (name.endsWith(".JPG") && name.length() == 12) {
-                            try {
-                                String numStr = name.substring(4, 8);
-                                int val = Integer.parseInt(numStr);
-                                if (val > maxSeq) maxSeq = val;
-                            } catch (Throwable ignored) {}
+                        if (name.endsWith(".JPG") || name.endsWith(".JPEG")) {
+                            if (name.startsWith("FUJI_") && name.length() >= 9) {
+                                try {
+                                    int dot = name.indexOf('.');
+                                    String numStr = name.substring(5, dot > 5 ? dot : 9);
+                                    int val = Integer.parseInt(numStr);
+                                    if (val > maxSeq) maxSeq = val;
+                                } catch (Throwable ignored) {}
+                            } else if (name.length() == 12) {
+                                try {
+                                    String numStr = name.substring(4, 8);
+                                    int val = Integer.parseInt(numStr);
+                                    if (val > maxSeq) maxSeq = val;
+                                } catch (Throwable ignored) {}
+                            }
                         }
                     }
                 }
@@ -171,11 +180,18 @@ public final class StorageResolver {
     }
 
     /**
-     * Extracts the 4-digit sequence number from a DCF filename (e.g. DSC00123.JPG -> 123).
+     * Extracts the 4-digit sequence number from a DCF filename (e.g. DSC00123.JPG -> 123, fuji_0123.jpg -> 123).
      */
     public static int parseSequenceNumber(String filename) {
         if (filename == null) return -1;
         String name = new File(filename).getName().toUpperCase(Locale.US);
+        if (name.startsWith("FUJI_") && (name.endsWith(".JPG") || name.endsWith(".JPEG"))) {
+            try {
+                int dot = name.indexOf('.');
+                String numStr = name.substring(5, dot > 5 ? dot : 9);
+                return Integer.parseInt(numStr);
+            } catch (Throwable ignored) {}
+        }
         if (name.endsWith(".JPG") && name.length() == 12) {
             try {
                 return Integer.parseInt(name.substring(4, 8));
@@ -352,13 +368,31 @@ public final class StorageResolver {
         return null;
     }
 
+    public static final String PREFIX_FUJI = "FUJI"; // Supported for DCF compatibility
+
+    /**
+     * Resolves the target file path on SD card using the mandatory fuji_%04d.jpg naming format (Requirement 2).
+     */
+    public static File getGradedOutputFile(int sequenceNum) {
+        List<File> candidates = getCandidateDcimDirs();
+        for (File dir : candidates) {
+            try {
+                if (!dir.exists()) dir.mkdirs();
+                if (dir.exists() && dir.isDirectory()) {
+                    String filename = String.format(Locale.US, "fuji_%04d.jpg", sequenceNum);
+                    return new File(dir, filename);
+                }
+            } catch (Throwable ignored) {}
+        }
+        return new File("/mnt/sdcard/DCIM/100MSDCF", String.format(Locale.US, "fuji_%04d.jpg", sequenceNum));
+    }
+
     /**
      * Saves a color-graded JPEG bitmap directly to the first writable SD card directory.
-     * Generates a DCF 8.3 compliant filename with prefix "FUJI" (e.g. FUJI0001.JPG)
-     * matching the sequence number of DSC00001.JPG.
+     * Generates a filename starting with "fuji_" (e.g. fuji_0001.jpg).
      */
     public static String saveGradedJpegToSd(Context context, Bitmap bitmap, int sequenceNum, String recipeName) {
-        return saveJpegInternal(context, bitmap, "FUJI", sequenceNum, recipeName);
+        return saveJpegInternal(context, bitmap, "fuji_", sequenceNum, recipeName);
     }
 
     /**
@@ -366,7 +400,7 @@ public final class StorageResolver {
      * Returns the absolute path of the saved file, or null if all attempts fail.
      */
     public static String saveJpegToSd(Context context, Bitmap bitmap) {
-        return saveJpegInternal(context, bitmap, "FUJI", -1, null);
+        return saveJpegInternal(context, bitmap, "fuji_", -1, null);
     }
 
     private static String saveJpegInternal(Context context, Bitmap bitmap, String prefix, int sequenceNum, String recipeName) {
@@ -391,9 +425,16 @@ public final class StorageResolver {
                     continue;
                 }
 
-                String filename = (sequenceNum > 0)
-                    ? String.format(Locale.US, "%s%04d.JPG", prefix, sequenceNum)
-                    : generateDcfFilename(dir, prefix);
+                String filename;
+                if (sequenceNum > 0) {
+                    if ("fuji_".equalsIgnoreCase(prefix) || "FUJI".equalsIgnoreCase(prefix)) {
+                        filename = String.format(Locale.US, "fuji_%04d.jpg", sequenceNum);
+                    } else {
+                        filename = String.format(Locale.US, "%s%04d.JPG", prefix, sequenceNum);
+                    }
+                } else {
+                    filename = generateDcfFilename(dir, prefix);
+                }
                 File file = new File(dir, filename);
                 java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(file), 65536);
                 boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
@@ -402,6 +443,10 @@ public final class StorageResolver {
 
                 if (compressed && file.exists() && file.length() > 0) {
                     String savedPath = file.getAbsolutePath();
+                    writeExifMetadata(savedPath, recipeName);
+                    if (sequenceNum > 0) {
+                        cleanupUnfilteredRawFiles(sequenceNum);
+                    }
                     sLastDiagnostic = "OK (" + prefix + "): " + savedPath + " (" + (file.length() / 1024) + "KB)";
                     Log.i(TAG, "Successfully saved graded photo: " + sLastDiagnostic);
 
@@ -419,6 +464,35 @@ public final class StorageResolver {
         sLastDiagnostic = "FAIL: All " + candidates.size() + " mount attempts failed";
         Log.e(TAG, sLastDiagnostic);
         return null;
+    }
+
+    /**
+     * Cleans up any duplicate/unfiltered raw files (e.g. DSC0xxxx.JPG) left by BIONZ X or hardware callbacks,
+     * ensuring that ONLY the single graded fuji_xxxx.jpg file remains on the SD card (Requirement 1).
+     */
+    public static void cleanupUnfilteredRawFiles(int sequenceNum) {
+        if (sequenceNum <= 0) return;
+        List<File> candidates = getCandidateDcimDirs();
+        for (File dir : candidates) {
+            if (!dir.exists() || !dir.isDirectory()) continue;
+            File rawDsc = new File(dir, String.format(Locale.US, "DSC0%04d.JPG", sequenceNum));
+            if (rawDsc.exists()) {
+                boolean deleted = rawDsc.delete();
+                Log.i(TAG, "Removed unfiltered raw duplicate: " + rawDsc.getAbsolutePath() + " (success=" + deleted + ")");
+            }
+        }
+    }
+
+    /**
+     * Registers a freshly saved native graded JPEG, writes EXIF metadata, and eliminates any unfiltered duplicate.
+     */
+    public static void postProcessGradedFile(Context context, String filePath, int sequenceNum, String recipeName) {
+        if (filePath == null) return;
+        writeExifMetadata(filePath, recipeName);
+        if (sequenceNum > 0) {
+            cleanupUnfilteredRawFiles(sequenceNum);
+        }
+        registerWithAvindex(context, filePath);
     }
 
     /**
