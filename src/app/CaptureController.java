@@ -320,51 +320,66 @@ public class CaptureController {
             // 4. Upscale to True 10.6 MP (3984 x 2656 = ~4K 3:2) via Native Edge-Directed Super-Resolution
             final int targetW = 3984;
             final int targetH = 2656;
-            Bitmap dst10MpBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.RGB_565);
+            Bitmap dst10MpBmp = null;
 
-            ByteBuffer dstDirect = MemoryPool.acquireFreeSlot();
-            boolean upscaled = false;
-            if (dstDirect != null && dstDirect.capacity() >= targetW * targetH * 2) {
-                try {
-                    ByteBuffer srcDirect = ByteBuffer.allocateDirect(srcW * srcH * 2);
-                    srcBmp.copyPixelsToBuffer(srcDirect);
-                    srcDirect.rewind();
-                    dstDirect.clear();
+            try {
+                System.gc();
+                dst10MpBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.RGB_565);
+            } catch (Throwable t) {
+                Log.w(TAG, "Heap cannot allocate 21MB bitmap; saving at native resolution", t);
+                dst10MpBmp = null;
+            }
 
-                    upscaled = ColorEngine.upscaleEdgeDirectedSafe(srcDirect, srcW, srcH, dstDirect, targetW, targetH);
-                    if (upscaled) {
-                        dstDirect.rewind();
-                        dst10MpBmp.copyPixelsFromBuffer(dstDirect);
+            if (dst10MpBmp != null) {
+                ByteBuffer dstDirect = MemoryPool.acquireFreeSlot();
+                boolean upscaled = false;
+                if (dstDirect != null && dstDirect.capacity() >= targetW * targetH * 2) {
+                    try {
+                        ByteBuffer srcDirect = ByteBuffer.allocateDirect(srcW * srcH * 2);
+                        srcBmp.copyPixelsToBuffer(srcDirect);
+                        srcDirect.rewind();
+                        dstDirect.clear();
+
+                        upscaled = ColorEngine.upscaleEdgeDirectedSafe(srcDirect, srcW, srcH, dstDirect, targetW, targetH);
+                        if (upscaled) {
+                            dstDirect.rewind();
+                            dst10MpBmp.copyPixelsFromBuffer(dstDirect);
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "Native upscaler failed; falling back to Canvas", t);
+                    } finally {
+                        MemoryPool.releaseSlot(dstDirect);
                     }
-                } catch (Throwable t) {
-                    Log.w(TAG, "Native upscaler failed; falling back to Canvas", t);
-                } finally {
-                    MemoryPool.releaseSlot(dstDirect);
                 }
+
+                if (!upscaled) {
+                    Canvas c = new Canvas(dst10MpBmp);
+                    Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);
+                    c.drawBitmap(srcBmp, null, new Rect(0, 0, targetW, targetH), p);
+                }
+
+                srcBmp.recycle(); // Free 1.7MP buffer immediately
+            } else {
+                dst10MpBmp = srcBmp;
             }
 
-            if (!upscaled) {
-                Canvas c = new Canvas(dst10MpBmp);
-                Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);
-                c.drawBitmap(srcBmp, null, new Rect(0, 0, targetW, targetH), p);
-            }
+            // 5. Save Graded FUJIxxxx.JPG to SD card (Quality = 94, DCF 8.3)
+            final int outW = dst10MpBmp.getWidth();
+            final int outH = dst10MpBmp.getHeight();
+            final float mp = (float)(outW * outH) / 1000000.0f;
 
-            srcBmp.recycle(); // Free 1.7MP buffer immediately
-
-            // 5. Save Graded FUJIxxxx.JPG to SD card at true 10.6 MP (Quality = 94, DCF 8.3)
             final String presetName = appState.getCurrentPresetName();
             final String gradedSavedPath = StorageResolver.saveGradedJpegToSd(context, dst10MpBmp, seqNum, presetName);
 
             final long elapsedMs = System.currentTimeMillis() - captureStartTime;
-            final float mp = (float)(targetW * targetH) / 1000000.0f;
 
             // 6. Verification Telemetry Toast & Log
-            final String telemetry = String.format(Locale.US, "SAVED %.1fMP (%dx%d) in %dms", mp, targetW, targetH, elapsedMs);
+            final String telemetry = String.format(Locale.US, "SAVED %.1fMP (%dx%d) in %dms", mp, outW, outH, elapsedMs);
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
             // Deliver to UI Review
-            deliverResult(dst10MpBmp, presetName, targetW, targetH, elapsedMs, gradedSavedPath);
+            deliverResult(dst10MpBmp, presetName, outW, outH, elapsedMs, gradedSavedPath);
 
         } catch (Throwable t) {
             Log.e(TAG, "Error in processAndUpscaleCapture", t);

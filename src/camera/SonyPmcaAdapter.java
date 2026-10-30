@@ -407,13 +407,25 @@ public class SonyPmcaAdapter implements CameraAdapter {
     }
 
     @Override
-    public void takePicture(Camera.PictureCallback jpegCallback) {
+    public void takePicture(final Camera.PictureCallback jpegCallback) {
         if (!ensureOpen()) return;
         try {
             if (jpegCallback == null) {
                 normalCamera.takePicture(null, null, null);
             } else {
-                normalCamera.takePicture(null, null, jpegCallback);
+                Camera.ShutterCallback shutterCb = new Camera.ShutterCallback() {
+                    @Override
+                    public void onShutter() {
+                        Log.i(TAG, "Hardware shutter callback fired");
+                    }
+                };
+                try {
+                    normalCamera.takePicture(shutterCb, null, jpegCallback);
+                    Log.i(TAG, "takePicture(shutterCb, null, jpegCallback) dispatched");
+                } catch (Throwable t1) {
+                    Log.w(TAG, "takePicture with shutterCb failed, falling back to (null, null, callback)", t1);
+                    normalCamera.takePicture(null, null, jpegCallback);
+                }
             }
         } catch (Throwable t) {
             Log.e(TAG, "takePicture failed", t);

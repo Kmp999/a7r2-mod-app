@@ -336,6 +336,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private boolean isS2PhysicallyHeld = false;
+    private long lastShutterDownTime = 0;
     private boolean isS1Held = false;
 
     /**
@@ -357,8 +358,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Strict Hardware Shutter Debouncing (catches 514, 0x202, 513, 0x201)
         if (fujiAction == SonyKeyCodes.FujiAction.FULL_SHUTTER) {
             if (action == KeyEvent.ACTION_DOWN) {
-                if (event.getRepeatCount() > 0 || isS2PhysicallyHeld) return true; // Block hardware burst loop
+                long now = System.currentTimeMillis();
+                if (event.getRepeatCount() > 0) return true;
+                if (isS2PhysicallyHeld && (now - lastShutterDownTime < 600)) return true; // Debounce 600ms
                 isS2PhysicallyHeld = true;
+                lastShutterDownTime = now;
 
                 // Seamless dismissal: if reviewing or in Q-Menu, exit overlay immediately to shoot
                 if (qMenuView != null && qMenuView.isReviewing()) {
