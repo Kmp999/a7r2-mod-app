@@ -562,22 +562,12 @@ public class SonyPmcaAdapter implements CameraAdapter {
                         break;
                     }
                 }
-                if (optimal == null) {
-                    // Fallback to highest supported
-                    Camera.Size max = sizes.get(0);
-                    for (Camera.Size s : sizes) {
-                        long currentArea = (long) s.width * s.height;
-                        long maxArea = (long) max.width * max.height;
-                        if (currentArea > maxArea) {
-                            max = s;
-                        }
-                    }
-                    optimal = max;
-                }
                 if (optimal != null) {
                     Log.i(TAG, "Configured Camera picture-size: " + optimal.width + "x" + optimal.height);
                     params.setPictureSize(optimal.width, optimal.height);
                     normalCamera.setParameters(params);
+                } else {
+                    Log.i(TAG, "Retaining default high-speed picture size (avoids 5-second 42MP sensor readout latency)");
                 }
             }
         } catch (Throwable t) {

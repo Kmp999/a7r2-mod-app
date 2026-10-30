@@ -280,6 +280,7 @@ public class CaptureController {
 
             final int srcW = srcBmp.getWidth();
             final int srcH = srcBmp.getHeight();
+            final long t2_decoded = System.currentTimeMillis();
 
             // 2. Precompute Active 17^3 3D LUT Table (~2ms)
             FujiRecipe recipe = appState.getActiveRecipe();
@@ -308,6 +309,7 @@ public class CaptureController {
             int grainStrength = recipe.grainEffect.ordinal();
             int clarityStrength = recipe.clarity;
             ColorEngine.applyLutAndGrainBitmapSafe(srcBmp, grainStrength, clarityStrength);
+            final long t3_graded = System.currentTimeMillis();
 
             // 4. Ultra-Fast Sub-400ms Pipeline:
             // Operates directly on the 1616x1080 sensor frame, avoiding 21MB Dalvik OOM and 3-second GC pauses
@@ -324,16 +326,21 @@ public class CaptureController {
 
             final String presetName = appState.getCurrentPresetName();
             final String gradedSavedPath = StorageResolver.saveGradedJpegToSd(context, dst10MpBmp, seqNum, presetName);
+            final long t4_saved = System.currentTimeMillis();
 
-            final long elapsedMs = System.currentTimeMillis() - captureStartTime;
+            final long hwTimeMs = t2_decoded - captureStartTime;
+            final long gradeTimeMs = t3_graded - t2_decoded;
+            final long saveTimeMs = t4_saved - t3_graded;
+            final long totalMs = t4_saved - captureStartTime;
 
-            // 6. Verification Telemetry Toast & Log
-            final String telemetry = String.format(Locale.US, "SAVED %.1fMP (%dx%d) in %dms", mp, outW, outH, elapsedMs);
+            // 6. Precise Telemetry Toast & Log
+            final String telemetry = String.format(Locale.US, "SAVED %.1fMP: Total %dms (HW:%dms Grd:%dms SD:%dms)",
+                mp, totalMs, hwTimeMs, gradeTimeMs, saveTimeMs);
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
             // Deliver to UI Review
-            deliverResult(dst10MpBmp, presetName, outW, outH, elapsedMs, gradedSavedPath);
+            deliverResult(dst10MpBmp, presetName, outW, outH, totalMs, gradedSavedPath);
 
         } catch (Throwable t) {
             Log.e(TAG, "Error in processAndUpscaleCapture", t);
