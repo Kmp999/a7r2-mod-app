@@ -81,22 +81,26 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_precomputeLut17(JNIEnv
         return;
     }
 
-    jshort* ccm_ptr = (*env)->GetPrimitiveArrayCritical(env, ccmQ8Array, 0);
-    jbyte* r_ptr = (*env)->GetPrimitiveArrayCritical(env, toneCurveR, 0);
-    jbyte* g_ptr = (*env)->GetPrimitiveArrayCritical(env, toneCurveG, 0);
-    jbyte* b_ptr = (*env)->GetPrimitiveArrayCritical(env, toneCurveB, 0);
-
-    if (ccm_ptr && r_ptr && g_ptr && b_ptr) {
-        int16_t ccm[9];
-        memcpy(ccm, ccm_ptr, sizeof(int16_t) * 9);
-        lut17_precompute(&g_lut17, ccm, (uint8_t*)r_ptr, (uint8_t*)g_ptr, (uint8_t*)b_ptr);
-        LOGI("17x17x17 3D LUT precomputed successfully");
+    if ((*env)->GetArrayLength(env, ccmQ8Array) < 9 ||
+        (*env)->GetArrayLength(env, toneCurveR) < 256 ||
+        (*env)->GetArrayLength(env, toneCurveG) < 256 ||
+        (*env)->GetArrayLength(env, toneCurveB) < 256) {
+        LOGE("Array length mismatch in precomputeLut17");
+        return;
     }
 
-    if (b_ptr) (*env)->ReleasePrimitiveArrayCritical(env, toneCurveB, b_ptr, 0);
-    if (g_ptr) (*env)->ReleasePrimitiveArrayCritical(env, toneCurveG, g_ptr, 0);
-    if (r_ptr) (*env)->ReleasePrimitiveArrayCritical(env, toneCurveR, r_ptr, 0);
-    if (ccm_ptr) (*env)->ReleasePrimitiveArrayCritical(env, ccmQ8Array, ccm_ptr, 0);
+    int16_t ccm[9];
+    uint8_t r_curve[256];
+    uint8_t g_curve[256];
+    uint8_t b_curve[256];
+
+    (*env)->GetShortArrayRegion(env, ccmQ8Array, 0, 9, (jshort*)ccm);
+    (*env)->GetByteArrayRegion(env, toneCurveR, 0, 256, (jbyte*)r_curve);
+    (*env)->GetByteArrayRegion(env, toneCurveG, 0, 256, (jbyte*)g_curve);
+    (*env)->GetByteArrayRegion(env, toneCurveB, 0, 256, (jbyte*)b_curve);
+
+    lut17_precompute(&g_lut17, ccm, r_curve, g_curve, b_curve);
+    LOGI("17x17x17 3D LUT precomputed successfully");
 }
 
 JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_precomputeLut17WithBase(JNIEnv *env, jclass clazz,
@@ -110,24 +114,38 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_precomputeLut17WithBas
         return;
     }
 
-    jshort* ccm_ptr = (*env)->GetPrimitiveArrayCritical(env, ccmQ8Array, 0);
-    jbyte* r_ptr = (*env)->GetPrimitiveArrayCritical(env, toneCurveR, 0);
-    jbyte* g_ptr = (*env)->GetPrimitiveArrayCritical(env, toneCurveG, 0);
-    jbyte* b_ptr = (*env)->GetPrimitiveArrayCritical(env, toneCurveB, 0);
-    jbyte* base_ptr = (baseLutArray != NULL) ? (*env)->GetPrimitiveArrayCritical(env, baseLutArray, 0) : NULL;
-
-    if (ccm_ptr && r_ptr && g_ptr && b_ptr) {
-        int16_t ccm[9];
-        memcpy(ccm, ccm_ptr, sizeof(int16_t) * 9);
-        lut17_precompute_with_base(&g_lut17, (const uint8_t*)base_ptr, ccm, (uint8_t*)r_ptr, (uint8_t*)g_ptr, (uint8_t*)b_ptr);
-        LOGI("17x17x17 3D LUT with base precomputed successfully");
+    if ((*env)->GetArrayLength(env, ccmQ8Array) < 9 ||
+        (*env)->GetArrayLength(env, toneCurveR) < 256 ||
+        (*env)->GetArrayLength(env, toneCurveG) < 256 ||
+        (*env)->GetArrayLength(env, toneCurveB) < 256) {
+        LOGE("Array length mismatch in precomputeLut17WithBase");
+        return;
     }
 
-    if (base_ptr) (*env)->ReleasePrimitiveArrayCritical(env, baseLutArray, base_ptr, 0);
-    if (b_ptr) (*env)->ReleasePrimitiveArrayCritical(env, toneCurveB, b_ptr, 0);
-    if (g_ptr) (*env)->ReleasePrimitiveArrayCritical(env, toneCurveG, g_ptr, 0);
-    if (r_ptr) (*env)->ReleasePrimitiveArrayCritical(env, toneCurveR, r_ptr, 0);
-    if (ccm_ptr) (*env)->ReleasePrimitiveArrayCritical(env, ccmQ8Array, ccm_ptr, 0);
+    int16_t ccm[9];
+    uint8_t r_curve[256];
+    uint8_t g_curve[256];
+    uint8_t b_curve[256];
+
+    (*env)->GetShortArrayRegion(env, ccmQ8Array, 0, 9, (jshort*)ccm);
+    (*env)->GetByteArrayRegion(env, toneCurveR, 0, 256, (jbyte*)r_curve);
+    (*env)->GetByteArrayRegion(env, toneCurveG, 0, 256, (jbyte*)g_curve);
+    (*env)->GetByteArrayRegion(env, toneCurveB, 0, 256, (jbyte*)b_curve);
+
+    uint8_t* base_ptr = NULL;
+    if (baseLutArray != NULL) {
+        jsize baseLen = (*env)->GetArrayLength(env, baseLutArray);
+        if (baseLen >= (jsize)(17 * 17 * 17 * 3)) {
+            base_ptr = (uint8_t*)(*env)->GetByteArrayElements(env, baseLutArray, NULL);
+        }
+    }
+
+    lut17_precompute_with_base(&g_lut17, base_ptr, ccm, r_curve, g_curve, b_curve);
+
+    if (base_ptr != NULL) {
+        (*env)->ReleaseByteArrayElements(env, baseLutArray, (jbyte*)base_ptr, JNI_ABORT);
+    }
+    LOGI("17x17x17 3D LUT with base precomputed successfully");
 }
 
 JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_loadLut17Table(JNIEnv *env, jclass clazz, jbyteArray tableArray) {
@@ -135,12 +153,8 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_loadLut17Table(JNIEnv 
     jsize len = (*env)->GetArrayLength(env, tableArray);
     if (len < (jsize)sizeof(g_lut17.table)) return;
 
-    jbyte* ptr = (*env)->GetPrimitiveArrayCritical(env, tableArray, 0);
-    if (ptr != NULL) {
-        memcpy(g_lut17.table, ptr, sizeof(g_lut17.table));
-        (*env)->ReleasePrimitiveArrayCritical(env, tableArray, ptr, 0);
-        LOGI("17x17x17 3D LUT direct table loaded (%zu bytes)", sizeof(g_lut17.table));
-    }
+    (*env)->GetByteArrayRegion(env, tableArray, 0, sizeof(g_lut17.table), (jbyte*)g_lut17.table);
+    LOGI("17x17x17 3D LUT direct table loaded (%zu bytes)", sizeof(g_lut17.table));
 }
 
 JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_applyLut17RGB565(JNIEnv *env, jclass clazz,

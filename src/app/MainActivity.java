@@ -445,29 +445,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        if (cameraAdapter == null) return;
-        cameraAdapter.startPreview(holder);
+        try {
+            if (cameraAdapter == null) return;
+            cameraAdapter.startPreview(holder);
 
-        SonyToFujiHardwareMapper.applyRecipeToHardware(
-            cameraAdapter.getCameraEx(),
-            cameraAdapter.getNormalCamera(),
-            appState.getActiveRecipe()
-        );
+            SonyToFujiHardwareMapper.applyRecipeToHardware(
+                cameraAdapter.getCameraEx(),
+                cameraAdapter.getNormalCamera(),
+                appState.getActiveRecipe()
+            );
 
-        if (uiController != null) {
-            uiController.updateBottomHud();
-        }
-
-        // Register Zero-GC Real-time Preview Callback
-        if (cameraAdapter instanceof SonyPmcaAdapter) {
-            try {
-                android.hardware.Camera.Size previewSize = cameraAdapter.getNormalCamera().getParameters().getPreviewSize();
-                if (previewSize != null) {
-                    ((SonyPmcaAdapter) cameraAdapter).setRealtimePreviewCallback(realtimePreviewCallback, previewSize.width, previewSize.height);
-                }
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to initialize realtime preview callback", t);
+            if (uiController != null) {
+                uiController.updateBottomHud();
             }
+
+            // Register Zero-GC Real-time Preview Callback
+            if (cameraAdapter instanceof SonyPmcaAdapter) {
+                try {
+                    android.hardware.Camera normalCam = cameraAdapter.getNormalCamera();
+                    if (normalCam != null) {
+                        android.hardware.Camera.Size previewSize = normalCam.getParameters().getPreviewSize();
+                        if (previewSize != null) {
+                            ((SonyPmcaAdapter) cameraAdapter).setRealtimePreviewCallback(realtimePreviewCallback, previewSize.width, previewSize.height);
+                        }
+                    }
+                } catch (Throwable t) {
+                    Log.e(TAG, "Failed to initialize realtime preview callback", t);
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "surfaceCreated failed", t);
         }
     }
 
@@ -485,8 +492,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onResume() {
         super.onResume();
-        if (cameraAdapter != null && cameraPreview != null) {
-            cameraAdapter.startPreview(cameraPreview.getHolder());
+        try {
+            if (cameraAdapter != null && cameraPreview != null) {
+                cameraAdapter.startPreview(cameraPreview.getHolder());
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "onResume startPreview failed", t);
         }
     }
 

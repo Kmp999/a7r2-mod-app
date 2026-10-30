@@ -27,17 +27,6 @@ public class SonyToFujiHardwareMapper {
         try {
             Camera.Parameters params = camera.getParameters();
 
-            // 0. Enforce 10.6 MP picture size baseline on standard parameters
-            List<Camera.Size> sizes = params.getSupportedPictureSizes();
-            if (sizes != null && !sizes.isEmpty()) {
-                for (Camera.Size s : sizes) {
-                    if (s.width >= 3500 && s.width <= 4200) {
-                        params.setPictureSize(s.width, s.height);
-                        break;
-                    }
-                }
-            }
-
             // 1. Creative Style base
             mapCreativeStyle(params, recipe.filmSim);
 
