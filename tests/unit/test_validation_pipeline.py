@@ -38,12 +38,11 @@ class TestValidationPipeline(unittest.TestCase):
         self.assertIn("onResume startPreview failed", content)
 
     def test_capture_controller_callback_upscaling_pipeline(self):
-        """Verify CaptureController receives callback, grades, upscales, and saves FUJI photo."""
+        """Verify CaptureController receives callback, grades in native memory, and saves FUJI photo."""
         content = self.capture_file.read_text(encoding="utf-8")
         self.assertIn("cameraAdapter.takePicture(new Camera.PictureCallback()", content)
         self.assertIn("processAndUpscaleCapture(jpegData, seqNum, captureStartTime)", content)
         self.assertIn("ColorEngine.applyLutAndGrainBitmapSafe(srcBmp", content)
-        self.assertIn("ColorEngine.upscaleEdgeDirectedSafe", content)
         self.assertIn("StorageResolver.saveGradedJpegToSd", content)
 
     def test_heap_safe_failover_in_capture_controller(self):

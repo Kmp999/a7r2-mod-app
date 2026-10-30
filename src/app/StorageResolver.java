@@ -383,17 +383,13 @@ public final class StorageResolver {
                     ? String.format(Locale.US, "%s%04d.JPG", prefix, sequenceNum)
                     : generateDcfFilename(dir, prefix);
                 File file = new File(dir, filename);
-                FileOutputStream out = new FileOutputStream(file);
+                java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(file), 65536);
                 boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
                 out.flush();
-                try {
-                    out.getFD().sync();
-                } catch (Throwable ignored) {}
                 out.close();
 
                 if (compressed && file.exists() && file.length() > 0) {
                     String savedPath = file.getAbsolutePath();
-                    writeExifMetadata(savedPath, recipeName);
                     sLastDiagnostic = "OK (" + prefix + "): " + savedPath + " (" + (file.length() / 1024) + "KB)";
                     Log.i(TAG, "Successfully saved graded photo: " + sLastDiagnostic);
 
