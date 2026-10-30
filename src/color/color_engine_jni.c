@@ -357,3 +357,29 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
     return JNI_TRUE;
 }
 
+/**
+ * Pure JNI Edge-Directed Super-Resolution Upscaling from 1.7MP to 10.6MP.
+ * Zero external library dependencies.
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeUpscaleEdgeDirected(
+    JNIEnv *env, jclass clazz,
+    jobject srcDirect, jint srcW, jint srcH,
+    jobject dstDirect, jint dstW, jint dstH) {
+    if (srcDirect == NULL || dstDirect == NULL || srcW <= 1 || srcH <= 1 || dstW <= 1 || dstH <= 1) {
+        LOGE("nativeUpscaleEdgeDirected: Invalid arguments");
+        return JNI_FALSE;
+    }
+
+    uint16_t* src_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, srcDirect);
+    uint16_t* dst_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, dstDirect);
+
+    if (src_pixels == NULL || dst_pixels == NULL) {
+        LOGE("nativeUpscaleEdgeDirected: Failed to get DirectBuffer addresses");
+        return JNI_FALSE;
+    }
+
+    upscaler_edge_directed_rgb565(src_pixels, (int)srcW, (int)srcH,
+                                  dst_pixels, (int)dstW, (int)dstH);
+    return JNI_TRUE;
+}
+

@@ -232,4 +232,21 @@ public class ColorEngine {
     }
 
     public static native boolean nativeApplyLutAndGrainDirect(java.nio.ByteBuffer directBuffer, int width, int height, int grainStrength, int clarityStrength);
+
+    /**
+     * Edge-directed super-resolution upscaling from 1.7MP to 10.6MP (~4K).
+     */
+    public static boolean upscaleEdgeDirectedSafe(java.nio.ByteBuffer srcDirect, int srcW, int srcH,
+                                                  java.nio.ByteBuffer dstDirect, int dstW, int dstH) {
+        if (!sNativeAvailable || srcDirect == null || dstDirect == null) return false;
+        try {
+            return nativeUpscaleEdgeDirected(srcDirect, srcW, srcH, dstDirect, dstW, dstH);
+        } catch (Throwable t) {
+            Log.e(TAG, "nativeUpscaleEdgeDirected failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean nativeUpscaleEdgeDirected(java.nio.ByteBuffer srcDirect, int srcW, int srcH,
+                                                           java.nio.ByteBuffer dstDirect, int dstW, int dstH);
 }
