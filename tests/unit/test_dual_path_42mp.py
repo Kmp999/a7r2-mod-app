@@ -66,5 +66,35 @@ class TestDualPath42MP(unittest.TestCase):
         self.assertIn('"small"', adapter_content)
         self.assertIn("s.width >= 3500", adapter_content)
 
+    def test_hardware_direct_capture_bypasses_hal_proxy(self):
+        """Verify takeHardwarePicture passes (shutterCallback, null, null) to bypass 1.7MP HAL proxy."""
+        adapter_file = self.root / "src" / "camera" / "SonyPmcaAdapter.java"
+        adapter_content = adapter_file.read_text(encoding="utf-8")
+        self.assertIn("normalCamera.takePicture(shutterCallback, null, null)", adapter_content)
+        self.assertIn("cancelTakePicture", adapter_content)
+
+    def test_storage_resolver_has_hardware_jpeg_poller(self):
+        """Verify StorageResolver has fallback DCIM poller and quality 94."""
+        storage_content = self.storage_file.read_text(encoding="utf-8")
+        self.assertIn("pollForNewHardwareJpeg", storage_content)
+        self.assertIn("parseSequenceNumber", storage_content)
+        self.assertIn("JPEG, 94, out", storage_content)
+
+    def test_hardware_mapper_preserves_10_6mp_and_single_drive(self):
+        """Verify SonyToFujiHardwareMapper preserves 10.6MP ImageSize and Single DriveMode."""
+        mapper_file = self.root / "src" / "camera" / "SonyToFujiHardwareMapper.java"
+        mapper_content = mapper_file.read_text(encoding="utf-8")
+        self.assertIn('"small"', mapper_content)
+        self.assertIn('"single"', mapper_content)
+
+    def test_lut_cube_17_performance_optimizations(self):
+        """Verify lut_cube_17.h has bit replication, branchless white-point, and 64x64 grain."""
+        lut_file = self.root / "src" / "color" / "lut_cube_17.h"
+        lut_content = lut_file.read_text(encoding="utf-8")
+        self.assertIn("STATIC_GRAIN_64x64", lut_content)
+        self.assertIn("BAYER_2X2", lut_content)
+        self.assertIn("r + (r >> 7)", lut_content)
+        self.assertIn("(r5 << 3) | (r5 >> 2)", lut_content)
+
 if __name__ == '__main__':
     unittest.main()

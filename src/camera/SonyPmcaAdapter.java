@@ -215,16 +215,27 @@ public class SonyPmcaAdapter implements CameraAdapter {
                     new java.lang.reflect.InvocationHandler() {
                         @Override
                         public Object invoke(Object proxy, Method method, Object[] args) {
-                            if ("onDone".equals(method.getName()) && args != null && args.length >= 2) {
+                            if ("onDone".equals(method.getName()) && args != null && args.length > 0) {
                                 try {
-                                    Object info = args[1];
-                                    if (info != null) {
-                                        String dir = (String) info.getClass().getField("DirectoryName").get(info);
-                                        String fn = (String) info.getClass().getField("FileName").get(info);
-                                        Log.i(TAG, "Hardware StoreImageCompleteListener: " + dir + "/" + fn);
-                                        if (storeImageListener != null) {
-                                            storeImageListener.onImageStored(dir, fn);
-                                        }
+                                    String dir = null;
+                                    String fn = null;
+                                    for (Object arg : args) {
+                                        if (arg == null) continue;
+                                        try {
+                                            try { dir = (String) arg.getClass().getField("DirectoryName").get(arg); } catch (Throwable ignored) {}
+                                            try { fn = (String) arg.getClass().getField("FileName").get(arg); } catch (Throwable ignored) {}
+                                            if (dir == null) {
+                                                try { dir = (String) arg.getClass().getMethod("getDirectoryName").invoke(arg); } catch (Throwable ignored) {}
+                                            }
+                                            if (fn == null) {
+                                                try { fn = (String) arg.getClass().getMethod("getFileName").invoke(arg); } catch (Throwable ignored) {}
+                                            }
+                                        } catch (Throwable ignored) {}
+                                        if (dir != null && fn != null) break;
+                                    }
+                                    Log.i(TAG, "Hardware StoreImageCompleteListener: " + dir + "/" + fn);
+                                    if (storeImageListener != null) {
+                                        storeImageListener.onImageStored(dir, fn);
                                     }
                                 } catch (Throwable t) {
                                     Log.w(TAG, "Failed reading StoreImageInfo", t);

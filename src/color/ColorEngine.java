@@ -201,4 +201,19 @@ public class ColorEngine {
     }
 
     public static native boolean nativeGradeCaptureRGB565(java.nio.ByteBuffer directBuffer, int width, int height);
+
+    /**
+     * Applies 17x17x17 3D LUT, Grain, and Micro-Contrast directly to an RGB_565 Bitmap in native memory.
+     */
+    public static boolean applyLutAndGrainBitmapSafe(android.graphics.Bitmap bitmap, int grainStrength, int clarityStrength) {
+        if (!sNativeAvailable || bitmap == null) return false;
+        try {
+            return nativeApplyLutAndGrainBitmap(bitmap, grainStrength, clarityStrength);
+        } catch (Throwable t) {
+            Log.e(TAG, "nativeApplyLutAndGrainBitmap failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean nativeApplyLutAndGrainBitmap(android.graphics.Bitmap bitmap, int grainStrength, int clarityStrength);
 }

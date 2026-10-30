@@ -159,6 +159,99 @@ public final class StorageResolver {
     }
 
     /**
+     * Extracts the 4-digit sequence number from a DCF filename (e.g. DSC00123.JPG -> 123).
+     */
+    public static int parseSequenceNumber(String filename) {
+        if (filename == null) return -1;
+        String name = new File(filename).getName().toUpperCase(Locale.US);
+        if (name.endsWith(".JPG") && name.length() == 12) {
+            try {
+                return Integer.parseInt(name.substring(4, 8));
+            } catch (Throwable ignored) {}
+        }
+        return -1;
+    }
+
+    /**
+     * Finds the latest DCF hardware photo filename currently residing on the SD card.
+     */
+    public static String getLatestDcfFilename() {
+        List<File> candidates = getCandidateDcimDirs();
+        File newest = null;
+        long newestTime = 0;
+        for (File dir : candidates) {
+            if (dir.exists() && dir.isDirectory()) {
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        String name = f.getName().toUpperCase(Locale.US);
+                        if (name.startsWith("DSC0") && name.endsWith(".JPG")) {
+                            long t = f.lastModified();
+                            if (t > newestTime) {
+                                newestTime = t;
+                                newest = f;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return newest != null ? newest.getName() : null;
+    }
+
+    /**
+     * Fast fallback directory poller (Requirement 1.3).
+     * Polls DCIM candidate folders every 50ms up to timeoutMs for a newly written DSC0xxxx.JPG by BIONZ X.
+     */
+    public static File pollForNewHardwareJpeg(long preCaptureTime, String lastKnownFilename, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        List<File> candidates = getCandidateDcimDirs();
+        long threshold = preCaptureTime - 1500; // Allow slight timestamp skew on FAT32
+
+        while (System.currentTimeMillis() < deadline) {
+            for (File dir : candidates) {
+                if (!dir.exists() || !dir.isDirectory()) continue;
+                File[] files = dir.listFiles();
+                if (files == null) continue;
+
+                File candidate = null;
+                long newestTime = 0;
+
+                for (File f : files) {
+                    String name = f.getName().toUpperCase(Locale.US);
+                    if (name.startsWith("DSC0") && name.endsWith(".JPG")) {
+                        if (lastKnownFilename != null && name.equalsIgnoreCase(lastKnownFilename)) {
+                            continue;
+                        }
+                        long mtime = f.lastModified();
+                        if (mtime >= threshold && mtime >= newestTime && f.length() > 10240) {
+                            newestTime = mtime;
+                            candidate = f;
+                        }
+                    }
+                }
+
+                if (candidate != null) {
+                    // Wait 30ms to ensure BIONZ X hardware DMA has finished flushing the file
+                    long initialLen = candidate.length();
+                    try { Thread.sleep(30); } catch (InterruptedException ignored) {}
+                    if (candidate.length() >= initialLen && candidate.length() > 10240) {
+                        Log.i(TAG, "Hardware JPEG discovered via DCIM poller: " + candidate.getAbsolutePath() + " (" + (candidate.length() / 1024) + "KB)");
+                        return candidate;
+                    }
+                }
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+        Log.w(TAG, "Hardware JPEG poller timed out after " + timeoutMs + "ms");
+        return null;
+    }
+
+    /**
      * Saves raw 42.4 MP JPEG bytes directly from BIONZ X to the first writable SD card directory.
      * Zero-Copy / Zero-Decode: Preserves 100% of native 7952x5304 resolution and hardware ISP metadata.
      * Returns the absolute path of the saved file, or null if all attempts fail.
@@ -267,7 +360,7 @@ public final class StorageResolver {
                     : generateDcfFilename(dir, prefix);
                 File file = new File(dir, filename);
                 FileOutputStream out = new FileOutputStream(file);
-                boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out);
+                boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
                 out.flush();
                 try {
                     out.getFD().sync();

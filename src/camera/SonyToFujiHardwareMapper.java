@@ -26,6 +26,17 @@ public class SonyToFujiHardwareMapper {
         try {
             Camera.Parameters params = camera.getParameters();
 
+            // 0. Enforce 10.6 MP picture size baseline on standard parameters
+            List<Camera.Size> sizes = params.getSupportedPictureSizes();
+            if (sizes != null && !sizes.isEmpty()) {
+                for (Camera.Size s : sizes) {
+                    if (s.width >= 3500 && s.width <= 4200) {
+                        params.setPictureSize(s.width, s.height);
+                        break;
+                    }
+                }
+            }
+
             // 1. Creative Style base
             mapCreativeStyle(params, recipe.filmSim);
 
@@ -35,9 +46,12 @@ public class SonyToFujiHardwareMapper {
             // 3. Dynamic Range Hardware Exposure Protection (-1.0 EV for DR200, -2.0 EV for DR400)
             mapDynamicRangeHardware(params, recipe);
 
-            // 4. Deep CameraEx ParametersModifier for DRO and WB shift
+            // 4. Deep CameraEx ParametersModifier for DRO, WB shift, 10.6MP ImageSize, and Single DriveMode
             if (cameraEx != null) {
-                applySonyExModifiers(cameraEx, params, recipe);
+                Camera.Parameters modifiedParams = applySonyExModifiers(cameraEx, params, recipe);
+                if (modifiedParams != null) {
+                    params = modifiedParams;
+                }
             }
 
             // Write parameters to camera driver
@@ -163,7 +177,7 @@ public class SonyToFujiHardwareMapper {
         throw new NoSuchMethodException(name);
     }
 
-    private static void applySonyExModifiers(Object cameraEx, Camera.Parameters params, FujiRecipe recipe) {
+    private static Camera.Parameters applySonyExModifiers(Object cameraEx, Camera.Parameters params, FujiRecipe recipe) {
         try {
             Class<?> camExClass = cameraEx.getClass();
             Method createModMethod = null;
@@ -174,12 +188,38 @@ public class SonyToFujiHardwareMapper {
                     break;
                 }
             }
-            if (createModMethod == null) return;
+            if (createModMethod == null) return params;
 
             Object modifier = createModMethod.invoke(cameraEx, params);
-            if (modifier == null) return;
+            if (modifier == null) return params;
 
-            // 1. Dynamic Range (DR) -> Sony DRO (Dynamic Range Optimizer)
+            // 1. Preserve 10.6 MP (3984 x 2656) BIONZ X hardware capture and single-shot drive mode
+            try {
+                Method setImgSize = findAccessibleMethod(modifier, "setImageSize", String.class);
+                setImgSize.invoke(modifier, "small");
+            } catch (Throwable ignored) {}
+
+            try {
+                Method setAspect = findAccessibleMethod(modifier, "setImageAspectRatio", String.class);
+                setAspect.invoke(modifier, "3:2");
+            } catch (Throwable ignored) {}
+
+            try {
+                Method setFormat = findAccessibleMethod(modifier, "setPictureStorageFormat", String.class);
+                setFormat.invoke(modifier, "jpeg");
+            } catch (Throwable ignored) {}
+
+            try {
+                Method setDrive = findAccessibleMethod(modifier, "setDriveMode", String.class);
+                setDrive.invoke(modifier, "single");
+            } catch (Throwable t) {
+                try {
+                    Method setDriveInt = findAccessibleMethod(modifier, "setDriveMode", int.class);
+                    setDriveInt.invoke(modifier, 0);
+                } catch (Throwable ignored) {}
+            }
+
+            // 2. Dynamic Range (DR) -> Sony DRO (Dynamic Range Optimizer)
             int droLevel = 1;
             switch (recipe.dynamicRange) {
                 case DR100: droLevel = 1; break;
@@ -208,7 +248,7 @@ public class SonyToFujiHardwareMapper {
                 }
             } catch (Throwable ignored) {}
 
-            // 2. WB Fine Shift
+            // 3. WB Fine Shift
             int sonyAB = recipe.wbShiftR;
             int sonyGM = -recipe.wbShiftB;
 
@@ -217,15 +257,19 @@ public class SonyToFujiHardwareMapper {
                 setWbShift.invoke(modifier, sonyAB, sonyGM);
             } catch (Throwable ignored) {}
 
-            // Update params from modifier
+            // Return updated parameters from modifier
             try {
                 Method getParams = findAccessibleMethod(modifier, "getParameters");
                 Camera.Parameters newParams = (Camera.Parameters) getParams.invoke(modifier);
+                if (newParams != null) {
+                    return newParams;
+                }
             } catch (Throwable ignored) {}
 
         } catch (Throwable t) {
             Log.w(TAG, "CameraEx ParametersModifier not fully supported", t);
         }
+        return params;
     }
 
     private static int clamp(int val, int min, int max) {
