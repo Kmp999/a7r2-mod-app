@@ -4,6 +4,7 @@ import android.hardware.Camera;
 import android.util.Log;
 
 import java.lang.reflect.Method;
+import java.util.List;
 
 /**
  * Maps Fujifilm Recipe parameters directly to Sony BIONZ X hardware registers
