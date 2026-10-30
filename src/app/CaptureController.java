@@ -171,15 +171,7 @@ public class CaptureController {
                         // 2. Synchronize DCF Sequence Number
                         final int seqNum = StorageResolver.allocateNextSequenceNumber();
 
-                        // 3. Save raw capture DSC0xxxx.JPG to SD card in background thread
-                        ioExecutor.execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                saveFullResJpegDirectly(jpegData, seqNum);
-                            }
-                        });
-
-                        // 4. Grade with 3D LUT + Upscale to true 10.6 MP (3984 x 2656) in background
+                        // 3. Grade with 3D LUT and save FUJIxxxx.JPG in background thread
                         processingExecutor.execute(new Runnable() {
                             @Override
                             public void run() {

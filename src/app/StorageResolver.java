@@ -37,6 +37,8 @@ public final class StorageResolver {
 
     private static volatile String sLastDiagnostic = "Not initialized";
     private static int sFileSequence = 1;
+    private static volatile boolean sSequenceInitialized = false;
+    private static volatile File sCachedWorkingDir = null;
 
     private StorageResolver() {}
 
@@ -45,6 +47,9 @@ public final class StorageResolver {
      */
     public static List<File> getCandidateDcimDirs() {
         List<File> list = new ArrayList<File>();
+        if (sCachedWorkingDir != null && sCachedWorkingDir.exists()) {
+            list.add(sCachedWorkingDir);
+        }
         Set<String> roots = new LinkedHashSet<String>();
 
         // 1. Sony Scalar AvindexStore official mounted media path via reflection
@@ -133,6 +138,12 @@ public final class StorageResolver {
      * across existing DSC0xxxx.JPG and FUJIxxxx.JPG files in DCIM.
      */
     public static synchronized int allocateNextSequenceNumber() {
+        if (sSequenceInitialized) {
+            int num = sFileSequence++;
+            if (sFileSequence > 9999) sFileSequence = 1;
+            return num;
+        }
+
         List<File> candidates = getCandidateDcimDirs();
         int maxSeq = 0;
         for (File dir : candidates) {
@@ -155,6 +166,7 @@ public final class StorageResolver {
         int nextNum = (maxSeq > 0) ? (maxSeq + 1) : sFileSequence;
         if (nextNum > 9999) nextNum = 1;
         sFileSequence = nextNum + 1;
+        sSequenceInitialized = true;
         return nextNum;
     }
 
