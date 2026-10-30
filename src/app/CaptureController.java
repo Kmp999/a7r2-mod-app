@@ -165,6 +165,16 @@ public class CaptureController {
                 public void onImageStored(String dir, String filename) {
                     if (captureHandedOff.compareAndSet(false, true)) {
                         watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+
+                        // Capture finished: restore EVF preview immediately
+                        try {
+                            pmca.cancelAutoFocus();
+                            setState(CameraState.RESTORING_PREVIEW);
+                            restorePreviewWithWatchdog(3);
+                        } finally {
+                            isCapturing.set(false);
+                        }
+
                         File hwFile = (dir != null && filename != null) ? new File(dir, filename) : null;
                         if (hwFile == null || !hwFile.exists() || hwFile.length() < 10240) {
                             List<File> candDirs = StorageResolver.getCandidateDcimDirs();
@@ -187,18 +197,11 @@ public class CaptureController {
                 }
             });
 
-            // 2. Hardware Shutter Callback (Restores EVF in < 250ms)
+            // 2. Hardware Shutter Callback
             Camera.ShutterCallback shutterCb = new Camera.ShutterCallback() {
                 @Override
                 public void onShutter() {
-                    try {
-                        pmca.cancelAutoFocus();
-                        pmca.cancelTakePicture(); // Release mechanical shutter latch
-                        setState(CameraState.RESTORING_PREVIEW);
-                        restorePreviewWithWatchdog(3);
-                    } finally {
-                        isCapturing.set(false);
-                    }
+                    Log.d(TAG, "Hardware shutter fired");
                 }
             };
 
@@ -209,6 +212,16 @@ public class CaptureController {
                     File polled = StorageResolver.pollForNewHardwareJpeg(preCaptureTime, lastKnownDcf, 2500);
                     if (polled != null && captureHandedOff.compareAndSet(false, true)) {
                         watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+
+                        // Capture finished: restore EVF preview immediately
+                        try {
+                            pmca.cancelAutoFocus();
+                            setState(CameraState.RESTORING_PREVIEW);
+                            restorePreviewWithWatchdog(3);
+                        } finally {
+                            isCapturing.set(false);
+                        }
+
                         final File target = polled;
                         processingExecutor.execute(new Runnable() {
                             @Override
@@ -484,8 +497,25 @@ public class CaptureController {
         }
         ResultListener l = resultListener;
         if (l != null) {
-            l.onResult(bitmap, baseInfo);
-        } else {
+            // Downsample review bitmap (<= 960x640) for UI display to prevent OpenGL texture crash (> 2048x2048)
+            Bitmap displayBmp = null;
+            if (bitmap != null && !bitmap.isRecycled() && (bitmap.getWidth() > 1920 || bitmap.getHeight() > 1080)) {
+                try {
+                    int targetW = 960;
+                    int targetH = (h * targetW) / w;
+                    displayBmp = Bitmap.createScaledBitmap(bitmap, targetW, targetH, true);
+                } catch (Throwable t) {
+                    Log.w(TAG, "Failed creating review display bitmap", t);
+                }
+            }
+            if (displayBmp == null) {
+                displayBmp = bitmap;
+            }
+            l.onResult(displayBmp, baseInfo);
+            if (displayBmp != bitmap && bitmap != null && !bitmap.isRecycled()) {
+                bitmap.recycle();
+            }
+        } else if (bitmap != null && !bitmap.isRecycled()) {
             bitmap.recycle();
         }
     }

@@ -203,17 +203,33 @@ public class ColorEngine {
     public static native boolean nativeGradeCaptureRGB565(java.nio.ByteBuffer directBuffer, int width, int height);
 
     /**
-     * Applies 17x17x17 3D LUT, Grain, and Micro-Contrast directly to an RGB_565 Bitmap in native memory.
+     * Applies 17x17x17 3D LUT, Grain, and Micro-Contrast to an RGB_565 Bitmap using the Zero-Copy DirectBuffer pool.
+     * Does NOT require libjnigraphics, ensuring 100% compatibility with Sony PMCA firmware.
      */
     public static boolean applyLutAndGrainBitmapSafe(android.graphics.Bitmap bitmap, int grainStrength, int clarityStrength) {
         if (!sNativeAvailable || bitmap == null) return false;
         try {
-            return nativeApplyLutAndGrainBitmap(bitmap, grainStrength, clarityStrength);
+            int w = bitmap.getWidth();
+            int h = bitmap.getHeight();
+            int requiredBytes = w * h * 2;
+            java.nio.ByteBuffer directBuf = MemoryPool.acquireFreeSlot();
+            if (directBuf != null && directBuf.capacity() >= requiredBytes) {
+                directBuf.clear();
+                bitmap.copyPixelsToBuffer(directBuf);
+                directBuf.rewind();
+                boolean ok = nativeApplyLutAndGrainDirect(directBuf, w, h, grainStrength, clarityStrength);
+                directBuf.rewind();
+                if (ok) {
+                    bitmap.copyPixelsFromBuffer(directBuf);
+                }
+                MemoryPool.releaseSlot(directBuf);
+                return ok;
+            }
         } catch (Throwable t) {
-            Log.e(TAG, "nativeApplyLutAndGrainBitmap failed", t);
-            return false;
+            Log.e(TAG, "applyLutAndGrainBitmapSafe failed", t);
         }
+        return false;
     }
 
-    public static native boolean nativeApplyLutAndGrainBitmap(android.graphics.Bitmap bitmap, int grainStrength, int clarityStrength);
+    public static native boolean nativeApplyLutAndGrainDirect(java.nio.ByteBuffer directBuffer, int width, int height, int grainStrength, int clarityStrength);
 }

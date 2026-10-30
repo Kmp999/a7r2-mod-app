@@ -27,7 +27,7 @@ LOCAL_SRC_FILES := \
     ../src/perf/profiler.c \
     ../src/util/memory_pool.c
 
-LOCAL_LDLIBS    := -llog -lm -ljnigraphics
+LOCAL_LDLIBS    := -llog -lm
 
 # Optimization flags for ARMv7-A (Sony A7R II BIONZ X Cortex-A CPU)
 LOCAL_CFLAGS    := -O3 -mfloat-abi=softfp -mfpu=neon -ffast-math -ftree-vectorize

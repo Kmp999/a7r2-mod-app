@@ -1,6 +1,5 @@
 #include <jni.h>
 #include <android/log.h>
-#include <android/bitmap.h>
 #include "color_engine.h"
 #include "lut_cube_17.h"
 
@@ -323,37 +322,24 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeCapture
 }
 
 /**
- * Direct Bitmap grading via AndroidBitmap_lockPixels (Requirement 2.2).
- * Operates in-place on 10.6 MP (3984 x 2656) mutable RGB_565 Bitmaps in < 350 ms.
+ * Pure JNI Direct ByteBuffer grading with Grain and Clarity.
+ * Zero external library dependencies (does not require libjnigraphics).
  */
-JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndGrainBitmap(
-    JNIEnv *env, jclass clazz, jobject bitmap, jint grainStrength, jint clarityStrength) {
-    if (bitmap == NULL) {
-        LOGE("nativeApplyLutAndGrainBitmap: Bitmap is null");
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndGrainDirect(
+    JNIEnv *env, jclass clazz, jobject directBuffer, jint width, jint height, jint grainStrength, jint clarityStrength) {
+    if (directBuffer == NULL || width <= 0 || height <= 0) {
+        LOGE("nativeApplyLutAndGrainDirect: Invalid arguments");
         return JNI_FALSE;
     }
 
-    AndroidBitmapInfo info;
-    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) {
-        LOGE("nativeApplyLutAndGrainBitmap: AndroidBitmap_getInfo failed");
+    uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+    if (pixels == NULL) {
+        LOGE("nativeApplyLutAndGrainDirect: GetDirectBufferAddress returned null");
         return JNI_FALSE;
     }
 
-    if (info.format != ANDROID_BITMAP_FORMAT_RGB_565) {
-        LOGE("nativeApplyLutAndGrainBitmap: Expected RGB_565 format, got %d", info.format);
-        return JNI_FALSE;
-    }
-
-    void* pixels = NULL;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0 || pixels == NULL) {
-        LOGE("nativeApplyLutAndGrainBitmap: AndroidBitmap_lockPixels failed");
-        return JNI_FALSE;
-    }
-
-    lut17_process_rgb565_advanced(&g_lut17, (uint16_t*)pixels, (int)info.width, (int)info.height,
+    lut17_process_rgb565_advanced(&g_lut17, pixels, (int)width, (int)height,
                                   (int)grainStrength, (int)clarityStrength);
-
-    AndroidBitmap_unlockPixels(env, bitmap);
     return JNI_TRUE;
 }
 

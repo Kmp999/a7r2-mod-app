@@ -177,6 +177,14 @@ public class FujiQMenuView extends View {
     }
 
     public void setQuickReviewBitmap(Bitmap bmp, String info) {
+        if (bmp != null && !bmp.isRecycled() && (bmp.getWidth() > 1920 || bmp.getHeight() > 1080)) {
+            try {
+                int targetW = 960;
+                int targetH = (bmp.getHeight() * targetW) / bmp.getWidth();
+                Bitmap scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true);
+                if (scaled != null) bmp = scaled;
+            } catch (Throwable ignored) {}
+        }
         this.reviewBitmap = bmp;
         this.reviewInfo = info;
         postInvalidate();

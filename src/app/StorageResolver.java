@@ -232,11 +232,8 @@ public final class StorageResolver {
                 }
 
                 if (candidate != null) {
-                    // Wait 30ms to ensure BIONZ X hardware DMA has finished flushing the file
-                    long initialLen = candidate.length();
-                    try { Thread.sleep(30); } catch (InterruptedException ignored) {}
-                    if (candidate.length() >= initialLen && candidate.length() > 10240) {
-                        Log.i(TAG, "Hardware JPEG discovered via DCIM poller: " + candidate.getAbsolutePath() + " (" + (candidate.length() / 1024) + "KB)");
+                    if (isJpegFileComplete(candidate)) {
+                        Log.i(TAG, "Hardware JPEG verified complete via DCIM poller: " + candidate.getAbsolutePath() + " (" + (candidate.length() / 1024) + "KB)");
                         return candidate;
                     }
                 }
@@ -249,6 +246,33 @@ public final class StorageResolver {
         }
         Log.w(TAG, "Hardware JPEG poller timed out after " + timeoutMs + "ms");
         return null;
+    }
+
+    /**
+     * Checks if a JPEG file has been completely written and flushed to disk by BIONZ X.
+     * Prevents fatal partial-decode SIGSEGV and EBUSY file-locking collisions on FAT32.
+     */
+    public static boolean isJpegFileComplete(File file) {
+        if (file == null || !file.exists()) return false;
+        long len = file.length();
+        if (len < 50000) return false;
+
+        java.io.RandomAccessFile raf = null;
+        try {
+            raf = new java.io.RandomAccessFile(file, "r");
+            long fileLen = raf.length();
+            if (fileLen < 50000) return false;
+            raf.seek(fileLen - 2);
+            int b1 = raf.read();
+            int b2 = raf.read();
+            return (b1 == 0xFF && b2 == 0xD9); // JPEG End-Of-Image marker
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            if (raf != null) {
+                try { raf.close(); } catch (Throwable ignored) {}
+            }
+        }
     }
 
     /**
