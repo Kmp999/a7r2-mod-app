@@ -64,11 +64,11 @@ public class CaptureController {
     private final Handler watchdogHandler;
     private final JavaColorEngine javaEngine = new JavaColorEngine();
 
-    public CaptureController(CameraAdapter adapter, UIController uiController, AppState state) {
+    public CaptureController(CameraAdapter adapter, final UIController uiController, AppState state) {
         this(null, adapter, uiController, state);
     }
 
-    public CaptureController(Context context, CameraAdapter adapter, UIController uiController, AppState state) {
+    public CaptureController(Context context, CameraAdapter adapter, final UIController uiController, AppState state) {
         this.context = (context != null) ? context.getApplicationContext() : null;
         this.cameraAdapter = adapter;
         this.uiController = uiController;
@@ -108,8 +108,8 @@ public class CaptureController {
                     final int seqNum = StorageResolver.parseSequenceNumber(filename);
                     if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
                         Log.w(TAG, "Grading queue full on hardware store; skipping background grading.");
-                        if (uiController != null) {
-                            uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
+                        if (CaptureController.this.uiController != null) {
+                            CaptureController.this.uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
                         }
                         return;
                     }
