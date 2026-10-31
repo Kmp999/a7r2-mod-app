@@ -280,6 +280,15 @@ public class ColorEngine {
     public static native boolean nativeWriteStreamStrip(long handle, java.nio.ByteBuffer directBuffer, int stripW, int stripH, int rowOffset);
 
     /**
+     * Direct alias for streaming strip writing: native_write_jpeg_strip()
+     */
+    public static boolean writeJpegStripSafe(long handle, java.nio.ByteBuffer directBuffer, int stripW, int stripH, int rowOffset) {
+        return writeStreamStripSafe(handle, directBuffer, stripW, stripH, rowOffset);
+    }
+
+    public static native boolean nativeWriteJpegStrip(long handle, java.nio.ByteBuffer directBuffer, int stripW, int stripH, int rowOffset);
+
+    /**
      * Fused Grading + JPEG Stream Writing for an RGB_565 strip buffer.
      * Grades 64 rows in native memory and encodes directly to JPEG stream with zero heap allocation.
      */

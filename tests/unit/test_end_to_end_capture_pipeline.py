@@ -83,11 +83,11 @@ class TestEndToEndCapturePipeline(unittest.TestCase):
         self.assertIn("getGradedOutputFile", storage_content)
 
     def test_capture_controller_under_2_seconds_budget(self):
-        """Step 4: CaptureController executes 42.4MP strip-streaming pipeline with strict memory safety."""
+        """Step 4: CaptureController executes 42.4MP-to-10.6MP downsampled strip-streaming pipeline."""
         cc_content = self.capture_controller.read_text(encoding="utf-8")
         self.assertIn("processStripStreamingCapture", cc_content)
-        self.assertIn("stripMaxH = 64", cc_content)
-        self.assertIn("opts.inSampleSize = 1", cc_content)
+        self.assertIn("srcStripH = 128", cc_content)
+        self.assertIn("opts.inSampleSize = (srcW > 4000) ? 2 : 1", cc_content)
         self.assertIn("SAVED %s (%dx%d | %.1fMP) in %dms", cc_content)
 
     def test_fuji_q_menu_quick_review(self):

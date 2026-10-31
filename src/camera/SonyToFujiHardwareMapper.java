@@ -183,10 +183,10 @@ public class SonyToFujiHardwareMapper {
             Object modifier = createModMethod.invoke(cameraEx, params);
             if (modifier == null) return params;
 
-            // 1. Preserve 10.6 MP (3984 x 2656) BIONZ X hardware capture and single-shot drive mode
+            // 1. Preserve 42.4 MP (7952 x 5304) BIONZ X hardware capture and single-shot drive mode
             try {
                 Method setImgSize = findAccessibleMethod(modifier, "setImageSize", String.class);
-                setImgSize.invoke(modifier, "small");
+                setImgSize.invoke(modifier, "large");
             } catch (Throwable ignored) {}
 
             try {

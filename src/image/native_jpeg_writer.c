@@ -414,6 +414,10 @@ int native_jpeg_stream_write_strip_rgb565(JpegStreamState* state, const uint16_t
     return 1;
 }
 
+int native_write_jpeg_strip(JpegStreamState* state, const uint16_t* strip_pixels, int strip_w, int strip_h, int row_offset) {
+    return native_jpeg_stream_write_strip_rgb565(state, strip_pixels, strip_w, strip_h, row_offset);
+}
+
 int native_jpeg_stream_close(JpegStreamState* state, int success) {
     if (!state) return 0;
     int ret = 0;

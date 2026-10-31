@@ -49,6 +49,11 @@ JpegStreamState* native_jpeg_stream_open(const char* filename, int width, int he
 int native_jpeg_stream_write_strip_rgb565(JpegStreamState* state, const uint16_t* strip_pixels, int strip_w, int strip_h, int row_offset);
 
 /**
+ * Convenience alias matching requirement: native_write_jpeg_strip()
+ */
+int native_write_jpeg_strip(JpegStreamState* state, const uint16_t* strip_pixels, int strip_w, int strip_h, int row_offset);
+
+/**
  * Closes the JPEG stream session.
  * If success != 0, flushes bit buffer, writes EOI marker (0xFF, 0xD9), and closes file.
  * If success == 0, aborts and cleans up.

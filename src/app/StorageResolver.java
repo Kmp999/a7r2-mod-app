@@ -519,13 +519,63 @@ public final class StorageResolver {
     }
 
     /**
+     * Checks if a JPEG file has finished writing by verifying the JPEG End-Of-Image marker (0xFF, 0xD9).
+     */
+    public static boolean isJpegComplete(File file) {
+        if (file == null || !file.exists() || file.length() < 4) return false;
+        java.io.RandomAccessFile raf = null;
+        try {
+            raf = new java.io.RandomAccessFile(file, "r");
+            long len = raf.length();
+            if (len < 4) return false;
+            raf.seek(len - 2);
+            int b1 = raf.read();
+            int b2 = raf.read();
+            return (b1 == 0xFF && b2 == 0xD9);
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            if (raf != null) {
+                try { raf.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Waits for a JPEG file to finish writing to the SD card (verifying file size stability and 0xFF 0xD9 EOI).
+     */
+    public static boolean waitForJpegComplete(File file, int timeoutMs) {
+        if (file == null) return false;
+        long start = System.currentTimeMillis();
+        long prevLen = -1;
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            if (file.exists()) {
+                long currentLen = file.length();
+                if (currentLen > 100000 && isJpegComplete(file)) {
+                    return true;
+                }
+                if (currentLen > 0 && currentLen == prevLen && isJpegComplete(file)) {
+                    return true;
+                }
+                prevLen = currentLen;
+            }
+            try {
+                Thread.sleep(30);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+        return file.exists() && file.length() > 0;
+    }
+
+    /**
      * Registers a freshly saved native graded JPEG, preserves original EXIF metadata, and registers with Avindex.
      */
     public static void postProcessGradedFile(Context context, String filePath, int sequenceNum, String recipeName) {
         if (filePath == null) return;
         File master = findRawMasterFile(sequenceNum);
         if (master != null && master.exists()) {
-            copyExifMetadata(master.getAbsolutePath(), filePath, recipeName);
+            copyExifMetadata(master.getAbsolutePath(), filePath, recipeName, 3976, 2652);
         } else {
             writeExifMetadata(filePath, recipeName);
         }
@@ -534,9 +584,17 @@ public final class StorageResolver {
 
     /**
      * Copies all camera EXIF metadata from source master capture (DSC0xxxx.JPG) to graded JPEG (fuji_xxxx.jpg).
-     * Preserves hardware ISP tags (aperture, shutter speed, ISO, focal length, date, white balance, etc.).
+     * Preserves hardware ISP tags and updates image dimensions to 3976 x 2652.
      */
     public static void copyExifMetadata(String srcPath, String dstPath, String recipeName) {
+        copyExifMetadata(srcPath, dstPath, recipeName, 3976, 2652);
+    }
+
+    /**
+     * Copies all camera EXIF metadata from source master capture (DSC0xxxx.JPG) to graded JPEG (fuji_xxxx.jpg),
+     * setting specified output image dimensions.
+     */
+    public static void copyExifMetadata(String srcPath, String dstPath, String recipeName, int width, int height) {
         if (dstPath == null) return;
         if (srcPath == null || !new File(srcPath).exists()) {
             writeExifMetadata(dstPath, recipeName);
@@ -559,8 +617,6 @@ public final class StorageResolver {
                 ExifInterface.TAG_GPS_LONGITUDE_REF,
                 ExifInterface.TAG_GPS_PROCESSING_METHOD,
                 ExifInterface.TAG_GPS_TIMESTAMP,
-                ExifInterface.TAG_IMAGE_LENGTH,
-                ExifInterface.TAG_IMAGE_WIDTH,
                 ExifInterface.TAG_ISO,
                 ExifInterface.TAG_MAKE,
                 ExifInterface.TAG_MODEL,
@@ -594,11 +650,13 @@ public final class StorageResolver {
 
             dstExif.setAttribute(ExifInterface.TAG_MAKE, "SONY");
             dstExif.setAttribute(ExifInterface.TAG_MODEL, "ILCE-7RM2");
+            dstExif.setAttribute(ExifInterface.TAG_IMAGE_WIDTH, String.valueOf(width));
+            dstExif.setAttribute(ExifInterface.TAG_IMAGE_LENGTH, String.valueOf(height));
             if (recipeName != null && !recipeName.trim().isEmpty()) {
                 dstExif.setAttribute("UserComment", "Fuji Recipe: " + recipeName);
             }
             dstExif.saveAttributes();
-            Log.d(TAG, "EXIF metadata successfully preserved from " + srcPath + " to " + dstPath);
+            Log.d(TAG, "EXIF metadata successfully preserved from " + srcPath + " to " + dstPath + " (dims: " + width + "x" + height + ")");
         } catch (Throwable t) {
             Log.w(TAG, "Failed preserving EXIF metadata: " + t.getMessage());
             writeExifMetadata(dstPath, recipeName);

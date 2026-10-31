@@ -45,7 +45,7 @@ class TestNative42MPStripStreaming(unittest.TestCase):
         self.assertIn("tmpFile.renameTo", capture_content)
 
     def test_guardrail_2_true_42_4mp_resolution_no_upscaler(self):
-        """Guardrail 2: Legacy upscaler completely removed, inSampleSize strictly 1 on BitmapRegionDecoder."""
+        """Guardrail 2: Legacy upscaler completely removed, native 2x downsampling (inSampleSize = 2) on BitmapRegionDecoder."""
         lut_content = self.lut_h.read_text(encoding="utf-8")
         jni_content = self.color_jni_c.read_text(encoding="utf-8")
         writer_content = self.jpeg_writer_c.read_text(encoding="utf-8")
@@ -57,22 +57,23 @@ class TestNative42MPStripStreaming(unittest.TestCase):
         self.assertNotIn("native_upscale_and_write_jpeg_rgb565", writer_content)
         self.assertNotIn("native_upscale_and_write_jpeg_rgb565", jni_content)
 
-        # True 42.4MP inSampleSize = 1
+        # 42.4MP -> 10.6MP inSampleSize = 2 via BitmapRegionDecoder
         self.assertIn("BitmapRegionDecoder.newInstance", capture_content)
-        self.assertIn("opts.inSampleSize = 1", capture_content)
+        self.assertIn("opts.inSampleSize = (srcW > 4000) ? 2 : 1", capture_content)
+        self.assertIn("dstW = (srcW > 4000) ? srcW / 2 : srcW", capture_content)
 
     def test_guardrail_3_strict_dalvik_heap_and_strip_memory(self):
-        """Guardrail 3: 64-row strips (7952 x 64), single DirectBuffer, immediate .recycle() per strip."""
+        """Guardrail 3: 128 source row strips producing 3976x64 strips (~508 KB RAM), immediate .recycle() per strip."""
         capture_content = self.capture_file.read_text(encoding="utf-8")
 
-        # 64-row strip height
-        self.assertIn("stripMaxH = 64", capture_content)
+        # 128-row source strip height
+        self.assertIn("srcStripH = 128", capture_content)
 
         # Immediate recycle in finally block
         self.assertIn("stripBmp.recycle()", capture_content)
 
-        # Single direct ByteBuffer allocation
-        self.assertIn("java.nio.ByteBuffer.allocateDirect(fullW * stripMaxH * 2)", capture_content)
+        # Single direct ByteBuffer allocation (~508 KB)
+        self.assertIn("java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2)", capture_content)
 
         # Deterministic closure in finally block
         self.assertIn("ColorEngine.closeJpegStreamSafe(streamHandle, streamSuccess)", capture_content)
@@ -108,9 +109,9 @@ class TestNative42MPStripStreaming(unittest.TestCase):
         self.assertIn("Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWriteStreamStrip", jni_content)
         self.assertIn("nativeApplyLutAndGrainDirectOffset", jni_content)
 
-        # EXIF Preservation: copyExifMetadata copies from master capture to fuji_xxxx.jpg
+        # EXIF Preservation: copyExifMetadata copies from master capture to fuji_xxxx.jpg with 10.6MP dimensions
         self.assertIn("copyExifMetadata", storage_content)
-        self.assertIn("StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName);", capture_content)
+        self.assertIn("StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);", capture_content)
         self.assertIn("TAG_MAKE", storage_content)
         self.assertIn("TAG_MODEL", storage_content)
         self.assertIn("ExposureTime", storage_content)
@@ -124,12 +125,41 @@ class TestNative42MPStripStreaming(unittest.TestCase):
 
         self.assertIn("native_jpeg_stream_open", writer_h)
         self.assertIn("native_jpeg_stream_write_strip_rgb565", writer_h)
+        self.assertIn("native_write_jpeg_strip", writer_h)
         self.assertIn("native_jpeg_stream_close", writer_h)
 
         self.assertIn("native_jpeg_stream_open", writer_c)
         self.assertIn("native_jpeg_stream_write_strip_rgb565", writer_c)
+        self.assertIn("native_write_jpeg_strip", writer_c)
         self.assertIn("native_jpeg_stream_close", writer_c)
         self.assertIn("struct JpegStreamState", writer_c)
+
+    def test_jpeg_eoi_and_completion_check(self):
+        """Verify StorageResolver checks JPEG file completion via EOI marker (0xFF, 0xD9)."""
+        storage_content = self.storage_file.read_text(encoding="utf-8")
+        self.assertIn("isJpegComplete", storage_content)
+        self.assertIn("waitForJpegComplete", storage_content)
+        self.assertIn("0xFF", storage_content)
+        self.assertIn("0xD9", storage_content)
+
+    def test_native_write_jpeg_strip_alias(self):
+        """Verify native_write_jpeg_strip is exposed through JNI and ColorEngine."""
+        color_engine_content = self.color_engine_java.read_text(encoding="utf-8")
+        jni_content = self.color_jni_c.read_text(encoding="utf-8")
+        self.assertIn("writeJpegStripSafe", color_engine_content)
+        self.assertIn("nativeWriteJpegStrip", color_engine_content)
+        self.assertIn("Java_com_fujilite_a7r2_ColorEngine_nativeWriteJpegStrip", jni_content)
+
+    def test_bionz_x_hardware_capture_settings(self):
+        """Verify Sony hardware adapter and mapper configure full 42.4MP capture."""
+        adapter_file = self.src_dir / "camera" / "SonyPmcaAdapter.java"
+        mapper_file = self.src_dir / "camera" / "SonyToFujiHardwareMapper.java"
+        adapter_content = adapter_file.read_text(encoding="utf-8")
+        mapper_content = mapper_file.read_text(encoding="utf-8")
+
+        self.assertIn('"large"', adapter_content)
+        self.assertIn("s.width >= 7000", adapter_content)
+        self.assertIn('"large"', mapper_content)
 
 if __name__ == '__main__':
     unittest.main()

@@ -542,49 +542,53 @@ public class SonyPmcaAdapter implements CameraAdapter {
     }
 
     /**
-     * Configures the camera sensor and BIONZ X ISP for optimal 10.6MP (4K UHD) JPEG capture.
-     * On Sony Alpha 7R II, setting ImageSize="small" (approx 3984x2656) directs the BIONZ X ASIC
-     * to perform hardware-accelerated downscaling in silicon (<5ms), delivering a crisp 10.6MP JPEG (~3-4MB)
-     * directly to the Android subsystem without crashing Dalvik heap or getting restricted to 1.7MP proxy.
+     * Configures the camera sensor and BIONZ X ISP for native 42.4MP JPEG capture.
+     * On Sony Alpha 7R II, setting ImageSize="large" (7952x5304) directs the BIONZ X ASIC
+     * to capture full native 42.4MP resolution.
      */
     public void configureFullResolutionCapture() {
         if (normalCamera == null) return;
 
-        // 1. Standard Android Camera.Parameters: target ~10.6MP (approx 3984x2656 or closest ~10-12MP size)
+        // 1. Standard Android Camera.Parameters: target native 42.4MP (7952x5304)
         try {
             Camera.Parameters params = normalCamera.getParameters();
             List<Camera.Size> sizes = params.getSupportedPictureSizes();
             if (sizes != null && !sizes.isEmpty()) {
                 Camera.Size optimal = null;
-                // Target: ~3984x2656 (10.6 MP) or any 3:2 size around 10-12 MP
+                // Target: Native 42.4MP (7952x5304) or maximum 3:2 size
                 for (Camera.Size s : sizes) {
-                    if (s.width >= 3500 && s.width <= 4200) {
+                    if (s.width >= 7000) {
                         optimal = s;
                         break;
+                    }
+                }
+                if (optimal == null) {
+                    for (Camera.Size s : sizes) {
+                        if (optimal == null || (s.width * s.height > optimal.width * optimal.height)) {
+                            optimal = s;
+                        }
                     }
                 }
                 if (optimal != null) {
                     Log.i(TAG, "Configured Camera picture-size: " + optimal.width + "x" + optimal.height);
                     params.setPictureSize(optimal.width, optimal.height);
                     normalCamera.setParameters(params);
-                } else {
-                    Log.i(TAG, "Retaining default high-speed picture size (avoids 5-second 42MP sensor readout latency)");
                 }
             }
         } catch (Throwable t) {
             Log.w(TAG, "Failed setting picture size on standard Camera parameters", t);
         }
 
-        // 2. Sony CameraEx ParametersModifier: set image size to "small" (10.6MP on A7R II Full Frame)
+        // 2. Sony CameraEx ParametersModifier: set image size to "large" (42.4MP on A7R II Full Frame)
         if (cameraEx != null) {
             try {
                 Object mod = getModifier();
                 if (mod != null) {
                     try {
                         Method m = findAccessibleMethod(mod, "setImageSize", String.class);
-                        // On Sony A7R II Full Frame, "small" = 10.6 MP (3984x2656)
-                        m.invoke(mod, "small");
-                        Log.i(TAG, "CameraEx modifier.setImageSize('small') applied (10.6MP target)");
+                        // On Sony A7R II Full Frame, "large" = 42.4 MP (7952x5304)
+                        m.invoke(mod, "large");
+                        Log.i(TAG, "CameraEx modifier.setImageSize('large') applied (42.4MP target)");
                     } catch (Throwable ignored) {}
 
                     try {
@@ -602,7 +606,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
                     commitModifier(mod);
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "Failed configuring CameraEx parameters modifier for 10.6MP", t);
+                Log.w(TAG, "Failed configuring CameraEx parameters modifier for 42.4MP", t);
             }
         }
     }

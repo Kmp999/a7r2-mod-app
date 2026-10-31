@@ -38,19 +38,19 @@ class TestValidationPipeline(unittest.TestCase):
         self.assertIn("onResume startPreview failed", content)
 
     def test_capture_controller_callback_upscaling_pipeline(self):
-        """Verify CaptureController receives callback, delegates to 42.4MP strip-streaming, and saves FUJI photo."""
+        """Verify CaptureController receives callback, delegates to 42.4MP-to-10.6MP strip-streaming, and saves FUJI photo."""
         content = self.capture_file.read_text(encoding="utf-8")
         self.assertIn("cameraAdapter.takePicture(new Camera.PictureCallback()", content)
         self.assertIn("processStripStreamingCapture", content)
-        self.assertIn("opts.inSampleSize = 1", content)
+        self.assertIn("opts.inSampleSize = (srcW > 4000) ? 2 : 1", content)
         self.assertIn("StorageResolver.getGradedOutputFile", content)
 
     def test_heap_safe_failover_in_capture_controller(self):
-        """Verify 42.4MP strip memory safety with immediate strip bitmap recycling."""
+        """Verify 42.4MP-to-10.6MP strip memory safety with immediate strip bitmap recycling."""
         content = self.capture_file.read_text(encoding="utf-8")
         self.assertIn("stripBmp.recycle()", content)
         self.assertIn("stripDirect = java.nio.ByteBuffer.allocateDirect", content)
-        self.assertIn("stripMaxH = 64", content)
+        self.assertIn("srcStripH = 128", content)
 
     def test_display_safe_review_bitmap(self):
         """Verify review bitmap is downscaled to display size to avoid OpenGL 2048x2048 crash."""

@@ -259,14 +259,13 @@ public class CaptureController {
     }
 
     /**
-     * Native 42.4MP (7952 x 5304) Strip-Streaming Processing Engine:
-     * - True 42.4MP Resolution: inSampleSize = 1 via BitmapRegionDecoder.
-     * - Strict Dalvik Heap Safety: 64-row strips (7952 x 64), single pre-allocated DirectBuffer,
-     *   immediate .recycle() of each strip Bitmap before the next row block.
+     * Native 42.4MP-to-10.6MP Downsampled Strip-Streaming Processing Engine:
+     * - Native 42.4MP Hardware Master: Full 7952x5304 capture (DSC0xxxx.JPG) is kept 100% intact (NEVER deleted).
+     * - Downsamples 42.4MP -> 10.6MP (3976x2652) using native 1/2 DCT downsampling (inSampleSize = 2).
+     * - Strict Dalvik Heap Safety: Decodes 128 source rows at a time, producing 3976x64 strips (~508 KB RAM).
      * - Seamless Strip Boundaries: deterministic row-seeded PRNG and continuous grain/dither offsets.
-     * - Zero Data Destruction: original BIONZ X master (DSC0xxxx.JPG) is strictly preserved.
      * - Safe Temp-File-Then-Rename: writes to fuji_xxxx.jpg.tmp then renames to fuji_xxxx.jpg.
-     * - EXIF Preservation: copies camera hardware EXIF tags from DSC0xxxx.JPG to fuji_xxxx.jpg.
+     * - EXIF Preservation: copies camera hardware EXIF tags from DSC0xxxx.JPG, updating dims to 3976x2652.
      */
     public void processStripStreamingCapture(String rawJpegPath, final byte[] inMemoryJpegData, final int seqNum, final long captureStartTime) {
         appState.setProcessing(true);
@@ -287,10 +286,14 @@ public class CaptureController {
                 return;
             }
 
+            File rawMasterFile = new File(rawJpegPath);
+            // Verify file size stability and JPEG EOI marker (0xFF 0xD9)
+            StorageResolver.waitForJpegComplete(rawMasterFile, 3000);
+
             final FujiRecipe recipe = appState.getActiveRecipe();
             final String presetName = appState.getCurrentPresetName();
 
-            // 2. Initialize BitmapRegionDecoder for True 42.4MP (inSampleSize = 1)
+            // 2. Initialize BitmapRegionDecoder for 42.4MP -> 10.6MP downsampled decoding
             BitmapRegionDecoder decoder = null;
             try {
                 decoder = BitmapRegionDecoder.newInstance(rawJpegPath, false);
@@ -317,9 +320,12 @@ public class CaptureController {
                 return;
             }
 
-            final int fullW = decoder.getWidth();
-            final int fullH = decoder.getHeight();
-            Log.i(TAG, "Processing True 42.4MP Strip-Streaming: " + fullW + "x" + fullH + " (" + rawJpegPath + ")");
+            final int srcW = decoder.getWidth();
+            final int srcH = decoder.getHeight();
+            // Downsampled 10.6MP dimensions (3976 x 2652 from 7952 x 5304)
+            final int dstW = (srcW > 4000) ? srcW / 2 : srcW;
+            final int dstH = (srcH > 3000) ? srcH / 2 : srcH;
+            Log.i(TAG, "Processing 42.4MP->10.6MP Strip-Streaming: " + srcW + "x" + srcH + " -> " + dstW + "x" + dstH + " (" + rawJpegPath + ")");
 
             // 3. Prepare target and temporary files (Safe temp-file-then-rename)
             final File targetOutputFile = StorageResolver.getGradedOutputFile(seqNum);
@@ -353,61 +359,66 @@ public class CaptureController {
             final int grainStrength = recipe.grainEffect.ordinal();
             final int clarityStrength = recipe.clarity;
 
-            // 5. Open native JPEG stream session
-            long streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), fullW, fullH, 94);
+            // 5. Open native JPEG stream session configured for 10.6MP output (Quality 95)
+            long streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), dstW, dstH, 95);
             if (streamHandle == 0) {
                 Log.e(TAG, "Failed opening native JPEG stream at " + tmpFile.getAbsolutePath());
                 if (decoder != null) decoder.recycle();
                 return;
             }
 
-            // 6. Strict Dalvik Heap Management: Process in strips of 64 rows (7952 x 64)
-            final int stripMaxH = 64;
-            final int numStrips = (fullH + stripMaxH - 1) / stripMaxH;
+            // 6. Strict Dalvik Heap Management: Process in source strips of 128 rows (producing 3976 x 64 strips)
+            final int srcStripH = 128;
+            final int numStrips = (srcH + srcStripH - 1) / srcStripH;
 
-            // Allocate single direct buffer once per image (fullW * 64 * 2 bytes = ~1MB)
-            java.nio.ByteBuffer stripDirect = java.nio.ByteBuffer.allocateDirect(fullW * stripMaxH * 2);
+            // Allocate single direct buffer once per image (3976 * 64 * 2 bytes = ~508 KB)
+            java.nio.ByteBuffer stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2);
 
             BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inSampleSize = 1; // STRICT: True 42.4MP Resolution (No subsampling!)
+            opts.inSampleSize = (srcW > 4000) ? 2 : 1; // Native 1/2 DCT downsampling: 7952x5304 -> 3976x2652
             opts.inPreferredConfig = Bitmap.Config.RGB_565;
             opts.inDither = false;
             opts.inMutable = true;
 
             boolean streamSuccess = true;
+            int outputRowOffset = 0;
             try {
                 for (int stripIdx = 0; stripIdx < numStrips; stripIdx++) {
-                    int rowOffset = stripIdx * stripMaxH;
-                    int stripH = Math.min(stripMaxH, fullH - rowOffset);
-                    Rect rect = new Rect(0, rowOffset, fullW, rowOffset + stripH);
+                    int srcY = stripIdx * srcStripH;
+                    int currentSrcH = Math.min(srcStripH, srcH - srcY);
+                    Rect rect = new Rect(0, srcY, srcW, srcY + currentSrcH);
 
                     Bitmap stripBmp = null;
                     try {
                         stripBmp = decoder.decodeRegion(rect, opts);
                         if (stripBmp == null) {
-                            Log.e(TAG, "decodeRegion returned null for strip at row " + rowOffset);
+                            Log.e(TAG, "decodeRegion returned null for strip at source row " + srcY);
                             streamSuccess = false;
                             break;
                         }
+                        int outStripW = stripBmp.getWidth();  // 3976
+                        int outStripH = stripBmp.getHeight(); // 64 (or 28 for final strip)
+
                         stripDirect.clear();
                         stripBmp.copyPixelsToBuffer(stripDirect);
                         stripDirect.rewind();
+
+                        // Native C fused grading (deterministic row-seeded PRNG) + JPEG stream write
+                        boolean stripOk = ColorEngine.gradeAndWriteStreamStripSafe(
+                            streamHandle, stripDirect, outStripW, outStripH, outputRowOffset, grainStrength, clarityStrength
+                        );
+                        if (!stripOk) {
+                            Log.e(TAG, "Failed encoding strip at output row " + outputRowOffset);
+                            streamSuccess = false;
+                            break;
+                        }
+                        outputRowOffset += outStripH;
                     } finally {
                         // Crucial: immediately recycle strip Bitmap before decoding next row block
                         if (stripBmp != null && !stripBmp.isRecycled()) {
                             stripBmp.recycle();
                             stripBmp = null;
                         }
-                    }
-
-                    // Native C fused grading (deterministic row-seeded PRNG) + JPEG stream write
-                    boolean stripOk = ColorEngine.gradeAndWriteStreamStripSafe(
-                        streamHandle, stripDirect, fullW, stripH, rowOffset, grainStrength, clarityStrength
-                    );
-                    if (!stripOk) {
-                        Log.e(TAG, "Failed encoding strip at row " + rowOffset);
-                        streamSuccess = false;
-                        break;
                     }
                 }
             } finally {
@@ -434,8 +445,8 @@ public class CaptureController {
                 }
                 gradedSavedPath = targetOutputFile.getAbsolutePath();
 
-                // 8. Copy original camera EXIF metadata from DSC0xxxx.JPG to fuji_xxxx.jpg
-                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName);
+                // 8. Copy original camera EXIF metadata from DSC0xxxx.JPG to fuji_xxxx.jpg with 10.6MP dimensions
+                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
 
                 // 9. Register with Sony AvindexStore
                 StorageResolver.registerWithAvindex(context, gradedSavedPath);
@@ -447,10 +458,10 @@ public class CaptureController {
             }
 
             final long totalMs = System.currentTimeMillis() - captureStartTime;
-            final float mp = (float)(fullW * fullH) / 1000000.0f;
+            final float mp = (float)(dstW * dstH) / 1000000.0f;
             final String savedFileName = (gradedSavedPath != null) ? new File(gradedSavedPath).getName() : String.format(Locale.US, "fuji_%04d.jpg", seqNum);
             final String telemetry = String.format(Locale.US, "SAVED %s (%dx%d | %.1fMP) in %dms",
-                savedFileName, fullW, fullH, mp, totalMs);
+                savedFileName, dstW, dstH, mp, totalMs);
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
@@ -461,7 +472,7 @@ public class CaptureController {
             }
             if (reviewBmp != null) {
                 if (uiController != null) uiController.showQuickReview(reviewBmp);
-                deliverResult(reviewBmp, presetName, fullW, fullH, totalMs, gradedSavedPath);
+                deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, gradedSavedPath);
             }
 
         } catch (Throwable t) {

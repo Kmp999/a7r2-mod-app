@@ -429,6 +429,14 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeWriteStreamS
 }
 
 /**
+ * Direct alias for native_write_jpeg_strip
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeWriteJpegStrip(
+    JNIEnv *env, jclass clazz, jlong handle, jobject directBuffer, jint stripW, jint stripH, jint rowOffset) {
+    return Java_com_fujilite_a7r2_ColorEngine_nativeWriteStreamStrip(env, clazz, handle, directBuffer, stripW, stripH, rowOffset);
+}
+
+/**
  * Grades an RGB_565 strip buffer with 17^3 3D LUT + Grain + Clarity and writes it directly to the JPEG stream.
  */
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWriteStreamStrip(

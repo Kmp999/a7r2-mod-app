@@ -25,9 +25,9 @@ class TestDualPath42MP(unittest.TestCase):
         self.assertIn("SAVED 42.4MP", content)
 
     def test_proxy_uses_heap_safe_sample_size(self):
-        """Verify full resolution strip decoding uses sample=1 without downscaling."""
+        """Verify 42.4MP strip decoding uses sample=2 for clean 2x downsampling without upscaling artifacts."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("opts.inSampleSize = 1", content)
+        self.assertIn("opts.inSampleSize = (srcW > 4000) ? 2 : 1", content)
         self.assertIn("opts.inPreferredConfig = Bitmap.Config.RGB_565", content)
 
     def test_instant_preview_restoration_called(self):
@@ -55,17 +55,17 @@ class TestDualPath42MP(unittest.TestCase):
         self.assertIn('android:largeHeap="true"', manifest_content)
 
     def test_10_6mp_dynamic_sampling(self):
-        """Verify CaptureController enforces 64-row strips and true 42.4MP resolution."""
+        """Verify CaptureController decodes 128 source rows at a time for 508KB RAM footprint."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("stripMaxH = 64", content)
-        self.assertIn("opts.inSampleSize = 1", content)
+        self.assertIn("srcStripH = 128", content)
+        self.assertIn("opts.inSampleSize = (srcW > 4000) ? 2 : 1", content)
 
     def test_sony_adapter_configures_small_image_size(self):
-        """Verify SonyPmcaAdapter configures BIONZ X ImageSize to small (~10.6MP)."""
+        """Verify SonyPmcaAdapter configures BIONZ X ImageSize to large (42.4MP: 7952x5304)."""
         adapter_file = self.root / "src" / "camera" / "SonyPmcaAdapter.java"
         adapter_content = adapter_file.read_text(encoding="utf-8")
-        self.assertIn('"small"', adapter_content)
-        self.assertIn("s.width >= 3500", adapter_content)
+        self.assertIn('"large"', adapter_content)
+        self.assertIn("s.width >= 7000", adapter_content)
 
     def test_hardware_direct_capture_bypasses_hal_proxy(self):
         """Verify takeHardwarePicture passes (shutterCallback, null, null) to bypass 1.7MP HAL proxy."""
@@ -82,10 +82,10 @@ class TestDualPath42MP(unittest.TestCase):
         self.assertIn("JPEG, 94, out", storage_content)
 
     def test_hardware_mapper_preserves_10_6mp_and_single_drive(self):
-        """Verify SonyToFujiHardwareMapper preserves 10.6MP ImageSize and Single DriveMode."""
+        """Verify SonyToFujiHardwareMapper preserves 42.4MP ImageSize and Single DriveMode."""
         mapper_file = self.root / "src" / "camera" / "SonyToFujiHardwareMapper.java"
         mapper_content = mapper_file.read_text(encoding="utf-8")
-        self.assertIn('"small"', mapper_content)
+        self.assertIn('"large"', mapper_content)
         self.assertIn('"single"', mapper_content)
 
     def test_lut_cube_17_performance_optimizations(self):
