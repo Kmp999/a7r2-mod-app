@@ -212,7 +212,7 @@ public class ColorEngine {
             int w = bitmap.getWidth();
             int h = bitmap.getHeight();
             int requiredBytes = w * h * 2;
-            java.nio.ByteBuffer directBuf = MemoryPool.acquireFreeSlot();
+            java.nio.ByteBuffer directBuf = MemoryPool.acquireProxySlot();
             if (directBuf != null && directBuf.capacity() >= requiredBytes) {
                 directBuf.clear();
                 bitmap.copyPixelsToBuffer(directBuf);
@@ -258,7 +258,7 @@ public class ColorEngine {
         java.nio.ByteBuffer srcDirect, int srcW, int srcH,
         java.nio.ByteBuffer dstDirect, int dstW, int dstH,
         int grainStrength, int clarityStrength, String outputPath) {
-        if (!sNativeAvailable || srcDirect == null || dstDirect == null || outputPath == null) return false;
+        if (!sNativeAvailable || srcDirect == null || outputPath == null) return false;
         try {
             return gradeUpscaleAndSave10MpNative(srcDirect, srcW, srcH, dstDirect, dstW, dstH, grainStrength, clarityStrength, outputPath);
         } catch (Throwable t) {

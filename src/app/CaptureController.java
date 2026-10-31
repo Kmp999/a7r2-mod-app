@@ -159,8 +159,10 @@ public class CaptureController {
                 public void onPictureTaken(final byte[] jpegData, Camera camera) {
                     watchdogHandler.removeCallbacks(captureWatchdogRunnable);
                     try {
-                        // 1. Immediately restore Live View EVF/LCD (< 150ms)
+                        // 1. Immediately cancel take picture and restore Live View EVF/LCD (< 20ms)
+                        cameraAdapter.cancelTakePicture();
                         setState(CameraState.RESTORING_PREVIEW);
+                        cameraAdapter.resumePreview();
                         restorePreviewWithWatchdog(3);
 
                         if (jpegData == null || jpegData.length == 0) {
@@ -171,7 +173,7 @@ public class CaptureController {
                         // 2. Synchronize DCF Sequence Number
                         final int seqNum = StorageResolver.allocateNextSequenceNumber();
 
-                        // 3. Grade with 3D LUT and save FUJIxxxx.JPG in background thread
+                        // 3. Immediately hand off jpegData to background processingExecutor and return
                         processingExecutor.execute(new Runnable() {
                             @Override
                             public void run() {
@@ -179,6 +181,11 @@ public class CaptureController {
                             }
                         });
 
+                    } catch (Throwable t) {
+                        Log.e(TAG, "onPictureTaken error", t);
+                        if (uiController != null) {
+                            uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                        }
                     } finally {
                         isCapturing.set(false);
                     }
@@ -192,6 +199,9 @@ public class CaptureController {
             isCapturing.set(false);
             setState(CameraState.IDLE_PREVIEW);
             appState.setProcessing(false);
+            if (uiController != null) {
+                uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
             return false;
         }
     }
@@ -321,35 +331,46 @@ public class CaptureController {
             boolean nativeSuccess = false;
 
             // 4. Ultra-Fast Zero-GC Native Pipeline:
-            // Grades 1616x1080 sensor frame, upscales to 10.6MP (3984x2656) in native 22MB buffer,
+            // Grades 1616x1080 sensor frame, upscales to 10.6MP (3984x2656) via strip streaming,
             // and encodes directly to JPEG on SD card as fuji_%04d.jpg in < 650ms total.
             java.nio.ByteBuffer srcDirect = MemoryPool.acquireProxySlot();
-            java.nio.ByteBuffer dstDirect = MemoryPool.acquireFreeSlot();
+            java.nio.ByteBuffer dstDirect = null; // No 22MB buffer needed! Strip streaming used.
 
-            if (srcDirect != null && dstDirect != null && ColorEngine.isNativeAvailable()) {
+            if (srcDirect != null && ColorEngine.isNativeAvailable()) {
                 try {
                     srcDirect.clear();
                     srcBmp.copyPixelsToBuffer(srcDirect);
                     srcDirect.rewind();
 
+                    // 1. Grade 1.7MP proxy in native memory (~70ms)
+                    ColorEngine.nativeApplyLutAndGrainDirect(srcDirect, srcW, srcH, grainStrength, clarityStrength);
+                    srcDirect.rewind();
+                    srcBmp.copyPixelsFromBuffer(srcDirect);
+
+                    // 2. Immediately display on camera LCD (< 300ms)
+                    if (uiController != null) uiController.showQuickReview(srcBmp);
+
+                    // 3. Strip-streaming upscale + baseline JPEG write to disk (< 500ms, 127KB RAM)
+                    srcDirect.rewind();
                     nativeSuccess = ColorEngine.gradeUpscaleAndSave10MpNativeSafe(
                         srcDirect, srcW, srcH,
                         dstDirect, targetW, targetH,
-                        grainStrength, clarityStrength,
+                        0, 0,
                         targetPath
                     );
 
                     if (nativeSuccess) {
-                        srcDirect.rewind();
-                        srcBmp.copyPixelsFromBuffer(srcDirect); // Graded preview for instant LCD display
                         gradedSavedPath = targetPath;
                         StorageResolver.postProcessGradedFile(context, targetPath, seqNum, presetName);
+                        StorageResolver.cleanupUnfilteredRawFiles(seqNum);
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "Native 10.6MP capture pipeline error, falling back", t);
+                    if (uiController != null) {
+                        uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    }
                 } finally {
                     MemoryPool.releaseSlot(srcDirect);
-                    MemoryPool.releaseSlot(dstDirect);
                 }
             }
 
@@ -385,6 +406,9 @@ public class CaptureController {
 
         } catch (Throwable t) {
             Log.e(TAG, "Error in processAndUpscaleCapture", t);
+            if (uiController != null) {
+                uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
         } finally {
             appState.setProcessing(false);
             System.gc();

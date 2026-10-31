@@ -22,6 +22,22 @@ extern "C" {
  */
 int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int width, int height, int quality);
 
+/**
+ * Strip-streaming edge-directed upscaler + JPEG encoder.
+ * Upscales 16 rows at a time and encodes immediately, eliminating the need
+ * for a 22MB intermediate buffer.
+ *
+ * @param filename Target file path
+ * @param src_pixels Source pixels in RGB565 (typically 1616x1080)
+ * @param srcW Source width
+ * @param srcH Source height
+ * @param dstW Target width (typically 3984)
+ * @param dstH Target height (typically 2656)
+ * @param quality JPEG quality
+ * @return 1 on success, 0 on failure
+ */
+int native_upscale_and_write_jpeg_rgb565(const char* filename, const uint16_t* src_pixels, int srcW, int srcH, int dstW, int dstH, int quality);
+
 #ifdef __cplusplus
 }
 #endif

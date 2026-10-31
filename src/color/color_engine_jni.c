@@ -397,16 +397,14 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_gradeUpscaleAndSav
     jobject dstDirect, jint dstW, jint dstH,
     jint grainStrength, jint clarityStrength,
     jstring outputPath) {
-    if (srcDirect == NULL || dstDirect == NULL || outputPath == NULL ||
+    if (srcDirect == NULL || outputPath == NULL ||
         srcW <= 1 || srcH <= 1 || dstW <= 1 || dstH <= 1) {
         LOGE("gradeUpscaleAndSave10MpNative: Invalid parameters");
         return JNI_FALSE;
     }
 
     uint16_t* src_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, srcDirect);
-    uint16_t* dst_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, dstDirect);
-
-    if (src_pixels == NULL || dst_pixels == NULL) {
+    if (src_pixels == NULL) {
         LOGE("gradeUpscaleAndSave10MpNative: DirectBuffer address is null");
         return JNI_FALSE;
     }
@@ -421,12 +419,20 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_gradeUpscaleAndSav
     lut17_process_rgb565_advanced(&g_lut17, src_pixels, (int)srcW, (int)srcH,
                                   (int)grainStrength, (int)clarityStrength);
 
-    // 2. Edge-directed upscaling to 10.6 MP (3984 x 2656) into pre-allocated 22MB native buffer
-    upscaler_edge_directed_rgb565(src_pixels, (int)srcW, (int)srcH,
-                                  dst_pixels, (int)dstW, (int)dstH);
-
-    // 3. Write JPEG directly to SD card
-    int ok = native_write_jpeg_rgb565(path, dst_pixels, (int)dstW, (int)dstH, 92);
+    int ok = 0;
+    if (dstDirect != NULL) {
+        uint16_t* dst_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, dstDirect);
+        if (dst_pixels != NULL) {
+            // 2. Edge-directed upscaling to 10.6 MP into pre-allocated buffer
+            upscaler_edge_directed_rgb565(src_pixels, (int)srcW, (int)srcH,
+                                          dst_pixels, (int)dstW, (int)dstH);
+            // 3. Write JPEG directly to SD card
+            ok = native_write_jpeg_rgb565(path, dst_pixels, (int)dstW, (int)dstH, 92);
+        }
+    } else {
+        // Strip streaming upscale + save without 22MB buffer
+        ok = native_upscale_and_write_jpeg_rgb565(path, src_pixels, (int)srcW, (int)srcH, (int)dstW, (int)dstH, 92);
+    }
 
     (*env)->ReleaseStringUTFChars(env, outputPath, path);
     return ok ? JNI_TRUE : JNI_FALSE;

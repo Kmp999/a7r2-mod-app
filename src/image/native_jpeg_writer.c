@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
 static const uint8_t ZIGZAG[64] = {
      0, 1, 8,16, 9, 2, 3,10,17,24,32,25,18,11, 4, 5, 12,19,26,33,40,48,41,34,27,20,13, 6, 7,14,21,28,
@@ -39,6 +40,7 @@ static const uint8_t DHT_MARKER_DATA[] = {
     0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,0xF9,0xFA
 };
 
+// Kept for compatibility check
 static const int16_t DCT_M[8][8] = {
     { 362, 362, 362, 362, 362, 362, 362, 362}, { 502, 426, 284, 100,-100,-284,-426,-502},
     { 473, 196,-196,-473,-473,-196, 196, 473}, { 426,-100,-502,-284, 284, 502, 100,-426},
@@ -46,10 +48,31 @@ static const int16_t DCT_M[8][8] = {
     { 196,-473, 473,-196,-196, 473,-473, 196}, { 100,-284, 426,-502, 502,-426, 284,-100}
 };
 
-typedef struct { FILE* fp; uint32_t buf; int bits; } BitWriter;
+// Buffered BitWriter
+typedef struct {
+    FILE* fp;
+    uint32_t buf;
+    int bits;
+    uint8_t obuf[32768];
+    int opos;
+} BitWriter;
 
-static void bw_put_byte(BitWriter* bw, uint8_t b) { fputc(b, bw->fp); if (b == 0xFF) fputc(0x00, bw->fp); }
-static void bw_put_bits(BitWriter* bw, uint32_t code, int len) {
+static inline void bw_put_byte(BitWriter* bw, uint8_t b) {
+    bw->obuf[bw->opos++] = b;
+    if (bw->opos >= 32760) {
+        fwrite(bw->obuf, 1, bw->opos, bw->fp);
+        bw->opos = 0;
+    }
+    if (b == 0xFF) {
+        bw->obuf[bw->opos++] = 0x00;
+        if (bw->opos >= 32760) {
+            fwrite(bw->obuf, 1, bw->opos, bw->fp);
+            bw->opos = 0;
+        }
+    }
+}
+
+static inline void bw_put_bits(BitWriter* bw, uint32_t code, int len) {
     bw->buf = (bw->buf << len) | (code & ((1 << len) - 1));
     bw->bits += len;
     while (bw->bits >= 8) {
@@ -57,11 +80,17 @@ static void bw_put_bits(BitWriter* bw, uint32_t code, int len) {
         bw_put_byte(bw, (uint8_t)(bw->buf >> bw->bits));
     }
 }
+
 static void bw_flush(BitWriter* bw) {
     if (bw->bits > 0) {
         bw->buf = (bw->buf << (8 - bw->bits)) | ((1 << (8 - bw->bits)) - 1);
         bw_put_byte(bw, (uint8_t)bw->buf);
-        bw->buf = 0; bw->bits = 0;
+        bw->buf = 0;
+        bw->bits = 0;
+    }
+    if (bw->opos > 0) {
+        fwrite(bw->obuf, 1, bw->opos, bw->fp);
+        bw->opos = 0;
     }
 }
 
@@ -84,28 +113,62 @@ static inline void get_cat_bits(int val, int* cat, int* bits) {
     *bits = (val < 0) ? ((val - 1) & ((1 << c) - 1)) : val;
 }
 
-static void encode_block(BitWriter* bw, const int16_t* in_block, const uint8_t* q_table,
-                         const uint16_t* dc_codes, const uint8_t* dc_sizes,
-                         const uint16_t* ac_codes, const uint8_t* ac_sizes, int* last_dc) {
-    int16_t row_t[8][8];
-    for (int y = 0; y < 8; y++) {
-        for (int u = 0; u < 8; u++) {
-            int s = 0;
-            for (int x = 0; x < 8; x++) s += in_block[y * 8 + x] * DCT_M[u][x];
-            row_t[y][u] = (int16_t)((s + 256) >> 9);
-        }
+// Fast 1D FDCT (AAN algorithm)
+static inline void fdct_1d(int16_t* blk) {
+    for (int i=0; i<8; i++) {
+        int16_t* r = blk + i*8;
+        int s0 = r[0] + r[7], s1 = r[1] + r[6], s2 = r[2] + r[5], s3 = r[3] + r[4];
+        int d0 = r[0] - r[7], d1 = r[1] - r[6], d2 = r[2] - r[5], d3 = r[3] - r[4];
+        
+        int t0 = s0 + s3, t1 = s1 + s2, t2 = s1 - s2, t3 = s0 - s3;
+        r[0] = (t0 + t1); r[4] = (t0 - t1);
+        int z1 = (t2 + t3) * 4433; // 4433 = 0.54119610 * 8192
+        r[2] = (t3 * 8192 + z1) >> 13; r[6] = (t3 * 8192 - z1) >> 13;
+        
+        int t4 = d1 + d2, t5 = d0 + d3, t6 = d0 + d2, t7 = d1 + d3;
+        int z5 = (t6 - t7) * 9633; // 1.175875602 * 8192
+        int z2 = t4 * 2446; // 0.298631336
+        int z3 = t6 * 16819; // 2.053119869
+        int z4 = t7 * 24810; // 3.027378108
+        int z11 = t7 * 12282; // 1.5
+        r[1] = (z4 + z5 + t5 * 8192) >> 13;
+        r[3] = (z3 + z5 - t5 * 8192) >> 13;
+        r[5] = (z2 + z5 + t5 * 8192) >> 13;
+        r[7] = (z11 + z5 - t5 * 8192) >> 13;
     }
+    for (int i=0; i<8; i++) {
+        int16_t* r = blk + i;
+        int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
+        int d0 = r[0] - r[56], d1 = r[8] - r[48], d2 = r[16] - r[40], d3 = r[24] - r[32];
+        
+        int t0 = s0 + s3, t1 = s1 + s2, t2 = s1 - s2, t3 = s0 - s3;
+        r[0] = (t0 + t1); r[32] = (t0 - t1);
+        int z1 = (t2 + t3) * 4433;
+        r[16] = (t3 * 8192 + z1) >> 16; r[48] = (t3 * 8192 - z1) >> 16; // Shift 16 incorporates AAN scaling
+        
+        int t4 = d1 + d2, t5 = d0 + d3, t6 = d0 + d2, t7 = d1 + d3;
+        int z5 = (t6 - t7) * 9633;
+        int z2 = t4 * 2446, z3 = t6 * 16819, z4 = t7 * 24810, z11 = t7 * 12282;
+        r[8] = (z4 + z5 + t5 * 8192) >> 16;
+        r[24] = (z3 + z5 - t5 * 8192) >> 16;
+        r[40] = (z2 + z5 + t5 * 8192) >> 16;
+        r[56] = (z11 + z5 - t5 * 8192) >> 16;
+    }
+}
+
+static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q,
+                              const uint16_t* dc_codes, const uint8_t* dc_sizes,
+                              const uint16_t* ac_codes, const uint8_t* ac_sizes, int* last_dc) {
+    fdct_1d(blk);
     int16_t q_block[64];
-    for (int v = 0; v < 8; v++) {
-        for (int u = 0; u < 8; u++) {
-            int s = 0;
-            for (int y = 0; y < 8; y++) s += row_t[y][u] * DCT_M[v][y];
-            int coeff = (s + 1024) >> 11;
-            int q = q_table[v * 8 + u];
-            coeff = (coeff >= 0) ? ((coeff + (q >> 1)) / q) : -(((-coeff) + (q >> 1)) / q);
-            q_block[ZIGZAG[v * 8 + u]] = (int16_t)coeff;
-        }
+    for (int i = 0; i < 64; i++) {
+        int coeff = blk[i];
+        int sign = coeff < 0;
+        int abs_c = sign ? -coeff : coeff;
+        int q_val = (abs_c * inv_q[i] + 32768) >> 16;
+        q_block[ZIGZAG[i]] = (int16_t)(sign ? -q_val : q_val);
     }
+    
     int diff = q_block[0] - *last_dc;
     *last_dc = q_block[0];
     int cat, bits;
@@ -127,31 +190,20 @@ static void encode_block(BitWriter* bw, const int16_t* in_block, const uint8_t* 
     if (r > 0) bw_put_bits(bw, ac_codes[0x00], ac_sizes[0x00]);
 }
 
-int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int width, int height, int quality) {
-    if (!filename || !rgb565 || width <= 0 || height <= 0) return 0;
-    FILE* fp = fopen(filename, "wb");
-    if (!fp) return 0;
-
+static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma, uint16_t* inv_q_luma, uint16_t* inv_q_chroma) {
     int q = quality < 1 ? 1 : (quality > 100 ? 100 : quality);
     int s = (q < 50) ? (5000 / q) : (200 - q * 2);
-    uint8_t q_luma[64], q_chroma[64];
     for (int i = 0; i < 64; i++) {
         int vl = (BASE_Q_LUMA[i] * s + 50) / 100;
         int vc = (BASE_Q_CHROMA[i] * s + 50) / 100;
         q_luma[i] = (uint8_t)(vl < 1 ? 1 : (vl > 255 ? 255 : vl));
         q_chroma[i] = (uint8_t)(vc < 1 ? 1 : (vc > 255 ? 255 : vc));
+        inv_q_luma[i] = (uint16_t)((65536 + (q_luma[i] >> 1)) / q_luma[i]);
+        inv_q_chroma[i] = (uint16_t)((65536 + (q_chroma[i] >> 1)) / q_chroma[i]);
     }
+}
 
-    uint16_t dc_luma_c[256], ac_luma_c[256], dc_chroma_c[256], ac_chroma_c[256];
-    uint8_t dc_luma_s[256], ac_luma_s[256], dc_chroma_s[256], ac_chroma_s[256];
-    memset(dc_luma_s, 0, sizeof(dc_luma_s)); memset(ac_luma_s, 0, sizeof(ac_luma_s));
-    memset(dc_chroma_s, 0, sizeof(dc_chroma_s)); memset(ac_chroma_s, 0, sizeof(ac_chroma_s));
-
-    build_huff_table(&DHT_MARKER_DATA[1], &DHT_MARKER_DATA[17], dc_luma_c, dc_luma_s);
-    build_huff_table(&DHT_MARKER_DATA[30], &DHT_MARKER_DATA[46], ac_luma_c, ac_luma_s);
-    build_huff_table(&DHT_MARKER_DATA[209], &DHT_MARKER_DATA[225], dc_chroma_c, dc_chroma_s);
-    build_huff_table(&DHT_MARKER_DATA[238], &DHT_MARKER_DATA[254], ac_chroma_c, ac_chroma_s);
-
+static void write_headers(FILE* fp, int width, int height, uint8_t* q_luma, uint8_t* q_chroma) {
     static const uint8_t APP0_HDR[] = { 0xFF,0xD8, 0xFF,0xE0, 0,16, 'J','F','I','F',0, 1,1, 0, 0,1, 0,1, 0,0 };
     fwrite(APP0_HDR, 1, sizeof(APP0_HDR), fp);
     fputc(0xFF, fp); fputc(0xDB, fp); fputc(0x00, fp); fputc(0x84, fp); fputc(0x00, fp);
@@ -170,8 +222,31 @@ int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int w
 
     static const uint8_t SOS_HDR[] = { 0xFF,0xDA, 0,12, 3, 1,0x00, 2,0x11, 3,0x11, 0,63,0 };
     fwrite(SOS_HDR, 1, sizeof(SOS_HDR), fp);
+}
+
+int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int width, int height, int quality) {
+    if (!filename || !rgb565 || width <= 0 || height <= 0) return 0;
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) return 0;
+
+    uint8_t q_luma[64], q_chroma[64];
+    uint16_t inv_q_luma[64], inv_q_chroma[64];
+    compute_quant_tables(quality, q_luma, q_chroma, inv_q_luma, inv_q_chroma);
+
+    uint16_t dc_luma_c[256], ac_luma_c[256], dc_chroma_c[256], ac_chroma_c[256];
+    uint8_t dc_luma_s[256], ac_luma_s[256], dc_chroma_s[256], ac_chroma_s[256];
+    memset(dc_luma_s, 0, sizeof(dc_luma_s)); memset(ac_luma_s, 0, sizeof(ac_luma_s));
+    memset(dc_chroma_s, 0, sizeof(dc_chroma_s)); memset(ac_chroma_s, 0, sizeof(ac_chroma_s));
+
+    build_huff_table(&DHT_MARKER_DATA[1], &DHT_MARKER_DATA[17], dc_luma_c, dc_luma_s);
+    build_huff_table(&DHT_MARKER_DATA[30], &DHT_MARKER_DATA[46], ac_luma_c, ac_luma_s);
+    build_huff_table(&DHT_MARKER_DATA[209], &DHT_MARKER_DATA[225], dc_chroma_c, dc_chroma_s);
+    build_huff_table(&DHT_MARKER_DATA[238], &DHT_MARKER_DATA[254], ac_chroma_c, ac_chroma_s);
+
+    write_headers(fp, width, height, q_luma, q_chroma);
 
     BitWriter bw = { fp, 0, 0 };
+    bw.opos = 0;
     int last_dc[3] = { 0, 0, 0 };
     int16_t y_block[4][64], cb_block[64], cr_block[64];
 
@@ -205,9 +280,128 @@ int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int w
                     }
                 }
             }
-            for (int i = 0; i < 4; i++) encode_block(&bw, y_block[i], q_luma, dc_luma_c, dc_luma_s, ac_luma_c, ac_luma_s, &last_dc[0]);
-            encode_block(&bw, cb_block, q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[1]);
-            encode_block(&bw, cr_block, q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[2]);
+            for (int i = 0; i < 4; i++) encode_block_fast(&bw, y_block[i], inv_q_luma, dc_luma_c, dc_luma_s, ac_luma_c, ac_luma_s, &last_dc[0]);
+            encode_block_fast(&bw, cb_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[1]);
+            encode_block_fast(&bw, cr_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[2]);
+        }
+    }
+    bw_flush(&bw);
+    fputc(0xFF, fp); fputc(0xD9, fp);
+    fclose(fp);
+    return 1;
+}
+
+// 16-row Strip Streaming Upscaler and JPEG encoder
+int native_upscale_and_write_jpeg_rgb565(const char* filename, const uint16_t* src_pixels, int srcW, int srcH, int dstW, int dstH, int quality) {
+    if (!filename || !src_pixels || srcW <= 1 || srcH <= 1 || dstW <= 1 || dstH <= 1) return 0;
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) return 0;
+
+    uint8_t q_luma[64], q_chroma[64];
+    uint16_t inv_q_luma[64], inv_q_chroma[64];
+    compute_quant_tables(quality, q_luma, q_chroma, inv_q_luma, inv_q_chroma);
+
+    uint16_t dc_luma_c[256], ac_luma_c[256], dc_chroma_c[256], ac_chroma_c[256];
+    uint8_t dc_luma_s[256], ac_luma_s[256], dc_chroma_s[256], ac_chroma_s[256];
+    memset(dc_luma_s, 0, sizeof(dc_luma_s)); memset(ac_luma_s, 0, sizeof(ac_luma_s));
+    memset(dc_chroma_s, 0, sizeof(dc_chroma_s)); memset(ac_chroma_s, 0, sizeof(ac_chroma_s));
+
+    build_huff_table(&DHT_MARKER_DATA[1], &DHT_MARKER_DATA[17], dc_luma_c, dc_luma_s);
+    build_huff_table(&DHT_MARKER_DATA[30], &DHT_MARKER_DATA[46], ac_luma_c, ac_luma_s);
+    build_huff_table(&DHT_MARKER_DATA[209], &DHT_MARKER_DATA[225], dc_chroma_c, dc_chroma_s);
+    build_huff_table(&DHT_MARKER_DATA[238], &DHT_MARKER_DATA[254], ac_chroma_c, ac_chroma_s);
+
+    write_headers(fp, dstW, dstH, q_luma, q_chroma);
+
+    BitWriter bw = { fp, 0, 0 };
+    bw.opos = 0;
+    int last_dc[3] = { 0, 0, 0 };
+    int16_t y_block[4][64], cb_block[64], cr_block[64];
+    
+    // 128KB buffer for 16 rows of dstW (max width 4096)
+    uint16_t strip_buf[16 * 4096]; 
+    
+    // Scale logic
+    uint32_t scale_x = (uint32_t)(((uint64_t)(srcW - 1) << 16) / (dstW - 1));
+    uint32_t scale_y = (uint32_t)(((uint64_t)(srcH - 1) << 16) / (dstH - 1));
+
+    for (int my = 0; my < dstH; my += 16) {
+        // Upscale 16 rows
+        for (int dy = 0; dy < 16; dy++) {
+            int target_y = my + dy;
+            if (target_y >= dstH) target_y = dstH - 1;
+            
+            uint32_t src_y_fp = target_y * scale_y;
+            int y0 = (int)(src_y_fp >> 16);
+            int y1 = (y0 < srcH - 1) ? y0 + 1 : y0;
+            int y_frac = (src_y_fp >> 8) & 0xFF; // Q8
+            int inv_y = 256 - y_frac;
+
+            const uint16_t* row0 = &src_pixels[y0 * srcW];
+            const uint16_t* row1 = &src_pixels[y1 * srcW];
+            uint16_t* dst_row = &strip_buf[dy * dstW];
+
+            for (int dx = 0; dx < dstW; dx++) {
+                uint32_t src_x_fp = dx * scale_x;
+                int x0 = (int)(src_x_fp >> 16);
+                int x1 = (x0 < srcW - 1) ? x0 + 1 : x0;
+                int x_frac = (src_x_fp >> 8) & 0xFF; // Q8
+                int inv_x = 256 - x_frac;
+
+                uint16_t p00 = row0[x0], p10 = row0[x1];
+                uint16_t p01 = row1[x0], p11 = row1[x1];
+                
+                int r00 = (p00 >> 11) & 0x1F, g00 = (p00 >> 5) & 0x3F, b00 = p00 & 0x1F;
+                int r10 = (p10 >> 11) & 0x1F, g10 = (p10 >> 5) & 0x3F, b10 = p10 & 0x1F;
+                int r01 = (p01 >> 11) & 0x1F, g01 = (p01 >> 5) & 0x3F, b01 = p01 & 0x1F;
+                int r11 = (p11 >> 11) & 0x1F, g11 = (p11 >> 5) & 0x3F, b11 = p11 & 0x1F;
+
+                int w00 = (inv_x * inv_y) >> 8;
+                int w10 = (x_frac * inv_y) >> 8;
+                int w01 = (inv_x * y_frac) >> 8;
+                int w11 = (x_frac * y_frac) >> 8;
+                int total_w = w00 + w10 + w01 + w11;
+                if (total_w == 0) total_w = 1;
+
+                int r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) / total_w;
+                int g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) / total_w;
+                int b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) / total_w;
+
+                dst_row[dx] = (uint16_t)((r << 11) | (g << 5) | b);
+            }
+        }
+        
+        // Encode strip
+        for (int mx = 0; mx < dstW; mx += 16) {
+            for (int by = 0; by < 16; by++) {
+                const uint16_t* row = &strip_buf[by * dstW];
+                int b_idx = ((by >= 8) ? 2 : 0), sub_y = by & 7;
+
+                for (int bx = 0; bx < 16; bx++) {
+                    int px_idx = mx + bx;
+                    if (px_idx >= dstW) px_idx = dstW - 1;
+                    uint16_t px = row[px_idx];
+
+                    int r = (((px >> 11) & 0x1F) * 527 + 23) >> 6;
+                    int g = (((px >> 5) & 0x3F) * 259 + 33) >> 6;
+                    int b = ((px & 0x1F) * 527 + 23) >> 6;
+
+                    int y_val = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+                    int blk = b_idx + ((bx >= 8) ? 1 : 0), sub_x = bx & 7;
+                    y_block[blk][sub_y * 8 + sub_x] = (int16_t)(y_val - 128);
+
+                    if ((by & 1) == 0 && (bx & 1) == 0) {
+                        int cb_val = (-11059 * r - 21709 * g + 32768 * b + 32768) >> 16;
+                        int cr_val = (32768 * r - 27439 * g - 5329 * b + 32768) >> 16;
+                        int c_idx = (by >> 1) * 8 + (bx >> 1);
+                        cb_block[c_idx] = (int16_t)cb_val;
+                        cr_block[c_idx] = (int16_t)cr_val;
+                    }
+                }
+            }
+            for (int i = 0; i < 4; i++) encode_block_fast(&bw, y_block[i], inv_q_luma, dc_luma_c, dc_luma_s, ac_luma_c, ac_luma_s, &last_dc[0]);
+            encode_block_fast(&bw, cb_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[1]);
+            encode_block_fast(&bw, cr_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[2]);
         }
     }
     bw_flush(&bw);

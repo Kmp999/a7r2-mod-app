@@ -11,6 +11,7 @@ public interface CameraAdapter {
     void startPreview(Camera.PreviewCallback callback);
     void startPreview(SurfaceHolder holder);
     void takePicture(Camera.PictureCallback jpegCallback);
+    void cancelTakePicture();
     void resumePreview();
     void release();
     // TODO(SONY_SDK): Verify if we can set picture profiles natively here.

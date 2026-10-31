@@ -391,6 +391,19 @@ public class UIController {
         return false;
     }
 
+    public void showQuickReview(final android.graphics.Bitmap bmp) {
+        if (qMenuView != null) {
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (qMenuView != null) {
+                        qMenuView.showQuickReview(bmp);
+                    }
+                }
+            });
+        }
+    }
+
     public boolean handleRawKeyUp(int rawCode, KeyEvent event) {
         SonyKeyCodes.FujiAction action = SonyKeyCodes.resolveAction(rawCode, event);
 

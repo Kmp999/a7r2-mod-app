@@ -10,12 +10,10 @@ import java.nio.ByteBuffer;
 public final class MemoryPool {
     private static final String TAG = "MemoryPool";
 
-    public static final int BUFFER_CAPACITY = 22 * 1024 * 1024; // 22 MB (fits 10.6MP RGB_565 = ~21.1MB)
-    public static final int BUFFER_CAPACITY_FALLBACK = 6 * 1024 * 1024; // 6 MB fallback (fits 2.6MP)
+    // NO 22MB BUFFER: We stream 10.6MP directly to the JPEG encoder in 16-row strips (127KB)
+    public static final int BUFFER_CAPACITY = 22 * 1024 * 1024; // Deprecated: eliminated in favor of 127KB strip streaming
     public static final int PROXY_CAPACITY = 4 * 1024 * 1024; // 4 MB (fits 1616x1080 RGB_565 = ~3.5MB)
 
-    private static ByteBuffer sBuffer = null;
-    private static volatile boolean sInUse = false;
     private static ByteBuffer sProxyBuffer = null;
     private static volatile boolean sProxyInUse = false;
 
@@ -40,40 +38,22 @@ public final class MemoryPool {
     }
 
     public static synchronized void releaseProxySlot(ByteBuffer buffer) {
-        sProxyInUse = false;
-    }
-
-    public static synchronized ByteBuffer acquireFreeSlot() {
-        if (sInUse) return null;
-        if (sBuffer == null) {
-            try {
-                sBuffer = ByteBuffer.allocateDirect(BUFFER_CAPACITY);
-                Log.i(TAG, "Lazy direct grading buffer allocated (22 MB for 10.6MP)");
-            } catch (Throwable t) {
-                Log.w(TAG, "Failed to allocate 22MB direct buffer; attempting 6MB fallback", t);
-                try {
-                    sBuffer = ByteBuffer.allocateDirect(BUFFER_CAPACITY_FALLBACK);
-                    Log.i(TAG, "Lazy direct grading buffer allocated (6 MB fallback)");
-                } catch (Throwable t2) {
-                    Log.e(TAG, "Failed to allocate fallback direct buffer", t2);
-                    return null;
-                }
-            }
+        if (buffer == sProxyBuffer) {
+            sProxyInUse = false;
         }
-        sInUse = true;
-        sBuffer.clear();
-        return sBuffer;
     }
 
-    public static void markForIO(ByteBuffer buffer) {
-        // No-op
+    // Deprecated methods kept to prevent LinkageError, they now return proxy or null
+    public static synchronized ByteBuffer acquireFreeSlot() {
+        Log.w(TAG, "acquireFreeSlot() called, but 22MB buffer is eliminated. Use proxy slot.");
+        return null;
     }
+
+    public static void markForIO(ByteBuffer buffer) {}
 
     public static synchronized void releaseSlot(ByteBuffer buffer) {
         if (buffer == sProxyBuffer) {
             sProxyInUse = false;
-        } else {
-            sInUse = false;
         }
     }
 
