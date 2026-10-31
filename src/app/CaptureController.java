@@ -419,7 +419,17 @@ public class CaptureController {
                 // Fallback: Java BitmapRegionDecoder strip-streaming loop
                 long streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), dstW, dstH, 95);
                 if (streamHandle == 0) {
-                    Log.e(TAG, "Failed opening native JPEG stream at " + tmpFile.getAbsolutePath());
+                    Log.w(TAG, "Native stream unavailable, falling back to direct bitmap grading and saving modified image");
+                    Bitmap fallbackBmp = BitmapFactory.decodeFile(rawJpegPath);
+                    if (fallbackBmp == null && inMemoryJpegData != null) {
+                        fallbackBmp = BitmapFactory.decodeByteArray(inMemoryJpegData, 0, inMemoryJpegData.length);
+                    }
+                    if (fallbackBmp != null) {
+                        ColorEngine.applyLutAndGrainBitmapSafe(fallbackBmp, grainStrength, clarityStrength);
+                        String saved = StorageResolver.saveGradedJpegToSd(context, fallbackBmp, seqNum, presetName);
+                        long ms = System.currentTimeMillis() - captureStartTime;
+                        deliverResult(fallbackBmp, presetName, fallbackBmp.getWidth(), fallbackBmp.getHeight(), ms, saved);
+                    }
                     if (decoder != null) decoder.recycle();
                     return;
                 }
