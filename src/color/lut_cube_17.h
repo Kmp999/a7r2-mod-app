@@ -214,18 +214,19 @@ static inline void lut17_process_rgb565(const Lut17Context* lut, uint16_t* buffe
 }
 
 /**
- * Applies 17^3 3D LUT, Precomputed 64x64 Grain, Clarity Micro-Contrast,
- * and 2x2 Bayer Ordered Dithering in a single high-speed pass.
- * Optimized for ~10.6 MP (3984 x 2656) processing in < 350 ms on dual-core ARM Cortex-A9.
+ * Applies 17^3 3D LUT, Deterministic Row-Seeded Grain, Clarity Micro-Contrast,
+ * and 2x2 Bayer Ordered Dithering with seamless strip boundary support.
  *
+ * @param row_offset       Global scanline row offset for strip streaming (0 for full image)
  * @param grain_strength   0 = Off, 1 = Weak (~8), 2 = Strong (~16)
  * @param clarity_strength -5 to +5 (0 = Neutral)
  */
-static inline void lut17_process_rgb565_advanced(const Lut17Context* lut,
-                                                uint16_t* buffer,
-                                                int width, int height,
-                                                int grain_strength,
-                                                int clarity_strength) {
+static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* lut,
+                                                       uint16_t* buffer,
+                                                       int width, int height,
+                                                       int row_offset,
+                                                       int grain_strength,
+                                                       int clarity_strength) {
     if (!lut || !buffer || width <= 0 || height <= 0) return;
 
     init_static_grain_table();
@@ -233,8 +234,11 @@ static inline void lut17_process_rgb565_advanced(const Lut17Context* lut,
     int idx = 0;
 
     for (int y = 0; y < height; y++) {
-        const int8_t* bayer_row = BAYER_2X2[y & 1];
-        int grain_y_offset = (y & 63) << 6;
+        int global_y = row_offset + y;
+        const int8_t* bayer_row = BAYER_2X2[global_y & 1];
+        int grain_y_offset = (global_y & 63) << 6;
+        // Deterministic row-seeded PRNG state seeded by global_y for seamless strip boundaries
+        uint32_t rng_state = (uint32_t)(global_y * 1103515245U + 12345U);
         int prev_luma = 128;
 
         for (int x = 0; x < width; x++) {
@@ -251,10 +255,13 @@ static inline void lut17_process_rgb565_advanced(const Lut17Context* lut,
             // 3. Fast Rec.601 Luma calculation
             int luma = (or_val * 77 + og_val * 150 + ob_val * 29) >> 8;
 
-            // 4. Precomputed 64x64 Grain Lookup with Parabolic Midtone Envelope
+            // 4. Deterministic Grain with Parabolic Midtone Envelope (no horizontal strip seams)
             int grain_delta = 0;
             if (grain_scale > 0) {
-                int8_t raw_noise = STATIC_GRAIN_64x64[grain_y_offset | (x & 63)];
+                rng_state = rng_state * 1103515245U + 12345U;
+                int8_t lcg_noise = (int8_t)((rng_state >> 16) & 0x3F) - 32;
+                int8_t table_noise = STATIC_GRAIN_64x64[grain_y_offset | (x & 63)];
+                int8_t raw_noise = (int8_t)((lcg_noise + table_noise) >> 1);
                 int midtone_weight = (luma * (255 - luma)) >> 8; // Peaks at 128 (63), 0 at black/white
                 grain_delta = (raw_noise * grain_scale * midtone_weight) >> 8;
             }
@@ -267,7 +274,7 @@ static inline void lut17_process_rgb565_advanced(const Lut17Context* lut,
             }
             prev_luma = luma;
 
-            // 6. 2x2 Bayer Ordered Dithering
+            // 6. 2x2 Bayer Ordered Dithering (phase preserved across strips)
             int dither = bayer_row[x & 1];
 
             int total_delta = grain_delta + clarity_delta + dither;
@@ -282,6 +289,18 @@ static inline void lut17_process_rgb565_advanced(const Lut17Context* lut,
 }
 
 /**
+ * Applies 17^3 3D LUT, Precomputed Grain, Clarity Micro-Contrast,
+ * and 2x2 Bayer Ordered Dithering in a single pass starting at row 0.
+ */
+static inline void lut17_process_rgb565_advanced(const Lut17Context* lut,
+                                                uint16_t* buffer,
+                                                int width, int height,
+                                                int grain_strength,
+                                                int clarity_strength) {
+    lut17_process_rgb565_advanced_offset(lut, buffer, width, height, 0, grain_strength, clarity_strength);
+}
+
+/**
  * Backward compatibility wrapper for grain-only pass.
  */
 static inline void lut17_process_rgb565_with_grain(const Lut17Context* lut,
@@ -289,96 +308,6 @@ static inline void lut17_process_rgb565_with_grain(const Lut17Context* lut,
                                                    int width, int height,
                                                    int grain_strength) {
     lut17_process_rgb565_advanced(lut, buffer, width, height, grain_strength, 0);
-}
-
-/**
- * High-performance Edge-Directed Super-Resolution Upscaler for RGB_565.
- * Upscales 1.7 MP (1616 x 1080) to True 10.6 MP (3984 x 2656) with:
- *  - Fixed-point 16.16 coordinates & Q8 bilinear weights.
- *  - Edge-directed adaptive interpolation to prevent staircasing on diagonal edges.
- *  - 2x2 Bayer Ordered Dithering to eliminate color banding on 10.6 MP outputs.
- */
-static inline void upscaler_edge_directed_rgb565(const uint16_t* src, int src_w, int src_h,
-                                                 uint16_t* dst, int dst_w, int dst_h) {
-    if (!src || !dst || src_w <= 1 || src_h <= 1 || dst_w <= 1 || dst_h <= 1) return;
-
-    // 16.16 fixed-point scaling ratios
-    uint32_t scale_x = (uint32_t)(((uint64_t)(src_w - 1) << 16) / (dst_w - 1));
-    uint32_t scale_y = (uint32_t)(((uint64_t)(src_h - 1) << 16) / (dst_h - 1));
-
-    for (int dy = 0; dy < dst_h; dy++) {
-        uint32_t src_y_fp = dy * scale_y;
-        int y0 = (int)(src_y_fp >> 16);
-        int y1 = (y0 < src_h - 1) ? y0 + 1 : y0;
-        int y_frac = (src_y_fp >> 8) & 0xFF; // 0..255 (Q8)
-        int inv_y = 256 - y_frac;
-
-        const uint16_t* row0 = &src[y0 * src_w];
-        const uint16_t* row1 = &src[y1 * src_w];
-        uint16_t* dst_row = &dst[dy * dst_w];
-        const int8_t* bayer_row = BAYER_2X2[dy & 1];
-
-        for (int dx = 0; dx < dst_w; dx++) {
-            uint32_t src_x_fp = dx * scale_x;
-            int x0 = (int)(src_x_fp >> 16);
-            int x1 = (x0 < src_w - 1) ? x0 + 1 : x0;
-            int x_frac = (src_x_fp >> 8) & 0xFF; // 0..255 (Q8)
-            int inv_x = 256 - x_frac;
-
-            // Sample 4 neighboring pixels
-            uint16_t p00 = row0[x0];
-            uint16_t p10 = row0[x1];
-            uint16_t p01 = row1[x0];
-            uint16_t p11 = row1[x1];
-
-            // 1-cycle bit-replication unpacking to 8-bit
-            uint8_t r00, g00, b00; unpack_rgb565_fast(p00, &r00, &g00, &b00);
-            uint8_t r10, g10, b10; unpack_rgb565_fast(p10, &r10, &g10, &b10);
-            uint8_t r01, g01, b01; unpack_rgb565_fast(p01, &r01, &g01, &b01);
-            uint8_t r11, g11, b11; unpack_rgb565_fast(p11, &r11, &g11, &b11);
-
-            // Edge direction detection (Luma gradients)
-            int l00 = (r00 * 77 + g00 * 150 + b00 * 29) >> 8;
-            int l10 = (r10 * 77 + g10 * 150 + b10 * 29) >> 8;
-            int l01 = (r01 * 77 + g01 * 150 + b01 * 29) >> 8;
-            int l11 = (r11 * 77 + g11 * 150 + b11 * 29) >> 8;
-
-            int grad_main = abs(l00 - l11);
-            int grad_anti = abs(l10 - l01);
-
-            // Bilinear weights
-            int w00 = (inv_x * inv_y) >> 8;
-            int w10 = (x_frac * inv_y) >> 8;
-            int w01 = (inv_x * y_frac) >> 8;
-            int w11 = (x_frac * y_frac) >> 8;
-
-            // Adaptive diagonal edge emphasis
-            if (grad_main < grad_anti - 8) {
-                w00 += 12; w11 += 12;
-                w10 = (w10 > 12) ? w10 - 12 : 0;
-                w01 = (w01 > 12) ? w01 - 12 : 0;
-            } else if (grad_anti < grad_main - 8) {
-                w10 += 12; w01 += 12;
-                w00 = (w00 > 12) ? w00 - 12 : 0;
-                w11 = (w11 > 12) ? w11 - 12 : 0;
-            }
-
-            int total_w = w00 + w10 + w01 + w11;
-            if (total_w == 0) total_w = 1;
-
-            int r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) / total_w;
-            int g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) / total_w;
-            int b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) / total_w;
-
-            // 2x2 Bayer dithering
-            int dither = bayer_row[dx & 1];
-            int dr = clamp_u8_fast(r + dither);
-            int dg = clamp_u8_fast(g + (dither >> 1));
-            int db = clamp_u8_fast(b + dither);
-
-            dst_row[dx] = (uint16_t)(((dr >> 3) << 11) | ((dg >> 2) << 5) | (db >> 3));
-        }
-    }
 }
 
 #ifdef __cplusplus

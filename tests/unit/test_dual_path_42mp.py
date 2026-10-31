@@ -25,9 +25,10 @@ class TestDualPath42MP(unittest.TestCase):
         self.assertIn("SAVED 42.4MP", content)
 
     def test_proxy_uses_heap_safe_sample_size(self):
-        """Verify proxy quick review uses sample=4 for Dalvik heap safety."""
+        """Verify full resolution strip decoding uses sample=1 without downscaling."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("opts.inSampleSize = 4", content)
+        self.assertIn("opts.inSampleSize = 1", content)
+        self.assertIn("opts.inPreferredConfig = Bitmap.Config.RGB_565", content)
 
     def test_instant_preview_restoration_called(self):
         """Verify restorePreviewWithWatchdog is invoked immediately on picture taken."""
@@ -42,10 +43,10 @@ class TestDualPath42MP(unittest.TestCase):
         self.assertIn('"FUJI"', content)
 
     def test_capture_controller_saves_graded_photo_to_sd(self):
-        """Verify CaptureController dispatches saving the graded photo to SD card."""
+        """Verify CaptureController executes strip-streaming and saves graded photo to SD."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("StorageResolver.saveGradedJpegToSd", content)
-        self.assertIn("candidateSampleSizes = new int[]{ 2, 4 }", content)
+        self.assertIn("processStripStreamingCapture", content)
+        self.assertIn("StorageResolver.getGradedOutputFile(seqNum)", content)
 
     def test_manifest_enables_large_heap(self):
         """Verify AndroidManifest.xml specifies android:largeHeap='true' for 10.6MP processing."""
@@ -54,10 +55,10 @@ class TestDualPath42MP(unittest.TestCase):
         self.assertIn('android:largeHeap="true"', manifest_content)
 
     def test_10_6mp_dynamic_sampling(self):
-        """Verify CaptureController selects sample=1 for 10.6MP input to preserve full 4K detail."""
+        """Verify CaptureController enforces 64-row strips and true 42.4MP resolution."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("targetSample = (rawW > 5000) ? 2 : 1", content)
-        self.assertIn("rawW <= 5000", content)
+        self.assertIn("stripMaxH = 64", content)
+        self.assertIn("opts.inSampleSize = 1", content)
 
     def test_sony_adapter_configures_small_image_size(self):
         """Verify SonyPmcaAdapter configures BIONZ X ImageSize to small (~10.6MP)."""

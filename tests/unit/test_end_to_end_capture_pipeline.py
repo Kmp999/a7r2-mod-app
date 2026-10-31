@@ -49,18 +49,21 @@ class TestEndToEndCapturePipeline(unittest.TestCase):
         self.assertNotIn("-ljnigraphics", mk_content)
 
     def test_jni_grade_upscale_and_save_native_exported(self):
-        """Step 2B: color_engine_jni.c exports gradeUpscaleAndSave10MpNative."""
+        """Step 2B: color_engine_jni.c exports strip-streaming functions and removes legacy upscaler."""
         jni_content = self.color_jni_c.read_text(encoding="utf-8")
-        self.assertIn("Java_com_fujilite_a7r2_ColorEngine_gradeUpscaleAndSave10MpNative", jni_content)
-        self.assertIn("lut17_process_rgb565_advanced", jni_content)
-        self.assertIn("upscaler_edge_directed_rgb565", jni_content)
-        self.assertIn("native_write_jpeg_rgb565", jni_content)
+        self.assertIn("Java_com_fujilite_a7r2_ColorEngine_nativeOpenJpegStream", jni_content)
+        self.assertIn("Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWriteStreamStrip", jni_content)
+        self.assertIn("Java_com_fujilite_a7r2_ColorEngine_nativeCloseJpegStream", jni_content)
+        self.assertIn("native_jpeg_stream_open", jni_content)
+        self.assertNotIn("upscaler_edge_directed_rgb565", jni_content)
+        self.assertNotIn("native_upscale_and_write_jpeg_rgb565", jni_content)
 
     def test_color_engine_java_exposes_native_pipeline(self):
-        """Step 2C: ColorEngine.java exposes gradeUpscaleAndSave10MpNativeSafe."""
+        """Step 2C: ColorEngine.java exposes 42.4MP strip-streaming safe APIs."""
         java_content = self.color_engine_java.read_text(encoding="utf-8")
-        self.assertIn("gradeUpscaleAndSave10MpNativeSafe", java_content)
-        self.assertIn("gradeUpscaleAndSave10MpNative", java_content)
+        self.assertIn("openJpegStreamSafe", java_content)
+        self.assertIn("gradeAndWriteStreamStripSafe", java_content)
+        self.assertIn("closeJpegStreamSafe", java_content)
 
     def test_memory_pool_provides_dual_direct_slots(self):
         """Step 2D: MemoryPool provides 4MB proxy buffer and 22MB 10.6MP buffer off-heap."""
@@ -71,19 +74,20 @@ class TestEndToEndCapturePipeline(unittest.TestCase):
         self.assertIn("4 * 1024 * 1024", pool_content)
 
     def test_storage_resolver_fuji_filename_and_deduplication(self):
-        """Step 3: StorageResolver strictly formats fuji_%04d.jpg and cleans unfiltered files."""
+        """Step 3: StorageResolver formats fuji_%04d.jpg, uses .tmp rename pattern, and removes cleanupUnfilteredRawFiles."""
         storage_content = self.storage_resolver.read_text(encoding="utf-8")
         self.assertIn('String.format(Locale.US, "fuji_%04d.jpg", sequenceNum)', storage_content)
-        self.assertIn("cleanupUnfilteredRawFiles", storage_content)
+        self.assertNotIn("cleanupUnfilteredRawFiles", storage_content)
+        self.assertIn("copyExifMetadata", storage_content)
         self.assertIn("postProcessGradedFile", storage_content)
         self.assertIn("getGradedOutputFile", storage_content)
 
     def test_capture_controller_under_2_seconds_budget(self):
-        """Step 4: CaptureController executes 10.6MP pipeline with strict <2000ms budget."""
+        """Step 4: CaptureController executes 42.4MP strip-streaming pipeline with strict memory safety."""
         cc_content = self.capture_controller.read_text(encoding="utf-8")
-        self.assertIn("gradeUpscaleAndSave10MpNativeSafe", cc_content)
-        self.assertIn("targetW = 3984", cc_content)
-        self.assertIn("targetH = 2656", cc_content)
+        self.assertIn("processStripStreamingCapture", cc_content)
+        self.assertIn("stripMaxH = 64", cc_content)
+        self.assertIn("opts.inSampleSize = 1", cc_content)
         self.assertIn("SAVED %s (%dx%d | %.1fMP) in %dms", cc_content)
 
     def test_fuji_q_menu_quick_review(self):

@@ -359,82 +359,109 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
 }
 
 /**
- * Pure JNI Edge-Directed Super-Resolution Upscaling from 1.7MP to 10.6MP.
- * Zero external library dependencies.
+ * Pure JNI Direct ByteBuffer grading with Grain, Clarity, and scanline row offset.
+ * Guarantees zero visible seams across 64-row strip boundaries.
  */
-JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeUpscaleEdgeDirected(
-    JNIEnv *env, jclass clazz,
-    jobject srcDirect, jint srcW, jint srcH,
-    jobject dstDirect, jint dstW, jint dstH) {
-    if (srcDirect == NULL || dstDirect == NULL || srcW <= 1 || srcH <= 1 || dstW <= 1 || dstH <= 1) {
-        LOGE("nativeUpscaleEdgeDirected: Invalid arguments");
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndGrainDirectOffset(
+    JNIEnv *env, jclass clazz, jobject directBuffer, jint width, jint height, jint rowOffset, jint grainStrength, jint clarityStrength) {
+    if (directBuffer == NULL || width <= 0 || height <= 0) {
+        LOGE("nativeApplyLutAndGrainDirectOffset: Invalid arguments");
         return JNI_FALSE;
     }
 
-    uint16_t* src_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, srcDirect);
-    uint16_t* dst_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, dstDirect);
-
-    if (src_pixels == NULL || dst_pixels == NULL) {
-        LOGE("nativeUpscaleEdgeDirected: Failed to get DirectBuffer addresses");
+    uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+    if (pixels == NULL) {
+        LOGE("nativeApplyLutAndGrainDirectOffset: GetDirectBufferAddress returned null");
         return JNI_FALSE;
     }
 
-    upscaler_edge_directed_rgb565(src_pixels, (int)srcW, (int)srcH,
-                                  dst_pixels, (int)dstW, (int)dstH);
+    lut17_process_rgb565_advanced_offset(&g_lut17, pixels, (int)width, (int)height, (int)rowOffset,
+                                         (int)grainStrength, (int)clarityStrength);
     return JNI_TRUE;
 }
 
 /**
- * Combined Pipeline:
- *  1. Grades sensor proxy frame (1616x1080) with 17^3 3D LUT + Grain + Clarity in native memory (~75ms).
- *  2. Upscales to 10.6 MP (3984x2656) via Edge-Directed Super-Resolution into 22MB native buffer (~200ms).
- *  3. Writes baseline JPEG directly to SD card via native_write_jpeg_rgb565 (~350ms).
- * Total time: ~625ms off-thread, 0 MB Dalvik heap.
+ * Opens a streaming JPEG writer session for writing full-resolution (42.4MP: 7952x5304) JPEGs in strips.
  */
-JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_gradeUpscaleAndSave10MpNative(
-    JNIEnv *env, jclass clazz,
-    jobject srcDirect, jint srcW, jint srcH,
-    jobject dstDirect, jint dstW, jint dstH,
-    jint grainStrength, jint clarityStrength,
-    jstring outputPath) {
-    if (srcDirect == NULL || outputPath == NULL ||
-        srcW <= 1 || srcH <= 1 || dstW <= 1 || dstH <= 1) {
-        LOGE("gradeUpscaleAndSave10MpNative: Invalid parameters");
-        return JNI_FALSE;
-    }
-
-    uint16_t* src_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, srcDirect);
-    if (src_pixels == NULL) {
-        LOGE("gradeUpscaleAndSave10MpNative: DirectBuffer address is null");
-        return JNI_FALSE;
+JNIEXPORT jlong JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeOpenJpegStream(
+    JNIEnv *env, jclass clazz, jstring outputPath, jint width, jint height, jint quality) {
+    if (outputPath == NULL || width <= 0 || height <= 0) {
+        LOGE("nativeOpenJpegStream: Invalid parameters");
+        return 0;
     }
 
     const char* path = (*env)->GetStringUTFChars(env, outputPath, NULL);
     if (path == NULL) {
-        LOGE("gradeUpscaleAndSave10MpNative: Failed to extract outputPath UTF chars");
+        LOGE("nativeOpenJpegStream: Failed to extract outputPath UTF chars");
+        return 0;
+    }
+
+    JpegStreamState* state = native_jpeg_stream_open(path, (int)width, (int)height, (int)quality);
+    (*env)->ReleaseStringUTFChars(env, outputPath, path);
+
+    if (state == NULL) {
+        LOGE("nativeOpenJpegStream: native_jpeg_stream_open failed");
+        return 0;
+    }
+
+    return (jlong)(intptr_t)state;
+}
+
+/**
+ * Writes an RGB_565 strip buffer to the active JPEG stream.
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeWriteStreamStrip(
+    JNIEnv *env, jclass clazz, jlong handle, jobject directBuffer, jint stripW, jint stripH, jint rowOffset) {
+    if (handle == 0 || directBuffer == NULL || stripW <= 0 || stripH <= 0) {
+        LOGE("nativeWriteStreamStrip: Invalid parameters");
         return JNI_FALSE;
     }
 
-    // 1. Grade 1.7MP sensor buffer first (6x faster than grading after upscale)
-    lut17_process_rgb565_advanced(&g_lut17, src_pixels, (int)srcW, (int)srcH,
-                                  (int)grainStrength, (int)clarityStrength);
-
-    int ok = 0;
-    if (dstDirect != NULL) {
-        uint16_t* dst_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, dstDirect);
-        if (dst_pixels != NULL) {
-            // 2. Edge-directed upscaling to 10.6 MP into pre-allocated buffer
-            upscaler_edge_directed_rgb565(src_pixels, (int)srcW, (int)srcH,
-                                          dst_pixels, (int)dstW, (int)dstH);
-            // 3. Write JPEG directly to SD card
-            ok = native_write_jpeg_rgb565(path, dst_pixels, (int)dstW, (int)dstH, 92);
-        }
-    } else {
-        // Strip streaming upscale + save without 22MB buffer
-        ok = native_upscale_and_write_jpeg_rgb565(path, src_pixels, (int)srcW, (int)srcH, (int)dstW, (int)dstH, 92);
+    JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
+    uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+    if (pixels == NULL) {
+        LOGE("nativeWriteStreamStrip: DirectBuffer address is null");
+        return JNI_FALSE;
     }
 
-    (*env)->ReleaseStringUTFChars(env, outputPath, path);
+    int ok = native_jpeg_stream_write_strip_rgb565(state, pixels, (int)stripW, (int)stripH, (int)rowOffset);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Grades an RGB_565 strip buffer with 17^3 3D LUT + Grain + Clarity and writes it directly to the JPEG stream.
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWriteStreamStrip(
+    JNIEnv *env, jclass clazz, jlong handle, jobject directBuffer, jint stripW, jint stripH, jint rowOffset, jint grainStrength, jint clarityStrength) {
+    if (handle == 0 || directBuffer == NULL || stripW <= 0 || stripH <= 0) {
+        LOGE("nativeGradeAndWriteStreamStrip: Invalid parameters");
+        return JNI_FALSE;
+    }
+
+    JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
+    uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+    if (pixels == NULL) {
+        LOGE("nativeGradeAndWriteStreamStrip: DirectBuffer address is null");
+        return JNI_FALSE;
+    }
+
+    // 1. Grade strip in native memory with exact row-offset boundary continuity
+    lut17_process_rgb565_advanced_offset(&g_lut17, pixels, (int)stripW, (int)stripH, (int)rowOffset,
+                                         (int)grainStrength, (int)clarityStrength);
+
+    // 2. Encode strip directly into active JPEG stream
+    int ok = native_jpeg_stream_write_strip_rgb565(state, pixels, (int)stripW, (int)stripH, (int)rowOffset);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Closes the active JPEG stream session.
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeCloseJpegStream(
+    JNIEnv *env, jclass clazz, jlong handle, jint success) {
+    if (handle == 0) return JNI_FALSE;
+    JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
+    int ok = native_jpeg_stream_close(state, (int)success);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

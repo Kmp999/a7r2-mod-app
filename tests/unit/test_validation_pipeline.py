@@ -38,19 +38,19 @@ class TestValidationPipeline(unittest.TestCase):
         self.assertIn("onResume startPreview failed", content)
 
     def test_capture_controller_callback_upscaling_pipeline(self):
-        """Verify CaptureController receives callback, grades in native memory, and saves FUJI photo."""
+        """Verify CaptureController receives callback, delegates to 42.4MP strip-streaming, and saves FUJI photo."""
         content = self.capture_file.read_text(encoding="utf-8")
         self.assertIn("cameraAdapter.takePicture(new Camera.PictureCallback()", content)
-        self.assertIn("processAndUpscaleCapture(jpegData, seqNum, captureStartTime)", content)
-        self.assertIn("ColorEngine.applyLutAndGrainBitmapSafe(srcBmp", content)
-        self.assertIn("StorageResolver.saveGradedJpegToSd", content)
+        self.assertIn("processStripStreamingCapture", content)
+        self.assertIn("opts.inSampleSize = 1", content)
+        self.assertIn("StorageResolver.getGradedOutputFile", content)
 
     def test_heap_safe_failover_in_capture_controller(self):
-        """Verify 10.6MP bitmap allocation is guarded by try-catch with graceful fallback."""
+        """Verify 42.4MP strip memory safety with immediate strip bitmap recycling."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("Bitmap dst10MpBmp = null", content)
-        self.assertIn("dst10MpBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.RGB_565)", content)
-        self.assertIn("dst10MpBmp = srcBmp", content)
+        self.assertIn("stripBmp.recycle()", content)
+        self.assertIn("stripDirect = java.nio.ByteBuffer.allocateDirect", content)
+        self.assertIn("stripMaxH = 64", content)
 
     def test_display_safe_review_bitmap(self):
         """Verify review bitmap is downscaled to display size to avoid OpenGL 2048x2048 crash."""
@@ -72,11 +72,11 @@ class TestValidationPipeline(unittest.TestCase):
         self.assertIn("GetByteArrayRegion", jni_content)
 
     def test_lut_cube_17_edge_directed_upscaler(self):
-        """Verify lut_cube_17.h implements upscaler_edge_directed_rgb565."""
+        """Verify lut_cube_17.h implements seamless strip boundaries and removes legacy upscaler."""
         lut_content = self.lut_file.read_text(encoding="utf-8")
-        self.assertIn("upscaler_edge_directed_rgb565", lut_content)
-        self.assertIn("scale_x", lut_content)
-        self.assertIn("scale_y", lut_content)
+        self.assertNotIn("upscaler_edge_directed_rgb565", lut_content)
+        self.assertIn("lut17_process_rgb565_advanced_offset", lut_content)
+        self.assertIn("global_y", lut_content)
         self.assertIn("BAYER_2X2", lut_content)
 
 if __name__ == '__main__':

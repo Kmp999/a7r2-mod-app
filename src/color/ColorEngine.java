@@ -234,41 +234,79 @@ public class ColorEngine {
     public static native boolean nativeApplyLutAndGrainDirect(java.nio.ByteBuffer directBuffer, int width, int height, int grainStrength, int clarityStrength);
 
     /**
-     * Edge-directed super-resolution upscaling from 1.7MP to 10.6MP (~4K).
+     * Applies 17x17x17 3D LUT, Grain, and Micro-Contrast to an RGB_565 DirectByteBuffer with scanline row offset.
+     * Guarantees zero visible seams across 64-row strip boundaries.
      */
-    public static boolean upscaleEdgeDirectedSafe(java.nio.ByteBuffer srcDirect, int srcW, int srcH,
-                                                  java.nio.ByteBuffer dstDirect, int dstW, int dstH) {
-        if (!sNativeAvailable || srcDirect == null || dstDirect == null) return false;
+    public static boolean applyLutAndGrainDirectOffsetSafe(java.nio.ByteBuffer directBuffer, int width, int height, int rowOffset, int grainStrength, int clarityStrength) {
+        if (!sNativeAvailable || directBuffer == null || !directBuffer.isDirect()) return false;
         try {
-            return nativeUpscaleEdgeDirected(srcDirect, srcW, srcH, dstDirect, dstW, dstH);
+            return nativeApplyLutAndGrainDirectOffset(directBuffer, width, height, rowOffset, grainStrength, clarityStrength);
         } catch (Throwable t) {
-            Log.e(TAG, "nativeUpscaleEdgeDirected failed", t);
+            Log.e(TAG, "applyLutAndGrainDirectOffsetSafe failed", t);
             return false;
         }
     }
 
-    public static native boolean nativeUpscaleEdgeDirected(java.nio.ByteBuffer srcDirect, int srcW, int srcH,
-                                                           java.nio.ByteBuffer dstDirect, int dstW, int dstH);
+    public static native boolean nativeApplyLutAndGrainDirectOffset(java.nio.ByteBuffer directBuffer, int width, int height, int rowOffset, int grainStrength, int clarityStrength);
 
     /**
-     * Combined Pipeline in Native C (Zero Dalvik Heap):
-     * Grades 1.7MP sensor buffer, upscales to 10.6MP (3984x2656), and writes baseline JPEG directly to disk.
+     * Opens a streaming JPEG writer session for writing full-resolution (42.4MP: 7952x5304) JPEGs in strips.
      */
-    public static boolean gradeUpscaleAndSave10MpNativeSafe(
-        java.nio.ByteBuffer srcDirect, int srcW, int srcH,
-        java.nio.ByteBuffer dstDirect, int dstW, int dstH,
-        int grainStrength, int clarityStrength, String outputPath) {
-        if (!sNativeAvailable || srcDirect == null || outputPath == null) return false;
+    public static long openJpegStreamSafe(String outputPath, int width, int height, int quality) {
+        if (!sNativeAvailable || outputPath == null || width <= 0 || height <= 0) return 0;
         try {
-            return gradeUpscaleAndSave10MpNative(srcDirect, srcW, srcH, dstDirect, dstW, dstH, grainStrength, clarityStrength, outputPath);
+            return nativeOpenJpegStream(outputPath, width, height, quality);
         } catch (Throwable t) {
-            Log.e(TAG, "gradeUpscaleAndSave10MpNative failed", t);
+            Log.e(TAG, "openJpegStreamSafe failed", t);
+            return 0;
+        }
+    }
+
+    public static native long nativeOpenJpegStream(String outputPath, int width, int height, int quality);
+
+    /**
+     * Writes an RGB_565 strip buffer to the active JPEG stream.
+     */
+    public static boolean writeStreamStripSafe(long handle, java.nio.ByteBuffer directBuffer, int stripW, int stripH, int rowOffset) {
+        if (!sNativeAvailable || handle == 0 || directBuffer == null || !directBuffer.isDirect()) return false;
+        try {
+            return nativeWriteStreamStrip(handle, directBuffer, stripW, stripH, rowOffset);
+        } catch (Throwable t) {
+            Log.e(TAG, "writeStreamStripSafe failed", t);
             return false;
         }
     }
 
-    public static native boolean gradeUpscaleAndSave10MpNative(
-        java.nio.ByteBuffer srcDirect, int srcW, int srcH,
-        java.nio.ByteBuffer dstDirect, int dstW, int dstH,
-        int grainStrength, int clarityStrength, String outputPath);
+    public static native boolean nativeWriteStreamStrip(long handle, java.nio.ByteBuffer directBuffer, int stripW, int stripH, int rowOffset);
+
+    /**
+     * Fused Grading + JPEG Stream Writing for an RGB_565 strip buffer.
+     * Grades 64 rows in native memory and encodes directly to JPEG stream with zero heap allocation.
+     */
+    public static boolean gradeAndWriteStreamStripSafe(long handle, java.nio.ByteBuffer directBuffer, int stripW, int stripH, int rowOffset, int grainStrength, int clarityStrength) {
+        if (!sNativeAvailable || handle == 0 || directBuffer == null || !directBuffer.isDirect()) return false;
+        try {
+            return nativeGradeAndWriteStreamStrip(handle, directBuffer, stripW, stripH, rowOffset, grainStrength, clarityStrength);
+        } catch (Throwable t) {
+            Log.e(TAG, "gradeAndWriteStreamStripSafe failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean nativeGradeAndWriteStreamStrip(long handle, java.nio.ByteBuffer directBuffer, int stripW, int stripH, int rowOffset, int grainStrength, int clarityStrength);
+
+    /**
+     * Closes the active JPEG stream session.
+     */
+    public static boolean closeJpegStreamSafe(long handle, boolean success) {
+        if (!sNativeAvailable || handle == 0) return false;
+        try {
+            return nativeCloseJpegStream(handle, success ? 1 : 0);
+        } catch (Throwable t) {
+            Log.e(TAG, "closeJpegStreamSafe failed", t);
+            return false;
+        }
+    }
+
+    public static native boolean nativeCloseJpegStream(long handle, int success);
 }

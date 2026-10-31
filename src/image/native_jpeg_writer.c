@@ -291,95 +291,91 @@ int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int w
     return 1;
 }
 
-// 16-row Strip Streaming Upscaler and JPEG encoder
-int native_upscale_and_write_jpeg_rgb565(const char* filename, const uint16_t* src_pixels, int srcW, int srcH, int dstW, int dstH, int quality) {
-    if (!filename || !src_pixels || srcW <= 1 || srcH <= 1 || dstW <= 1 || dstH <= 1) return 0;
+// Stream state definition matching native_jpeg_writer.h
+struct JpegStreamState {
+    FILE* fp;
+    int width;
+    int height;
+    int quality;
+    uint8_t q_luma[64];
+    uint8_t q_chroma[64];
+    uint16_t inv_q_luma[64];
+    uint16_t inv_q_chroma[64];
+    uint16_t dc_luma_c[256];
+    uint8_t dc_luma_s[256];
+    uint16_t ac_luma_c[256];
+    uint8_t ac_luma_s[256];
+    uint16_t dc_chroma_c[256];
+    uint8_t dc_chroma_s[256];
+    uint16_t ac_chroma_c[256];
+    uint8_t ac_chroma_s[256];
+    BitWriter bw;
+    int last_dc[3];
+};
+
+JpegStreamState* native_jpeg_stream_open(const char* filename, int width, int height, int quality) {
+    if (!filename || width <= 0 || height <= 0) return NULL;
     FILE* fp = fopen(filename, "wb");
-    if (!fp) return 0;
+    if (!fp) return NULL;
 
-    uint8_t q_luma[64], q_chroma[64];
-    uint16_t inv_q_luma[64], inv_q_chroma[64];
-    compute_quant_tables(quality, q_luma, q_chroma, inv_q_luma, inv_q_chroma);
+    JpegStreamState* state = (JpegStreamState*)malloc(sizeof(JpegStreamState));
+    if (!state) {
+        fclose(fp);
+        return NULL;
+    }
+    memset(state, 0, sizeof(JpegStreamState));
+    state->fp = fp;
+    state->width = width;
+    state->height = height;
+    state->quality = quality;
 
-    uint16_t dc_luma_c[256], ac_luma_c[256], dc_chroma_c[256], ac_chroma_c[256];
-    uint8_t dc_luma_s[256], ac_luma_s[256], dc_chroma_s[256], ac_chroma_s[256];
-    memset(dc_luma_s, 0, sizeof(dc_luma_s)); memset(ac_luma_s, 0, sizeof(ac_luma_s));
-    memset(dc_chroma_s, 0, sizeof(dc_chroma_s)); memset(ac_chroma_s, 0, sizeof(ac_chroma_s));
+    compute_quant_tables(quality, state->q_luma, state->q_chroma, state->inv_q_luma, state->inv_q_chroma);
 
-    build_huff_table(&DHT_MARKER_DATA[1], &DHT_MARKER_DATA[17], dc_luma_c, dc_luma_s);
-    build_huff_table(&DHT_MARKER_DATA[30], &DHT_MARKER_DATA[46], ac_luma_c, ac_luma_s);
-    build_huff_table(&DHT_MARKER_DATA[209], &DHT_MARKER_DATA[225], dc_chroma_c, dc_chroma_s);
-    build_huff_table(&DHT_MARKER_DATA[238], &DHT_MARKER_DATA[254], ac_chroma_c, ac_chroma_s);
+    build_huff_table(&DHT_MARKER_DATA[1], &DHT_MARKER_DATA[17], state->dc_luma_c, state->dc_luma_s);
+    build_huff_table(&DHT_MARKER_DATA[30], &DHT_MARKER_DATA[46], state->ac_luma_c, state->ac_luma_s);
+    build_huff_table(&DHT_MARKER_DATA[209], &DHT_MARKER_DATA[225], state->dc_chroma_c, state->dc_chroma_s);
+    build_huff_table(&DHT_MARKER_DATA[238], &DHT_MARKER_DATA[254], state->ac_chroma_c, state->ac_chroma_s);
 
-    write_headers(fp, dstW, dstH, q_luma, q_chroma);
+    write_headers(fp, width, height, state->q_luma, state->q_chroma);
 
-    BitWriter bw = { fp, 0, 0 };
-    bw.opos = 0;
-    int last_dc[3] = { 0, 0, 0 };
+    state->bw.fp = fp;
+    state->bw.buf = 0;
+    state->bw.bits = 0;
+    state->bw.opos = 0;
+    state->last_dc[0] = 0;
+    state->last_dc[1] = 0;
+    state->last_dc[2] = 0;
+
+    return state;
+}
+
+int native_jpeg_stream_write_strip_rgb565(JpegStreamState* state, const uint16_t* strip_pixels, int strip_w, int strip_h, int row_offset) {
+    if (!state || !state->fp || !strip_pixels || strip_w <= 0 || strip_h <= 0) return 0;
+    if (strip_w != state->width) return 0;
+
     int16_t y_block[4][64], cb_block[64], cr_block[64];
-    
-    // 128KB buffer for 16 rows of dstW (max width 4096)
-    uint16_t strip_buf[16 * 4096]; 
-    
-    // Scale logic
-    uint32_t scale_x = (uint32_t)(((uint64_t)(srcW - 1) << 16) / (dstW - 1));
-    uint32_t scale_y = (uint32_t)(((uint64_t)(srcH - 1) << 16) / (dstH - 1));
 
-    for (int my = 0; my < dstH; my += 16) {
-        // Upscale 16 rows
-        for (int dy = 0; dy < 16; dy++) {
-            int target_y = my + dy;
-            if (target_y >= dstH) target_y = dstH - 1;
-            
-            uint32_t src_y_fp = target_y * scale_y;
-            int y0 = (int)(src_y_fp >> 16);
-            int y1 = (y0 < srcH - 1) ? y0 + 1 : y0;
-            int y_frac = (src_y_fp >> 8) & 0xFF; // Q8
-            int inv_y = 256 - y_frac;
+    for (int my = 0; my < strip_h; my += 16) {
+        int global_mcu_y = row_offset + my;
+        if (global_mcu_y >= state->height) break;
 
-            const uint16_t* row0 = &src_pixels[y0 * srcW];
-            const uint16_t* row1 = &src_pixels[y1 * srcW];
-            uint16_t* dst_row = &strip_buf[dy * dstW];
-
-            for (int dx = 0; dx < dstW; dx++) {
-                uint32_t src_x_fp = dx * scale_x;
-                int x0 = (int)(src_x_fp >> 16);
-                int x1 = (x0 < srcW - 1) ? x0 + 1 : x0;
-                int x_frac = (src_x_fp >> 8) & 0xFF; // Q8
-                int inv_x = 256 - x_frac;
-
-                uint16_t p00 = row0[x0], p10 = row0[x1];
-                uint16_t p01 = row1[x0], p11 = row1[x1];
-                
-                int r00 = (p00 >> 11) & 0x1F, g00 = (p00 >> 5) & 0x3F, b00 = p00 & 0x1F;
-                int r10 = (p10 >> 11) & 0x1F, g10 = (p10 >> 5) & 0x3F, b10 = p10 & 0x1F;
-                int r01 = (p01 >> 11) & 0x1F, g01 = (p01 >> 5) & 0x3F, b01 = p01 & 0x1F;
-                int r11 = (p11 >> 11) & 0x1F, g11 = (p11 >> 5) & 0x3F, b11 = p11 & 0x1F;
-
-                int w00 = (inv_x * inv_y) >> 8;
-                int w10 = (x_frac * inv_y) >> 8;
-                int w01 = (inv_x * y_frac) >> 8;
-                int w11 = (x_frac * y_frac) >> 8;
-                int total_w = w00 + w10 + w01 + w11;
-                if (total_w == 0) total_w = 1;
-
-                int r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) / total_w;
-                int g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) / total_w;
-                int b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) / total_w;
-
-                dst_row[dx] = (uint16_t)((r << 11) | (g << 5) | b);
-            }
-        }
-        
-        // Encode strip
-        for (int mx = 0; mx < dstW; mx += 16) {
+        for (int mx = 0; mx < state->width; mx += 16) {
             for (int by = 0; by < 16; by++) {
-                const uint16_t* row = &strip_buf[by * dstW];
+                int local_y = my + by;
+                if (local_y >= strip_h) local_y = strip_h - 1;
+                int global_y = row_offset + local_y;
+                if (global_y >= state->height) {
+                    local_y = (state->height - 1) - row_offset;
+                    if (local_y < 0) local_y = 0;
+                    if (local_y >= strip_h) local_y = strip_h - 1;
+                }
+
+                const uint16_t* row = &strip_pixels[local_y * strip_w];
                 int b_idx = ((by >= 8) ? 2 : 0), sub_y = by & 7;
 
                 for (int bx = 0; bx < 16; bx++) {
                     int px_idx = mx + bx;
-                    if (px_idx >= dstW) px_idx = dstW - 1;
+                    if (px_idx >= state->width) px_idx = state->width - 1;
                     uint16_t px = row[px_idx];
 
                     int r = (((px >> 11) & 0x1F) * 527 + 23) >> 6;
@@ -399,13 +395,39 @@ int native_upscale_and_write_jpeg_rgb565(const char* filename, const uint16_t* s
                     }
                 }
             }
-            for (int i = 0; i < 4; i++) encode_block_fast(&bw, y_block[i], inv_q_luma, dc_luma_c, dc_luma_s, ac_luma_c, ac_luma_s, &last_dc[0]);
-            encode_block_fast(&bw, cb_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[1]);
-            encode_block_fast(&bw, cr_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[2]);
+            for (int i = 0; i < 4; i++) {
+                encode_block_fast(&state->bw, y_block[i], state->inv_q_luma,
+                                  state->dc_luma_c, state->dc_luma_s,
+                                  state->ac_luma_c, state->ac_luma_s,
+                                  &state->last_dc[0]);
+            }
+            encode_block_fast(&state->bw, cb_block, state->inv_q_chroma,
+                              state->dc_chroma_c, state->dc_chroma_s,
+                              state->ac_chroma_c, state->ac_chroma_s,
+                              &state->last_dc[1]);
+            encode_block_fast(&state->bw, cr_block, state->inv_q_chroma,
+                              state->dc_chroma_c, state->dc_chroma_s,
+                              state->ac_chroma_c, state->ac_chroma_s,
+                              &state->last_dc[2]);
         }
     }
-    bw_flush(&bw);
-    fputc(0xFF, fp); fputc(0xD9, fp);
-    fclose(fp);
     return 1;
+}
+
+int native_jpeg_stream_close(JpegStreamState* state, int success) {
+    if (!state) return 0;
+    int ret = 0;
+    if (state->fp) {
+        if (success) {
+            bw_flush(&state->bw);
+            fputc(0xFF, state->fp);
+            fputc(0xD9, state->fp);
+            fflush(state->fp);
+            ret = 1;
+        }
+        fclose(state->fp);
+        state->fp = NULL;
+    }
+    free(state);
+    return ret;
 }

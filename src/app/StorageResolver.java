@@ -436,16 +436,27 @@ public final class StorageResolver {
                     filename = generateDcfFilename(dir, prefix);
                 }
                 File file = new File(dir, filename);
-                java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(file), 65536);
+                File tmpFile = new File(dir, filename + ".tmp");
+                java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(tmpFile), 65536);
                 boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
                 out.flush();
                 out.close();
 
-                if (compressed && file.exists() && file.length() > 0) {
+                if (compressed && tmpFile.exists() && tmpFile.length() > 0) {
+                    if (file.exists()) {
+                        file.delete();
+                    }
+                    boolean renamed = tmpFile.renameTo(file);
+                    if (!renamed) {
+                        copyFile(tmpFile, file);
+                        tmpFile.delete();
+                    }
                     String savedPath = file.getAbsolutePath();
-                    writeExifMetadata(savedPath, recipeName);
-                    if (sequenceNum > 0) {
-                        cleanupUnfilteredRawFiles(sequenceNum);
+                    File master = findRawMasterFile(sequenceNum);
+                    if (master != null && master.exists()) {
+                        copyExifMetadata(master.getAbsolutePath(), savedPath, recipeName);
+                    } else {
+                        writeExifMetadata(savedPath, recipeName);
                     }
                     sLastDiagnostic = "OK (" + prefix + "): " + savedPath + " (" + (file.length() / 1024) + "KB)";
                     Log.i(TAG, "Successfully saved graded photo: " + sLastDiagnostic);
@@ -454,7 +465,9 @@ public final class StorageResolver {
                     registerWithAvindex(context, savedPath);
                     return savedPath;
                 } else {
-                    file.delete();
+                    if (tmpFile.exists()) {
+                        tmpFile.delete();
+                    }
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "Write failed in " + dir.getAbsolutePath() + ": " + t.getMessage());
@@ -467,32 +480,129 @@ public final class StorageResolver {
     }
 
     /**
-     * Cleans up any duplicate/unfiltered raw files (e.g. DSC0xxxx.JPG) left by BIONZ X or hardware callbacks,
-     * ensuring that ONLY the single graded fuji_xxxx.jpg file remains on the SD card (Requirement 1).
+     * Finds the original master capture file (DSC0xxxx.JPG) for a given sequence number.
+     * Note: Original master files are strictly preserved and NEVER deleted.
      */
-    public static void cleanupUnfilteredRawFiles(int sequenceNum) {
-        if (sequenceNum <= 0) return;
+    public static File findRawMasterFile(int sequenceNum) {
+        if (sequenceNum <= 0) return null;
         List<File> candidates = getCandidateDcimDirs();
         for (File dir : candidates) {
             if (!dir.exists() || !dir.isDirectory()) continue;
             File rawDsc = new File(dir, String.format(Locale.US, "DSC0%04d.JPG", sequenceNum));
-            if (rawDsc.exists()) {
-                boolean deleted = rawDsc.delete();
-                Log.i(TAG, "Removed unfiltered raw duplicate: " + rawDsc.getAbsolutePath() + " (success=" + deleted + ")");
+            if (rawDsc.exists() && rawDsc.length() > 0) {
+                return rawDsc;
             }
+        }
+        return null;
+    }
+
+    /**
+     * Copies file content from src to dst.
+     */
+    public static void copyFile(File src, File dst) throws java.io.IOException {
+        java.io.FileInputStream in = new java.io.FileInputStream(src);
+        try {
+            java.io.FileOutputStream out = new java.io.FileOutputStream(dst);
+            try {
+                byte[] buf = new byte[65536];
+                int len;
+                while ((len = in.read(buf)) > 0) {
+                    out.write(buf, 0, len);
+                }
+                out.flush();
+            } finally {
+                out.close();
+            }
+        } finally {
+            in.close();
         }
     }
 
     /**
-     * Registers a freshly saved native graded JPEG, writes EXIF metadata, and eliminates any unfiltered duplicate.
+     * Registers a freshly saved native graded JPEG, preserves original EXIF metadata, and registers with Avindex.
      */
     public static void postProcessGradedFile(Context context, String filePath, int sequenceNum, String recipeName) {
         if (filePath == null) return;
-        writeExifMetadata(filePath, recipeName);
-        if (sequenceNum > 0) {
-            cleanupUnfilteredRawFiles(sequenceNum);
+        File master = findRawMasterFile(sequenceNum);
+        if (master != null && master.exists()) {
+            copyExifMetadata(master.getAbsolutePath(), filePath, recipeName);
+        } else {
+            writeExifMetadata(filePath, recipeName);
         }
         registerWithAvindex(context, filePath);
+    }
+
+    /**
+     * Copies all camera EXIF metadata from source master capture (DSC0xxxx.JPG) to graded JPEG (fuji_xxxx.jpg).
+     * Preserves hardware ISP tags (aperture, shutter speed, ISO, focal length, date, white balance, etc.).
+     */
+    public static void copyExifMetadata(String srcPath, String dstPath, String recipeName) {
+        if (dstPath == null) return;
+        if (srcPath == null || !new File(srcPath).exists()) {
+            writeExifMetadata(dstPath, recipeName);
+            return;
+        }
+        try {
+            ExifInterface srcExif = new ExifInterface(srcPath);
+            ExifInterface dstExif = new ExifInterface(dstPath);
+
+            String[] tags = new String[] {
+                ExifInterface.TAG_DATETIME,
+                ExifInterface.TAG_FLASH,
+                ExifInterface.TAG_FOCAL_LENGTH,
+                ExifInterface.TAG_GPS_ALTITUDE,
+                ExifInterface.TAG_GPS_ALTITUDE_REF,
+                ExifInterface.TAG_GPS_DATESTAMP,
+                ExifInterface.TAG_GPS_LATITUDE,
+                ExifInterface.TAG_GPS_LATITUDE_REF,
+                ExifInterface.TAG_GPS_LONGITUDE,
+                ExifInterface.TAG_GPS_LONGITUDE_REF,
+                ExifInterface.TAG_GPS_PROCESSING_METHOD,
+                ExifInterface.TAG_GPS_TIMESTAMP,
+                ExifInterface.TAG_IMAGE_LENGTH,
+                ExifInterface.TAG_IMAGE_WIDTH,
+                ExifInterface.TAG_ISO,
+                ExifInterface.TAG_MAKE,
+                ExifInterface.TAG_MODEL,
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.TAG_WHITE_BALANCE,
+                "ExposureTime",
+                "FNumber",
+                "ISOSpeedRatings",
+                "DateTimeOriginal",
+                "DateTimeDigitized",
+                "SubSecTime",
+                "SubSecTimeOriginal",
+                "SubSecTimeDigitized",
+                "ExposureProgram",
+                "MeteringMode",
+                "LightSource",
+                "ExposureBiasValue",
+                "MaxApertureValue",
+                "DigitalZoomRatio",
+                "FocalLengthIn35mmFilm"
+            };
+
+            for (String tag : tags) {
+                try {
+                    String val = srcExif.getAttribute(tag);
+                    if (val != null) {
+                        dstExif.setAttribute(tag, val);
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            dstExif.setAttribute(ExifInterface.TAG_MAKE, "SONY");
+            dstExif.setAttribute(ExifInterface.TAG_MODEL, "ILCE-7RM2");
+            if (recipeName != null && !recipeName.trim().isEmpty()) {
+                dstExif.setAttribute("UserComment", "Fuji Recipe: " + recipeName);
+            }
+            dstExif.saveAttributes();
+            Log.d(TAG, "EXIF metadata successfully preserved from " + srcPath + " to " + dstPath);
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed preserving EXIF metadata: " + t.getMessage());
+            writeExifMetadata(dstPath, recipeName);
+        }
     }
 
     /**
