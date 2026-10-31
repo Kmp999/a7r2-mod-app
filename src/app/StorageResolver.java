@@ -543,6 +543,7 @@ public final class StorageResolver {
 
     /**
      * Waits for a JPEG file to finish writing to the SD card (verifying file size stability and 0xFF 0xD9 EOI).
+     * Includes a non-aggressive settling backoff after EOI detection to ensure BIONZ X has flushed its file descriptor.
      */
     public static boolean waitForJpegComplete(File file, int timeoutMs) {
         if (file == null) return false;
@@ -552,20 +553,47 @@ public final class StorageResolver {
             if (file.exists()) {
                 long currentLen = file.length();
                 if (currentLen > 100000 && isJpegComplete(file)) {
+                    // Settle backoff: let BIONZ X finish flushing FD to FAT32
+                    try { Thread.sleep(40); } catch (InterruptedException ignored) {}
                     return true;
                 }
                 if (currentLen > 0 && currentLen == prevLen && isJpegComplete(file)) {
+                    try { Thread.sleep(40); } catch (InterruptedException ignored) {}
                     return true;
                 }
                 prevLen = currentLen;
             }
             try {
-                Thread.sleep(30);
+                Thread.sleep(35);
             } catch (InterruptedException e) {
                 break;
             }
         }
         return file.exists() && file.length() > 0;
+    }
+
+    /**
+     * Scans candidate DCIM directories on SD card and deletes any leftover orphaned *.tmp files
+     * from previous interrupted writes or battery pulls (Enhancement 3).
+     */
+    public static int cleanupOrphanedTempFiles() {
+        int cleanedCount = 0;
+        List<File> candidates = getCandidateDcimDirs();
+        for (File dir : candidates) {
+            if (!dir.exists() || !dir.isDirectory()) continue;
+            File[] files = dir.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                if (f.isFile() && f.getName().endsWith(".tmp")) {
+                    boolean ok = f.delete();
+                    if (ok) {
+                        cleanedCount++;
+                        Log.i(TAG, "Cleaned orphaned temp file: " + f.getAbsolutePath());
+                    }
+                }
+            }
+        }
+        return cleanedCount;
     }
 
     /**

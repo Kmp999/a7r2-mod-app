@@ -112,6 +112,24 @@ public class UIController {
         updateBottomHud();
     }
 
+    private volatile int pendingGradingCount = 0;
+
+    public void setPendingGradingCount(final int count) {
+        this.pendingGradingCount = count;
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (qMenuView != null) {
+                    qMenuView.setPendingGradingCount(count);
+                }
+            }
+        });
+    }
+
+    public int getPendingGradingCount() {
+        return pendingGradingCount;
+    }
+
     public void updateStatusAsync(final String message) {
         long now = System.currentTimeMillis();
         if (now - lastUiUpdateTime < MIN_UI_INTERVAL_MS) {

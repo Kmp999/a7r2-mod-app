@@ -87,6 +87,17 @@ public class FujiQMenuView extends View {
     private final Paint debugPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint bannerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint bannerTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint hudGradingBadgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private int pendingGradingCount = 0;
+
+    public void setPendingGradingCount(int count) {
+        this.pendingGradingCount = count;
+        postInvalidate();
+    }
+
+    public int getPendingGradingCount() {
+        return pendingGradingCount;
+    }
 
     private final RectF cellRect = new RectF();
     private final Rect srcRect = new Rect();
@@ -261,6 +272,11 @@ public class FujiQMenuView extends View {
         debugPaint.setColor(0xFFAAAAAA);
         debugPaint.setTextAlign(Paint.Align.RIGHT);
 
+        hudGradingBadgePaint.setTypeface(Typeface.create(mono, Typeface.BOLD));
+        hudGradingBadgePaint.setTextSize(13f);
+        hudGradingBadgePaint.setColor(COLOR_AMBER_GOLD);
+        hudGradingBadgePaint.setTextAlign(Paint.Align.RIGHT);
+
         // 16 Fujifilm Q-Menu items
         itemTitles[0]  = "BASE FILM";
         itemTitles[1]  = "D-RANGE";
@@ -421,6 +437,11 @@ public class FujiQMenuView extends View {
 
             if (SonyKeyCodes.sDebugKeyLoggingEnabled) {
                 canvas.drawText("[" + SonyKeyCodes.sLastKeyName + "]", w - 16, 20, debugPaint);
+            }
+
+            // Live HUD Queue Counter
+            if (pendingGradingCount > 0) {
+                canvas.drawText("[GRADING: " + pendingGradingCount + "]", w - 16, 38, hudGradingBadgePaint);
             }
         }
 

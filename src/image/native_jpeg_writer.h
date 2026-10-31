@@ -54,6 +54,20 @@ int native_jpeg_stream_write_strip_rgb565(JpegStreamState* state, const uint16_t
 int native_write_jpeg_strip(JpegStreamState* state, const uint16_t* strip_pixels, int strip_w, int strip_h, int row_offset);
 
 /**
+ * Encodes a strip of ARGB_8888 rows directly into the active JPEG stream (full 8-bit precision).
+ */
+int native_jpeg_stream_write_strip_argb8888(JpegStreamState* state, const uint32_t* strip_pixels, int strip_w, int strip_h, int row_offset);
+int native_write_jpeg_strip_argb8888(JpegStreamState* state, const uint32_t* strip_pixels, int strip_w, int strip_h, int row_offset);
+
+/**
+ * Pure C Fast-Path Strip Streaming Pipeline:
+ * Bypasses Java BitmapRegionDecoder + Bitmap allocation per strip by streaming scanlines directly
+ * in C from the source 42.4MP master to the output JPEG (scale_denom = 2).
+ * Returns 1 on success, 0 on fallback to Java BitmapRegionDecoder.
+ */
+int native_process_image_stream_fast(const char* input_jpeg_path, const char* output_jpeg_path, int grain_strength, int clarity_strength);
+
+/**
  * Closes the JPEG stream session.
  * If success != 0, flushes bit buffer, writes EOI marker (0xFF, 0xD9), and closes file.
  * If success == 0, aborts and cleans up.

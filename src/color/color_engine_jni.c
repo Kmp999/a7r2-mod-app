@@ -347,20 +347,29 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
         return JNI_FALSE;
     }
 
-    uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
-    if (pixels == NULL) {
-        LOGE("nativeApplyLutAndGrainDirect: GetDirectBufferAddress returned null");
-        return JNI_FALSE;
-    }
+    jlong cap = (*env)->GetDirectBufferCapacity(env, directBuffer);
+    if (cap >= (jlong)width * height * 4) {
+        uint32_t* pixels = (uint32_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+        if (pixels == NULL) return JNI_FALSE;
+        lut17_process_argb8888_advanced_offset(&g_lut17, pixels, (int)width, (int)height, 0,
+                                               (int)grainStrength, (int)clarityStrength);
+        return JNI_TRUE;
+    } else {
+        uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+        if (pixels == NULL) {
+            LOGE("nativeApplyLutAndGrainDirect: GetDirectBufferAddress returned null");
+            return JNI_FALSE;
+        }
 
-    lut17_process_rgb565_advanced(&g_lut17, pixels, (int)width, (int)height,
-                                  (int)grainStrength, (int)clarityStrength);
-    return JNI_TRUE;
+        lut17_process_rgb565_advanced(&g_lut17, pixels, (int)width, (int)height,
+                                      (int)grainStrength, (int)clarityStrength);
+        return JNI_TRUE;
+    }
 }
 
 /**
  * Pure JNI Direct ByteBuffer grading with Grain, Clarity, and scanline row offset.
- * Guarantees zero visible seams across 64-row strip boundaries.
+ * Guarantees zero visible seams across strip boundaries. Supports ARGB_8888 and RGB_565.
  */
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndGrainDirectOffset(
     JNIEnv *env, jclass clazz, jobject directBuffer, jint width, jint height, jint rowOffset, jint grainStrength, jint clarityStrength) {
@@ -369,15 +378,24 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
         return JNI_FALSE;
     }
 
-    uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
-    if (pixels == NULL) {
-        LOGE("nativeApplyLutAndGrainDirectOffset: GetDirectBufferAddress returned null");
-        return JNI_FALSE;
-    }
+    jlong cap = (*env)->GetDirectBufferCapacity(env, directBuffer);
+    if (cap >= (jlong)width * height * 4) {
+        uint32_t* pixels = (uint32_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+        if (pixels == NULL) return JNI_FALSE;
+        lut17_process_argb8888_advanced_offset(&g_lut17, pixels, (int)width, (int)height, (int)rowOffset,
+                                               (int)grainStrength, (int)clarityStrength);
+        return JNI_TRUE;
+    } else {
+        uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+        if (pixels == NULL) {
+            LOGE("nativeApplyLutAndGrainDirectOffset: GetDirectBufferAddress returned null");
+            return JNI_FALSE;
+        }
 
-    lut17_process_rgb565_advanced_offset(&g_lut17, pixels, (int)width, (int)height, (int)rowOffset,
-                                         (int)grainStrength, (int)clarityStrength);
-    return JNI_TRUE;
+        lut17_process_rgb565_advanced_offset(&g_lut17, pixels, (int)width, (int)height, (int)rowOffset,
+                                             (int)grainStrength, (int)clarityStrength);
+        return JNI_TRUE;
+    }
 }
 
 /**
@@ -437,7 +455,8 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeWriteJpegStr
 }
 
 /**
- * Grades an RGB_565 strip buffer with 17^3 3D LUT + Grain + Clarity and writes it directly to the JPEG stream.
+ * Grades a strip buffer with 17^3 3D LUT + Grain + Clarity and writes it directly to the JPEG stream.
+ * Seamlessly supports both ARGB_8888 (full 8-bit precision) and RGB_565.
  */
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWriteStreamStrip(
     JNIEnv *env, jclass clazz, jlong handle, jobject directBuffer, jint stripW, jint stripH, jint rowOffset, jint grainStrength, jint clarityStrength) {
@@ -447,18 +466,32 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWrit
     }
 
     JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
-    uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
-    if (pixels == NULL) {
-        LOGE("nativeGradeAndWriteStreamStrip: DirectBuffer address is null");
-        return JNI_FALSE;
+    jlong cap = (*env)->GetDirectBufferCapacity(env, directBuffer);
+    int is_argb = (cap >= (jlong)stripW * stripH * 4) ? 1 : 0;
+
+    int ok = 0;
+    if (is_argb) {
+        uint32_t* argb_pixels = (uint32_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+        if (argb_pixels == NULL) return JNI_FALSE;
+
+        // 1. Grade ARGB_8888 strip with 8-bit precision (Zero posterization)
+        lut17_process_argb8888_advanced_offset(&g_lut17, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
+                                               (int)grainStrength, (int)clarityStrength);
+
+        // 2. Encode ARGB_8888 strip directly to JPEG stream
+        ok = native_jpeg_stream_write_strip_argb8888(state, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset);
+    } else {
+        uint16_t* rgb_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
+        if (rgb_pixels == NULL) return JNI_FALSE;
+
+        // 1. Grade RGB_565 strip in native memory with exact row-offset boundary continuity
+        lut17_process_rgb565_advanced_offset(&g_lut17, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
+                                             (int)grainStrength, (int)clarityStrength);
+
+        // 2. Encode RGB_565 strip directly to JPEG stream
+        ok = native_jpeg_stream_write_strip_rgb565(state, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset);
     }
 
-    // 1. Grade strip in native memory with exact row-offset boundary continuity
-    lut17_process_rgb565_advanced_offset(&g_lut17, pixels, (int)stripW, (int)stripH, (int)rowOffset,
-                                         (int)grainStrength, (int)clarityStrength);
-
-    // 2. Encode strip directly into active JPEG stream
-    int ok = native_jpeg_stream_write_strip_rgb565(state, pixels, (int)stripW, (int)stripH, (int)rowOffset);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -470,6 +503,20 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeCloseJpegStr
     if (handle == 0) return JNI_FALSE;
     JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
     int ok = native_jpeg_stream_close(state, (int)success);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Pure C Zero-JNI-Copy Fast-Path Strip Streaming entrypoint.
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImageStreamFast(
+    JNIEnv *env, jclass clazz, jstring inputPath, jstring outputPath, jint grainStrength, jint clarityStrength) {
+    if (inputPath == NULL || outputPath == NULL) return JNI_FALSE;
+    const char* in_p = (*env)->GetStringUTFChars(env, inputPath, NULL);
+    const char* out_p = (*env)->GetStringUTFChars(env, outputPath, NULL);
+    int ok = native_process_image_stream_fast(in_p, out_p, (int)grainStrength, (int)clarityStrength);
+    (*env)->ReleaseStringUTFChars(env, inputPath, in_p);
+    (*env)->ReleaseStringUTFChars(env, outputPath, out_p);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

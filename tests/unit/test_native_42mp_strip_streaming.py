@@ -72,8 +72,8 @@ class TestNative42MPStripStreaming(unittest.TestCase):
         # Immediate recycle in finally block
         self.assertIn("stripBmp.recycle()", capture_content)
 
-        # Single direct ByteBuffer allocation (~508 KB)
-        self.assertIn("java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2)", capture_content)
+        # Single direct ByteBuffer allocation (~1.01 MB for ARGB_8888, <4MB threshold)
+        self.assertIn("java.nio.ByteBuffer.allocateDirect(dstW * 64 * 4)", capture_content)
 
         # Deterministic closure in finally block
         self.assertIn("ColorEngine.closeJpegStreamSafe(streamHandle, streamSuccess)", capture_content)

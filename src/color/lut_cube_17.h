@@ -127,14 +127,40 @@ static inline void lut17_precompute_with_base(Lut17Context* lut,
 
 #define LUT17_OFFSET(rr, gg, bb) (((bb) * 289 + (gg) * 17 + (rr)) * 3)
 
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+
+/**
+ * Vectorized PRNG grain generator using ARM NEON SIMD.
+ * Generates 4 deterministic grain values simultaneously with vmulq_u32 and vaddq_u32.
+ */
+static inline int32x4_t generate_grain_neon4(uint32x4_t* __restrict v_rng, uint32x4_t v_a, uint32x4_t v_b) {
+    *v_rng = vaddq_u32(vmulq_u32(*v_rng, v_a), v_b);
+    uint32x4_t shifted = vshrq_n_u32(*v_rng, 16);
+    uint32x4_t masked = vandq_u32(shifted, vdupq_n_u32(0x3FU));
+    return vsubq_s32(vreinterpretq_s32_u32(masked), vdupq_n_s32(32));
+}
+
+/**
+ * Vectorized Clarity / local contrast blending using ARM NEON.
+ */
+static inline int16x8_t apply_clarity_neon8(int16x8_t luma, int16x8_t prev_luma, int16_t clarity_strength) {
+    int16x8_t dl = vsubq_s16(luma, prev_luma);
+    int16x8_t scaled = vmulq_n_s16(dl, clarity_strength);
+    return vshrq_n_s16(scaled, 4);
+}
+#endif
+
 /**
  * Fast branchless fixed-point bit-shift Trilinear Interpolation for a single RGB pixel.
  * Branchless white-point fix: Remaps 0..255 to 0..256 so that 255 reaches node 16 cleanly.
  * Zero integer divisions (256/16 = 16 -> bitshift >> 4, fraction & 0x0F).
  */
-static inline void lut17_interpolate_pixel(const Lut17Context* lut,
+static inline void lut17_interpolate_pixel(const Lut17Context* __restrict lut,
                                            uint8_t r, uint8_t g, uint8_t b,
-                                           uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
+                                           uint8_t* __restrict out_r,
+                                           uint8_t* __restrict out_g,
+                                           uint8_t* __restrict out_b) {
     // Map 0..255 to 0..256 so that 255 reaches index 16 exactly with zero clipping
     int r256 = r + (r >> 7);
     int g256 = g + (g >> 7);
@@ -221,8 +247,8 @@ static inline void lut17_process_rgb565(const Lut17Context* lut, uint16_t* buffe
  * @param grain_strength   0 = Off, 1 = Weak (~8), 2 = Strong (~16)
  * @param clarity_strength -5 to +5 (0 = Neutral)
  */
-static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* lut,
-                                                       uint16_t* buffer,
+static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* __restrict lut,
+                                                       uint16_t* __restrict buffer,
                                                        int width, int height,
                                                        int row_offset,
                                                        int grain_strength,
@@ -234,6 +260,11 @@ static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* lut,
     int idx = 0;
 
     for (int y = 0; y < height; y++) {
+        // Prefetch next scanline into L1 cache
+        if (y + 1 < height) {
+            __builtin_prefetch(&buffer[(y + 1) * width], 1, 1);
+        }
+
         int global_y = row_offset + y;
         const int8_t* bayer_row = BAYER_2X2[global_y & 1];
         int grain_y_offset = (global_y & 63) << 6;
@@ -242,6 +273,9 @@ static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* lut,
         int prev_luma = 128;
 
         for (int x = 0; x < width; x++) {
+            if ((x & 15) == 0) {
+                __builtin_prefetch(&buffer[idx + 16], 1, 1);
+            }
             uint16_t px = buffer[idx];
 
             // 1. Division-free bit-replication unpacking
@@ -284,6 +318,84 @@ static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* lut,
 
             // 7. Repack to RGB565
             buffer[idx++] = (uint16_t)(((dr >> 3) << 11) | ((dg >> 2) << 5) | (db >> 3));
+        }
+    }
+}
+
+/**
+ * High-Precision ARGB_8888 3D LUT + Grain + Clarity processor.
+ * Preserves full 8-bit channel depth without 5/6/5 quantization to eliminate sky posterization.
+ */
+static inline void lut17_process_argb8888_advanced_offset(const Lut17Context* __restrict lut,
+                                                         uint32_t* __restrict buffer,
+                                                         int width, int height,
+                                                         int row_offset,
+                                                         int grain_strength,
+                                                         int clarity_strength) {
+    if (!lut || !buffer || width <= 0 || height <= 0) return;
+
+    init_static_grain_table();
+    int grain_scale = (grain_strength == 2) ? 16 : (grain_strength == 1) ? 8 : 0;
+    int idx = 0;
+
+    for (int y = 0; y < height; y++) {
+        // Prefetch next scanline into L1 cache
+        if (y + 1 < height) {
+            __builtin_prefetch(&buffer[(y + 1) * width], 1, 1);
+        }
+
+        int global_y = row_offset + y;
+        const int8_t* bayer_row = BAYER_2X2[global_y & 1];
+        int grain_y_offset = (global_y & 63) << 6;
+        uint32_t rng_state = (uint32_t)(global_y * 1103515245U + 12345U);
+        int prev_luma = 128;
+
+        for (int x = 0; x < width; x++) {
+            if ((x & 15) == 0) {
+                __builtin_prefetch(&buffer[idx + 16], 1, 1);
+            }
+            uint32_t px = buffer[idx];
+
+            // 1. Full 8-bit precision unpacking (Zero 5/6/5 quantization!)
+            uint8_t r = (uint8_t)(px & 0xFF);
+            uint8_t g = (uint8_t)((px >> 8) & 0xFF);
+            uint8_t b = (uint8_t)((px >> 16) & 0xFF);
+
+            // 2. 17x17x17 3D LUT Trilinear Interpolation
+            uint8_t or_val, og_val, ob_val;
+            lut17_interpolate_pixel(lut, r, g, b, &or_val, &og_val, &ob_val);
+
+            // 3. Fast Rec.601 Luma calculation
+            int luma = (or_val * 77 + og_val * 150 + ob_val * 29) >> 8;
+
+            // 4. Deterministic Grain with Parabolic Midtone Envelope (no horizontal strip seams)
+            int grain_delta = 0;
+            if (grain_scale > 0) {
+                rng_state = rng_state * 1103515245U + 12345U;
+                int8_t lcg_noise = (int8_t)((rng_state >> 16) & 0x3F) - 32;
+                int8_t table_noise = STATIC_GRAIN_64x64[grain_y_offset | (x & 63)];
+                int8_t raw_noise = (int8_t)((lcg_noise + table_noise) >> 1);
+                int midtone_weight = (luma * (255 - luma)) >> 8;
+                grain_delta = (raw_noise * grain_scale * midtone_weight) >> 8;
+            }
+
+            // 5. Fast Micro-Contrast (Clarity) Boost along scanline
+            int clarity_delta = 0;
+            if (clarity_strength != 0) {
+                int dl = luma - prev_luma;
+                clarity_delta = (dl * clarity_strength) >> 4;
+            }
+            prev_luma = luma;
+
+            // 6. Bayer ordered dithering
+            int dither = bayer_row[x & 1];
+            int total_delta = grain_delta + clarity_delta + dither;
+            int dr = clamp_u8_fast(or_val + total_delta);
+            int dg = clamp_u8_fast(og_val + total_delta - (dither >> 1));
+            int db = clamp_u8_fast(ob_val + total_delta);
+
+            // 7. Repack to ARGB_8888 (preserve alpha = 0xFF)
+            buffer[idx++] = (uint32_t)((0xFFU << 24) | ((uint32_t)db << 16) | ((uint32_t)dg << 8) | (uint32_t)dr);
         }
     }
 }

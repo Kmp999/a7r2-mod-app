@@ -31,6 +31,6 @@ LOCAL_SRC_FILES := \
 LOCAL_LDLIBS    := -llog -lm
 
 # Optimization flags for ARMv7-A (Sony A7R II BIONZ X Cortex-A CPU)
-LOCAL_CFLAGS    := -O3 -mfloat-abi=softfp -mfpu=neon -ffast-math -ftree-vectorize
+LOCAL_CFLAGS    := -O3 -ffast-math -ftree-vectorize -funroll-loops -mfloat-abi=softfp -mfpu=neon -march=armv7-a
 
 include $(BUILD_SHARED_LIBRARY)

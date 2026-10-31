@@ -91,6 +91,14 @@ public class CaptureController {
             }
         });
 
+        // Enhancement 3: Startup sweep for leftover .tmp files from previous hard power-offs
+        this.ioExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                StorageResolver.cleanupOrphanedTempFiles();
+            }
+        });
+
         // Asynchronous Decoupling: Hook into hardware StoreImageCompleteListener if available
         if (cameraAdapter instanceof SonyPmcaAdapter) {
             ((SonyPmcaAdapter) cameraAdapter).setStoreImageListener(new SonyPmcaAdapter.StoreImageListener() {
@@ -98,6 +106,15 @@ public class CaptureController {
                 public void onImageStored(String dir, String filename) {
                     final File rawFile = new File(dir, filename);
                     final int seqNum = StorageResolver.parseSequenceNumber(filename);
+                    if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
+                        Log.w(TAG, "Grading queue full on hardware store; skipping background grading.");
+                        if (uiController != null) {
+                            uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
+                        }
+                        return;
+                    }
+                    pendingJobsCount.incrementAndGet();
+                    updateQueueHud();
                     processingExecutor.execute(new Runnable() {
                         @Override
                         public void run() {
@@ -106,6 +123,20 @@ public class CaptureController {
                     });
                 }
             });
+        }
+    }
+
+    public static final int MAX_PENDING_JOBS = 8;
+    private final java.util.concurrent.atomic.AtomicInteger pendingJobsCount = new java.util.concurrent.atomic.AtomicInteger(0);
+    private volatile boolean isShuttingDown = false;
+
+    public int getPendingJobsCount() {
+        return pendingJobsCount.get();
+    }
+
+    private void updateQueueHud() {
+        if (uiController != null) {
+            uiController.setPendingGradingCount(pendingJobsCount.get());
         }
     }
 
@@ -191,7 +222,24 @@ public class CaptureController {
                         // 2. Synchronize DCF Sequence Number
                         final int seqNum = StorageResolver.allocateNextSequenceNumber();
 
+                        // Enhancement 2: Check queue bounding (MAX_PENDING_JOBS = 8)
+                        if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
+                            Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
+                            if (uiController != null) {
+                                uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
+                            }
+                            ioExecutor.execute(new Runnable() {
+                                @Override
+                                public void run() {
+                                    StorageResolver.saveRawJpegToSd(context, jpegData, seqNum);
+                                }
+                            });
+                            return;
+                        }
+
                         // 3. Immediately hand off jpegData to background processingExecutor and return (< 30ms UI return)
+                        pendingJobsCount.incrementAndGet();
+                        updateQueueHud();
                         processingExecutor.execute(new Runnable() {
                             @Override
                             public void run() {
@@ -359,76 +407,102 @@ public class CaptureController {
             final int grainStrength = recipe.grainEffect.ordinal();
             final int clarityStrength = recipe.clarity;
 
-            // 5. Open native JPEG stream session configured for 10.6MP output (Quality 95)
-            long streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), dstW, dstH, 95);
-            if (streamHandle == 0) {
-                Log.e(TAG, "Failed opening native JPEG stream at " + tmpFile.getAbsolutePath());
-                if (decoder != null) decoder.recycle();
-                return;
-            }
-
-            // 6. Strict Dalvik Heap Management: Process in source strips of 128 rows (producing 3976 x 64 strips)
-            final int srcStripH = 128;
-            final int numStrips = (srcH + srcStripH - 1) / srcStripH;
-
-            // Allocate single direct buffer once per image (3976 * 64 * 2 bytes = ~508 KB)
-            java.nio.ByteBuffer stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2);
-
-            BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inSampleSize = (srcW > 4000) ? 2 : 1; // Native 1/2 DCT downsampling: 7952x5304 -> 3976x2652
-            opts.inPreferredConfig = Bitmap.Config.RGB_565;
-            opts.inDither = false;
-            opts.inMutable = true;
-
-            boolean streamSuccess = true;
-            int outputRowOffset = 0;
-            try {
-                for (int stripIdx = 0; stripIdx < numStrips; stripIdx++) {
-                    int srcY = stripIdx * srcStripH;
-                    int currentSrcH = Math.min(srcStripH, srcH - srcY);
-                    Rect rect = new Rect(0, srcY, srcW, srcY + currentSrcH);
-
-                    Bitmap stripBmp = null;
-                    try {
-                        stripBmp = decoder.decodeRegion(rect, opts);
-                        if (stripBmp == null) {
-                            Log.e(TAG, "decodeRegion returned null for strip at source row " + srcY);
-                            streamSuccess = false;
-                            break;
-                        }
-                        int outStripW = stripBmp.getWidth();  // 3976
-                        int outStripH = stripBmp.getHeight(); // 64 (or 28 for final strip)
-
-                        stripDirect.clear();
-                        stripBmp.copyPixelsToBuffer(stripDirect);
-                        stripDirect.rewind();
-
-                        // Native C fused grading (deterministic row-seeded PRNG) + JPEG stream write
-                        boolean stripOk = ColorEngine.gradeAndWriteStreamStripSafe(
-                            streamHandle, stripDirect, outStripW, outStripH, outputRowOffset, grainStrength, clarityStrength
-                        );
-                        if (!stripOk) {
-                            Log.e(TAG, "Failed encoding strip at output row " + outputRowOffset);
-                            streamSuccess = false;
-                            break;
-                        }
-                        outputRowOffset += outStripH;
-                    } finally {
-                        // Crucial: immediately recycle strip Bitmap before decoding next row block
-                        if (stripBmp != null && !stripBmp.isRecycled()) {
-                            stripBmp.recycle();
-                            stripBmp = null;
-                        }
-                    }
-                }
-            } finally {
-                // Deterministic stream closure in finally block
-                boolean closed = ColorEngine.closeJpegStreamSafe(streamHandle, streamSuccess);
-                streamHandle = 0;
-                if (!closed) streamSuccess = false;
+            // 5. Check Pure Native C Zero-JNI-Copy Fast-Path
+            boolean streamSuccess = false;
+            if (ColorEngine.isNativeAvailable() && ColorEngine.nativeProcessImageStreamFastSafe(rawJpegPath, tmpFile.getAbsolutePath(), grainStrength, clarityStrength)) {
+                streamSuccess = true;
                 if (decoder != null) {
                     decoder.recycle();
                     decoder = null;
+                }
+            } else {
+                // Fallback: Java BitmapRegionDecoder strip-streaming loop
+                long streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), dstW, dstH, 95);
+                if (streamHandle == 0) {
+                    Log.e(TAG, "Failed opening native JPEG stream at " + tmpFile.getAbsolutePath());
+                    if (decoder != null) decoder.recycle();
+                    return;
+                }
+
+                // 6. Strict Dalvik Heap Management: Process in source strips of 128 rows (producing 3976 x 64 strips)
+                final int srcStripH = 128;
+                final int numStrips = (srcH + srcStripH - 1) / srcStripH;
+
+                // Allocate single direct buffer once per image (3976 * 64 * 4 bytes = ~1.01 MB for ARGB_8888)
+                java.nio.ByteBuffer stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 4);
+
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inSampleSize = (srcW > 4000) ? 2 : 1; // Native 1/2 DCT downsampling: 7952x5304 -> 3976x2652
+                opts.inPreferredConfig = Bitmap.Config.ARGB_8888; // Enhancement 1: Upgrade to ARGB_8888 precision
+                opts.inDither = false;
+                opts.inMutable = true;
+
+                streamSuccess = true;
+                int outputRowOffset = 0;
+                try {
+                    for (int stripIdx = 0; stripIdx < numStrips; stripIdx++) {
+                        // Enhancement 3: Check abort flag on power-off / shutdown
+                        if (isShuttingDown) {
+                            Log.w(TAG, "Aborting strip streaming: camera shutdown in progress");
+                            streamSuccess = false;
+                            break;
+                        }
+
+                        int srcY = stripIdx * srcStripH;
+                        int currentSrcH = Math.min(srcStripH, srcH - srcY);
+                        Rect rect = new Rect(0, srcY, srcW, srcY + currentSrcH);
+
+                        Bitmap stripBmp = null;
+                        try {
+                            try {
+                                stripBmp = decoder.decodeRegion(rect, opts);
+                            } catch (OutOfMemoryError oom) {
+                                Log.w(TAG, "OOM decoding strip in ARGB_8888, falling back to RGB_565", oom);
+                                opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                                stripBmp = decoder.decodeRegion(rect, opts);
+                            }
+                            if (stripBmp == null) {
+                                Log.e(TAG, "decodeRegion returned null for strip at source row " + srcY);
+                                streamSuccess = false;
+                                break;
+                            }
+                            int outStripW = stripBmp.getWidth();  // 3976
+                            int outStripH = stripBmp.getHeight(); // 64 (or 28 for final strip)
+
+                            stripDirect.clear();
+                            stripBmp.copyPixelsToBuffer(stripDirect);
+                            stripDirect.rewind();
+
+                            // Native C fused grading (deterministic row-seeded PRNG) + JPEG stream write
+                            boolean stripOk = ColorEngine.gradeAndWriteStreamStripSafe(
+                                streamHandle, stripDirect, outStripW, outStripH, outputRowOffset, grainStrength, clarityStrength
+                            );
+                            if (!stripOk) {
+                                Log.e(TAG, "Failed encoding strip at output row " + outputRowOffset);
+                                streamSuccess = false;
+                                break;
+                            }
+                            outputRowOffset += outStripH;
+                        } finally {
+                            // Crucial: immediately recycle strip Bitmap before decoding next row block
+                            if (stripBmp != null && !stripBmp.isRecycled()) {
+                                stripBmp.recycle();
+                                stripBmp = null;
+                            }
+                        }
+                    }
+                } finally {
+                    // Deterministic stream closure in finally block
+                    boolean closed = ColorEngine.closeJpegStreamSafe(streamHandle, streamSuccess);
+                    streamHandle = 0;
+                    if (!closed) streamSuccess = false;
+                    if (decoder != null) {
+                        decoder.recycle();
+                        decoder = null;
+                    }
+                    if (!streamSuccess && tmpFile.exists()) {
+                        tmpFile.delete(); // Delete incomplete .tmp file on failure/abort
+                    }
                 }
             }
 
@@ -482,6 +556,9 @@ public class CaptureController {
             }
         } finally {
             appState.setProcessing(false);
+            int remaining = pendingJobsCount.decrementAndGet();
+            if (remaining < 0) pendingJobsCount.set(0);
+            updateQueueHud();
             System.gc();
         }
     }
@@ -610,8 +687,24 @@ public class CaptureController {
     }
 
     public void shutdown() {
+        isShuttingDown = true;
         watchdogHandler.removeCallbacks(captureWatchdogRunnable);
         processingExecutor.shutdown();
         ioExecutor.shutdown();
+        try {
+            if (!processingExecutor.awaitTermination(2500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "processingExecutor did not terminate within 2500ms; forcing shutdown");
+                processingExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            processingExecutor.shutdownNow();
+        }
+        try {
+            if (!ioExecutor.awaitTermination(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                ioExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            ioExecutor.shutdownNow();
+        }
     }
 }

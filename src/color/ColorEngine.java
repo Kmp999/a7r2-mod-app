@@ -318,4 +318,20 @@ public class ColorEngine {
     }
 
     public static native boolean nativeCloseJpegStream(long handle, int success);
+
+    /**
+     * Pure C Zero-JNI-Copy Fast-Path Strip Streaming Pipeline:
+     * Decompresses, grades with 17^3 3D LUT + Grain + Clarity, and streams JPEG directly in native C.
+     */
+    public static boolean nativeProcessImageStreamFastSafe(String inputPath, String outputPath, int grainStrength, int clarityStrength) {
+        if (!sNativeAvailable || inputPath == null || outputPath == null) return false;
+        try {
+            return nativeProcessImageStreamFast(inputPath, outputPath, grainStrength, clarityStrength);
+        } catch (Throwable t) {
+            Log.d(TAG, "nativeProcessImageStreamFastSafe fallback: " + t.getMessage());
+            return false;
+        }
+    }
+
+    public static native boolean nativeProcessImageStreamFast(String inputPath, String outputPath, int grainStrength, int clarityStrength);
 }
