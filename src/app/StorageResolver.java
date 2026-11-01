@@ -908,19 +908,21 @@ public final class StorageResolver {
         while (System.currentTimeMillis() < deadline) {
             List<File> candidates = getCandidateDcimDirs();
             File newest = null;
-            long newestTime = startTime - 3000; // Allow up to 3s clock skew
+            long newestTime = (preCaptureLatest != null) ? preCaptureLatest.lastModified() : 0;
             for (File dir : candidates) {
                 if (dir.exists() && dir.isDirectory()) {
                     File[] files = dir.listFiles();
                     if (files != null) {
                         for (File f : files) {
                             String name = f.getName().toUpperCase(Locale.US);
-                            if (name.startsWith("DSC") && name.endsWith(".JPG")) {
-                                if (preCaptureLatest != null && f.getAbsolutePath().equals(preCaptureLatest.getAbsolutePath()) && f.length() == preCaptureLatest.length()) {
+                            if (name.contains("DSC") && name.endsWith(".JPG")) {
+                                if (preCaptureLatest != null
+                                    && f.getAbsolutePath().equals(preCaptureLatest.getAbsolutePath())
+                                    && f.length() == preCaptureLatest.length()) {
                                     continue;
                                 }
                                 long mod = f.lastModified();
-                                if (mod >= newestTime && f.length() > 200 * 1024) {
+                                if (f.length() > 200 * 1024 && (newest == null || mod >= newestTime)) {
                                     newestTime = mod;
                                     newest = f;
                                 }
@@ -944,7 +946,7 @@ public final class StorageResolver {
                 break;
             }
         }
-        return null;
+        return getLatestSavedPhoto();
     }
 
     public static String getLastDiagnostic() {

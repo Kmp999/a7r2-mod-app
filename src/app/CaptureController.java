@@ -204,6 +204,9 @@ public class CaptureController {
 
         try {
             if (cameraAdapter instanceof SonyPmcaAdapter) {
+                // Record pre-capture latest photo BEFORE triggering the shutter!
+                final File preCaptureFile = StorageResolver.getLatestSavedPhoto();
+
                 // SONY HARDWARE CAPTURE: Trip BIONZ X with (shutter, null, null) to bypass 1.7MP HAL proxy!
                 // BIONZ X writes the full 42.4MP (7952 x 5304) DSC0xxxx.JPG directly to the SD card.
                 Camera.ShutterCallback shutterCb = new Camera.ShutterCallback() {
@@ -211,13 +214,24 @@ public class CaptureController {
                     public void onShutter() {
                         watchdogHandler.removeCallbacks(captureWatchdogRunnable);
                         try {
-                            cameraAdapter.cancelTakePicture();
+                            // Note: Do NOT call cancelTakePicture() here as it aborts the hardware exposure.
                             setState(CameraState.RESTORING_PREVIEW);
-                            cameraAdapter.resumePreview();
-                            restorePreviewWithWatchdog(3);
+                            // Restore preview after mechanical shutter exposure cycle
+                            watchdogHandler.postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        cameraAdapter.resumePreview();
+                                        restorePreviewWithWatchdog(3);
+                                    } catch (Throwable t) {
+                                        Log.w(TAG, "Delayed preview restore failed", t);
+                                    } finally {
+                                        isCapturing.set(false);
+                                    }
+                                }
+                            }, 120);
                         } catch (Throwable t) {
                             Log.e(TAG, "onShutter preview restore error", t);
-                        } finally {
                             isCapturing.set(false);
                         }
                     }
@@ -238,14 +252,26 @@ public class CaptureController {
                     @Override
                     public void run() {
                         // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                        File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, 5000);
+                        File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCaptureFile, 6000);
                         String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
+                        int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
+                        if (actualSeq <= 0) actualSeq = seqNum;
+
                         if (photoPath != null) {
-                            processStripStreamingCapture(photoPath, null, seqNum, captureStartTime);
+                            processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
                         } else {
                             File master = StorageResolver.findRawMasterFile(seqNum);
                             if (master != null) {
                                 processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
+                            } else {
+                                File latest = StorageResolver.getLatestSavedPhoto();
+                                if (latest != null && latest.length() > 200 * 1024) {
+                                    int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
+                                    processStripStreamingCapture(latest.getAbsolutePath(), null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
+                                } else {
+                                    Log.e(TAG, "No photo found on SD card after hardware capture");
+                                    if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
+                                }
                             }
                         }
                     }
@@ -437,7 +463,14 @@ public class CaptureController {
             Log.i(TAG, "Processing Strip-Streaming [" + resMode.label + "]: " + srcW + "x" + srcH + " -> " + dstW + "x" + dstH + " (" + rawJpegPath + ")");
 
             // 3. Prepare target and temporary files (Safe temp-file-then-rename)
-            final File targetOutputFile = StorageResolver.getGradedOutputFile(seqNum);
+            File resolvedTarget = StorageResolver.getGradedOutputFile(seqNum);
+            if (rawJpegPath != null) {
+                File rawDir = new File(rawJpegPath).getParentFile();
+                if (rawDir != null && rawDir.exists() && rawDir.isDirectory()) {
+                    resolvedTarget = new File(rawDir, String.format(Locale.US, "fuji_%04d.jpg", seqNum));
+                }
+            }
+            final File targetOutputFile = resolvedTarget;
             final File tmpFile = new File(targetOutputFile.getParentFile(), targetOutputFile.getName() + ".tmp");
             if (tmpFile.exists()) {
                 tmpFile.delete();
