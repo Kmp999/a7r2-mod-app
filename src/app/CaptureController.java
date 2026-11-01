@@ -366,9 +366,10 @@ public class CaptureController {
     }
 
     public void onShutterKeyUp() {
-        if (cameraAdapter instanceof SonyPmcaAdapter) {
-            ((SonyPmcaAdapter) cameraAdapter).cancelTakePicture();
-        }
+        // Do NOT call cancelTakePicture() here: calling cancelTakePicture on S2 release
+        // corrupts BIONZ X hardware capture sequence for subsequent shots!
+        isCapturing.set(false);
+        Log.d(TAG, "onShutterKeyUp - ready for next shot");
     }
 
     /**
@@ -424,8 +425,10 @@ public class CaptureController {
             }
 
             File rawMasterFile = new File(rawJpegPath);
-            // Verify file size stability and JPEG EOI marker (0xFF 0xD9)
-            StorageResolver.waitForJpegComplete(rawMasterFile, 3000);
+            // Verify file size stability and JPEG EOI marker (0xFF 0xD9) if not already complete
+            if (!StorageResolver.isJpegComplete(rawMasterFile)) {
+                StorageResolver.waitForJpegComplete(rawMasterFile, 1500);
+            }
 
             final FujiRecipe recipe = appState.getActiveRecipe();
             final String presetName = appState.getCurrentPresetName();
@@ -471,8 +474,8 @@ public class CaptureController {
                 targetSample = 1;
                 srcStripH = 64;
             }
-            final int dstW = (targetSample == 1) ? srcW : (srcW > 4000 ? srcW / 2 : srcW); // dstW = (srcW > 4000) ? srcW / 2 : srcW
-            final int dstH = (targetSample == 1) ? srcH : ((srcH > 3000) ? srcH / 2 : srcH);
+            final int dstW = (targetSample == 1) ? srcW : (srcW > 4000 ? (srcW >= 7000 ? srcW / 2 : srcW) : srcW); // dstW = (srcW > 4000) ? srcW / 2 : srcW
+            final int dstH = (targetSample == 1) ? srcH : ((srcH > 3000) ? (srcW >= 7000 ? srcH / 2 : srcH) : srcH);
             Log.i(TAG, "Processing Strip-Streaming [" + resMode.label + "]: " + srcW + "x" + srcH + " -> " + dstW + "x" + dstH + " (" + rawJpegPath + ")");
 
             // 3. Prepare target and temporary files (Safe temp-file-then-rename)
@@ -667,8 +670,11 @@ public class CaptureController {
                 gradedSavedPath = targetOutputFile.getAbsolutePath();
 
                 // 8. Copy original camera EXIF metadata from DSC0xxxx.JPG to fuji_xxxx.jpg with dynamic dims & DR mode stamp
-                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
-                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
+                if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
+                    StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
+                } else {
+                    StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
+                }
 
                 // 9. Register with Sony AvindexStore
                 StorageResolver.registerWithAvindex(context, gradedSavedPath);

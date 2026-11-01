@@ -1073,7 +1073,7 @@ public final class StorageResolver {
             }
             if (newest != null) {
                 long initialSize = newest.length();
-                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                try { Thread.sleep(50); } catch (InterruptedException ignored) {}
                 long currentSize = newest.length();
                 if (currentSize == initialSize && isJpegComplete(newest)) {
                     Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (currentSize/1024) + " KB)");

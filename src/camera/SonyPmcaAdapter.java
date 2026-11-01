@@ -441,6 +441,20 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public void takeHardwarePicture(final Camera.ShutterCallback shutterCallback) {
         if (!ensureOpen()) return;
 
+        // Ensure image size is Large (42.4MP on Full Frame, 18MP on APS-C) before every shot
+        if (cameraEx != null) {
+            try {
+                Object mod = getModifier();
+                if (mod != null) {
+                    Method m = findAccessibleMethod(mod, "setImageSize", String.class);
+                    if (m != null) {
+                        m.invoke(mod, "large");
+                    }
+                    commitModifier(mod);
+                }
+            } catch (Throwable ignored) {}
+        }
+
         // 1. Preferred Sony PMCA method (LightLab hardware trigger): CameraEx.burstableTakePicture()
         if (cameraEx != null) {
             try {
