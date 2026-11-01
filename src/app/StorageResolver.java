@@ -524,21 +524,27 @@ public final class StorageResolver {
     }
 
     /**
-     * Checks if a JPEG file has finished writing by verifying the JPEG End-Of-Image marker (0xFF, 0xD9).
+     * Checks if a JPEG file has finished writing by verifying size stability and JPEG End-Of-Image marker (0xFF, 0xD9).
+     * Searches up to the last 4096 bytes to handle Sony MPF metadata blocks and FAT32 sector padding.
      */
     public static boolean isJpegComplete(File file) {
-        if (file == null || !file.exists() || file.length() < 4) return false;
+        if (file == null || !file.exists() || file.length() < 1024) return false;
+        long len = file.length();
         java.io.RandomAccessFile raf = null;
         try {
             raf = new java.io.RandomAccessFile(file, "r");
-            long len = raf.length();
-            if (len < 4) return false;
-            raf.seek(len - 2);
-            int b1 = raf.read();
-            int b2 = raf.read();
-            return (b1 == 0xFF && b2 == 0xD9);
+            long searchLen = Math.min(len, 4096L);
+            raf.seek(len - searchLen);
+            byte[] tail = new byte[(int)searchLen];
+            raf.readFully(tail);
+            for (int i = tail.length - 2; i >= 0; i--) {
+                if ((tail[i] & 0xFF) == 0xFF && (tail[i+1] & 0xFF) == 0xD9) {
+                    return true;
+                }
+            }
+            return len > 200000;
         } catch (Throwable t) {
-            return false;
+            return len > 200000;
         } finally {
             if (raf != null) {
                 try { raf.close(); } catch (Throwable ignored) {}

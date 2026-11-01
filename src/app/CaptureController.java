@@ -526,16 +526,43 @@ public class CaptureController {
                 // Fallback: Java BitmapRegionDecoder strip-streaming loop
                 long streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), dstW, dstH, 95);
                 if (streamHandle == 0) {
-                    Log.w(TAG, "Native stream unavailable, falling back to direct bitmap grading and saving modified image");
-                    Bitmap fallbackBmp = BitmapFactory.decodeFile(rawJpegPath);
+                    Log.w(TAG, "Native stream unavailable, falling back to downsampled bitmap grading (10.6MP)");
+                    BitmapFactory.Options fallbackOpts = new BitmapFactory.Options();
+                    fallbackOpts.inSampleSize = (srcW > 4000) ? 2 : 1;
+                    fallbackOpts.inPreferredConfig = Bitmap.Config.RGB_565;
+                    fallbackOpts.inDither = true;
+
+                    Bitmap fallbackBmp = null;
+                    if (decoder != null) {
+                        try {
+                            fallbackBmp = decoder.decodeRegion(new Rect(0, 0, srcW, srcH), fallbackOpts);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "decodeRegion for fallback failed, trying decodeFile", t);
+                        }
+                    }
+                    if (fallbackBmp == null) {
+                        try {
+                            fallbackBmp = BitmapFactory.decodeFile(rawJpegPath, fallbackOpts);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "decodeFile for fallback failed", t);
+                        }
+                    }
                     if (fallbackBmp == null && inMemoryJpegData != null) {
-                        fallbackBmp = BitmapFactory.decodeByteArray(inMemoryJpegData, 0, inMemoryJpegData.length);
+                        fallbackBmp = BitmapFactory.decodeByteArray(inMemoryJpegData, 0, inMemoryJpegData.length, fallbackOpts);
                     }
                     if (fallbackBmp != null) {
                         ColorEngine.applyLutAndGrainBitmapSafe(fallbackBmp, grainStrength, clarityStrength);
                         String saved = StorageResolver.saveGradedJpegToSd(context, fallbackBmp, seqNum, presetName);
+                        if (saved != null) {
+                            StorageResolver.copyExifMetadata(rawJpegPath, saved, presetName, recipe.dynamicRange.label, fallbackBmp.getWidth(), fallbackBmp.getHeight());
+                            StorageResolver.registerWithAvindex(context, saved);
+                        }
                         long ms = System.currentTimeMillis() - captureStartTime;
                         deliverResult(fallbackBmp, presetName, fallbackBmp.getWidth(), fallbackBmp.getHeight(), ms, saved);
+                        uiController.updateStatusAsync(String.format(Locale.US, "SAVED fuji_%04d.jpg (%dx%d) in %dms", seqNum, fallbackBmp.getWidth(), fallbackBmp.getHeight(), ms));
+                    } else {
+                        Log.e(TAG, "Failed to decode fallback bitmap for " + rawJpegPath);
+                        if (uiController != null) uiController.updateStatusAsync("ERR: Decode failed");
                     }
                     if (decoder != null) decoder.recycle();
                     return;
