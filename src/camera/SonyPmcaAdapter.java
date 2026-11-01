@@ -440,6 +440,24 @@ public class SonyPmcaAdapter implements CameraAdapter {
      */
     public void takeHardwarePicture(final Camera.ShutterCallback shutterCallback) {
         if (!ensureOpen()) return;
+
+        // 1. Preferred Sony PMCA method (LightLab hardware trigger): CameraEx.burstableTakePicture()
+        if (cameraEx != null) {
+            try {
+                Method burstM = cameraEx.getClass().getMethod("burstableTakePicture");
+                burstM.setAccessible(true);
+                burstM.invoke(cameraEx);
+                Log.i(TAG, "Hardware CameraEx.burstableTakePicture() invoked successfully");
+                if (shutterCallback != null) {
+                    shutterCallback.onShutter();
+                }
+                return;
+            } catch (Throwable t) {
+                Log.w(TAG, "CameraEx.burstableTakePicture() unavailable; trying normalCamera.takePicture", t);
+            }
+        }
+
+        // 2. Direct normalCamera.takePicture(null, null, null) or with shutterCallback
         try {
             normalCamera.takePicture(shutterCallback, null, null);
             Log.i(TAG, "Hardware takePicture(shutter, null, null) invoked");
@@ -461,7 +479,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public void resumePreview() {
         if (normalCamera == null) return;
         try {
-            cancelTakePicture();
+            // Note: Do NOT call cancelTakePicture() here as it aborts the hardware exposure.
             normalCamera.startPreview();
         } catch (Throwable t) {
             Log.e(TAG, "resumePreview failed", t);

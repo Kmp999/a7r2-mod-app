@@ -204,8 +204,8 @@ public class CaptureController {
 
         try {
             if (cameraAdapter instanceof SonyPmcaAdapter) {
-                // Record pre-capture latest photo BEFORE triggering the shutter!
-                final File preCaptureFile = StorageResolver.getLatestSavedPhoto();
+                // Snapshot all existing photos on the SD card BEFORE tripping the shutter!
+                final java.util.Set<String> preExistingFiles = StorageResolver.snapshotExistingPhotos();
 
                 // SONY HARDWARE CAPTURE: Trip BIONZ X with (shutter, null, null) to bypass 1.7MP HAL proxy!
                 // BIONZ X writes the full 42.4MP (7952 x 5304) DSC0xxxx.JPG directly to the SD card.
@@ -251,27 +251,40 @@ public class CaptureController {
                 processingExecutor.execute(new Runnable() {
                     @Override
                     public void run() {
-                        // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                        File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCaptureFile, 6000);
-                        String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
-                        int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
-                        if (actualSeq <= 0) actualSeq = seqNum;
+                        boolean jobStarted = false;
+                        try {
+                            // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
+                            File newPhoto = StorageResolver.waitForNewCameraPhoto(preExistingFiles, 7000);
+                            String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
+                            int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
+                            if (actualSeq <= 0) actualSeq = seqNum;
 
-                        if (photoPath != null) {
-                            processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
-                        } else {
-                            File master = StorageResolver.findRawMasterFile(seqNum);
-                            if (master != null) {
-                                processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
+                            if (photoPath != null) {
+                                jobStarted = true;
+                                processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
                             } else {
-                                File latest = StorageResolver.getLatestSavedPhoto();
-                                if (latest != null && latest.length() > 200 * 1024) {
-                                    int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
-                                    processStripStreamingCapture(latest.getAbsolutePath(), null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
+                                File master = StorageResolver.findRawMasterFile(seqNum);
+                                if (master != null) {
+                                    jobStarted = true;
+                                    processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
                                 } else {
-                                    Log.e(TAG, "No photo found on SD card after hardware capture");
-                                    if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
+                                    File latest = StorageResolver.getLatestSavedPhoto();
+                                    if (latest != null && latest.length() > 200 * 1024) {
+                                        int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
+                                        jobStarted = true;
+                                        processStripStreamingCapture(latest.getAbsolutePath(), null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
+                                    } else {
+                                        Log.e(TAG, "No photo found on SD card after hardware capture");
+                                        if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
+                                    }
                                 }
+                            }
+                        } finally {
+                            if (!jobStarted) {
+                                int rem = pendingJobsCount.decrementAndGet();
+                                if (rem < 0) pendingJobsCount.set(0);
+                                updateQueueHud();
+                                appState.setProcessing(false);
                             }
                         }
                     }

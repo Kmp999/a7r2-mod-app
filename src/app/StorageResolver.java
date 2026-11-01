@@ -17,6 +17,7 @@ import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -888,6 +889,72 @@ public final class StorageResolver {
             Log.e(TAG, "Failed to decode photo for review: " + photoFile.getAbsolutePath(), t);
             return null;
         }
+    }
+
+    /**
+     * Snapshots all existing photo file absolute paths across all candidate DCIM directories.
+     */
+    public static Set<String> snapshotExistingPhotos() {
+        Set<String> set = new HashSet<String>();
+        List<File> candidates = getCandidateDcimDirs();
+        for (File dir : candidates) {
+            if (!dir.exists() || !dir.isDirectory()) continue;
+            File[] files = dir.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                if (f.isFile() && f.length() > 0) {
+                    set.add(f.getAbsolutePath());
+                }
+            }
+        }
+        return set;
+    }
+
+    /**
+     * Polls DCIM directories for any new camera photo whose absolute path is NOT in preExistingFiles.
+     */
+    public static File waitForNewCameraPhoto(final Set<String> preExistingFiles, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            List<File> candidates = getCandidateDcimDirs();
+            File newest = null;
+            long newestTime = 0;
+            for (File dir : candidates) {
+                if (!dir.exists() || !dir.isDirectory()) continue;
+                File[] files = dir.listFiles();
+                if (files == null) continue;
+                for (File f : files) {
+                    if (f.isFile() && f.length() > 50000) {
+                        String name = f.getName().toUpperCase(Locale.US);
+                        if ((name.endsWith(".JPG") || name.endsWith(".JPEG")) && !name.startsWith("FUJI_")) {
+                            if (preExistingFiles != null && preExistingFiles.contains(f.getAbsolutePath())) {
+                                continue;
+                            }
+                            long mod = f.lastModified();
+                            if (newest == null || mod >= newestTime) {
+                                newestTime = mod;
+                                newest = f;
+                            }
+                        }
+                    }
+                }
+            }
+            if (newest != null) {
+                long initialSize = newest.length();
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                long currentSize = newest.length();
+                if (currentSize == initialSize && isJpegComplete(newest)) {
+                    Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (currentSize/1024) + " KB)");
+                    return newest;
+                }
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ignored) {
+                break;
+            }
+        }
+        return getLatestSavedPhoto();
     }
 
     /**
