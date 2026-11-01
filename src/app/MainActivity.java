@@ -361,7 +361,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (action == KeyEvent.ACTION_DOWN) {
                 long now = System.currentTimeMillis();
                 if (event.getRepeatCount() > 0) return true;
-                if (isS2PhysicallyHeld && (now - lastShutterDownTime < 600)) return true; // Debounce 600ms
+                if (now - lastShutterDownTime < 600) return true; // Debounce 600ms
                 isS2PhysicallyHeld = true;
                 lastShutterDownTime = now;
 
@@ -388,6 +388,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         if (fujiAction == SonyKeyCodes.FujiAction.HALF_SHUTTER) {
             if (action == KeyEvent.ACTION_DOWN) {
+                isS2PhysicallyHeld = false; // Reset S2 state on new focus half-press
                 if (event.getRepeatCount() > 0 || isS1Held) return true;
                 isS1Held = true;
 

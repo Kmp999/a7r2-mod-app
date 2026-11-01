@@ -181,6 +181,9 @@ public class CaptureController {
      */
     public boolean triggerSingleCapture() {
         long now = System.currentTimeMillis();
+        if (now - lastCaptureTime > MIN_SHOT_INTERVAL_MS) {
+            isCapturing.set(false);
+        }
         if (!isCapturing.compareAndSet(false, true)) {
             Log.w(TAG, "Capture ignored: another shot is currently in progress");
             return false;
@@ -237,6 +240,8 @@ public class CaptureController {
                     }
                 };
                 ((SonyPmcaAdapter) cameraAdapter).takeHardwarePicture(shutterCb);
+                // Hardware trigger dispatched: immediately release gate so next shot is never locked out
+                isCapturing.set(false);
 
                 final int seqNum = StorageResolver.allocateNextSequenceNumber();
                 if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
