@@ -360,12 +360,16 @@ public final class StorageResolver {
 
                 if (file.exists() && file.length() > 0) {
                     String savedPath = file.getAbsolutePath();
-                    writeExifMetadata(savedPath);
+                    sCachedWorkingDir = dir;
                     sLastDiagnostic = "OK (42.4MP): " + savedPath + " (" + (file.length() / 1024) + "KB)";
                     Log.i(TAG, "Successfully saved full-res 42.4MP photo: " + sLastDiagnostic);
 
-                    // Register with Sony AvindexStore for physical playback
-                    registerWithAvindex(context, savedPath);
+                    try {
+                        writeExifMetadata(savedPath);
+                    } catch (Throwable ignored) {}
+                    try {
+                        registerWithAvindex(context, savedPath);
+                    } catch (Throwable ignored) {}
                     return savedPath;
                 } else {
                     file.delete();
@@ -420,15 +424,19 @@ public final class StorageResolver {
      * avoiding any accidental redirection to internal partitions like /mnt/wv_cache.
      */
     public static String saveGradedJpegToDirectory(Context context, Bitmap bitmap, File targetDir, int sequenceNum, String recipeName) {
+        List<File> dirsToTry = new ArrayList<File>();
         if (targetDir != null && !targetDir.getAbsolutePath().contains("wv_cache")) {
             if (!targetDir.exists()) targetDir.mkdirs();
             if (targetDir.exists() && targetDir.isDirectory()) {
-                List<File> specific = new ArrayList<File>();
-                specific.add(targetDir);
-                return saveJpegToDirList(context, bitmap, specific, "fuji_", sequenceNum, recipeName);
+                dirsToTry.add(targetDir);
             }
         }
-        return saveGradedJpegToSd(context, bitmap, sequenceNum, recipeName);
+        for (File d : getCandidateDcimDirs()) {
+            if (!dirsToTry.contains(d) && !d.getAbsolutePath().contains("wv_cache")) {
+                dirsToTry.add(d);
+            }
+        }
+        return saveJpegToDirList(context, bitmap, dirsToTry, "fuji_", sequenceNum, recipeName);
     }
 
     private static String saveJpegInternal(Context context, Bitmap bitmap, String prefix, int sequenceNum, String recipeName) {
@@ -503,17 +511,28 @@ public final class StorageResolver {
 
                 if (compressed && file.exists() && file.length() > 0) {
                     String savedPath = file.getAbsolutePath();
-                    File master = findRawMasterFile(sequenceNum);
-                    if (master != null && master.exists()) {
-                        copyExifMetadata(master.getAbsolutePath(), savedPath, recipeName);
-                    } else {
-                        writeExifMetadata(savedPath, recipeName);
-                    }
+                    sCachedWorkingDir = dir;
                     sLastDiagnostic = "OK (" + prefix + "): " + savedPath + " (" + (file.length() / 1024) + "KB)";
                     Log.i(TAG, "Successfully saved graded photo: " + sLastDiagnostic);
 
-                    // Register with Sony AvindexStore for physical playback
-                    registerWithAvindex(context, savedPath);
+                    // Post-processing: EXIF & Avindex isolated so errors never invalidate the saved image!
+                    try {
+                        File master = findRawMasterFile(sequenceNum);
+                        if (master != null && master.exists()) {
+                            copyExifMetadata(master.getAbsolutePath(), savedPath, recipeName);
+                        } else {
+                            writeExifMetadata(savedPath, recipeName);
+                        }
+                    } catch (Throwable exifErr) {
+                        Log.w(TAG, "EXIF preservation non-fatal error: " + exifErr.getMessage());
+                    }
+
+                    try {
+                        registerWithAvindex(context, savedPath);
+                    } catch (Throwable avErr) {
+                        Log.w(TAG, "Avindex registration non-fatal error: " + avErr.getMessage());
+                    }
+
                     return savedPath;
                 } else {
                     if (tmpFile.exists()) {
@@ -572,10 +591,14 @@ public final class StorageResolver {
                             c.close();
                         }
                         if (savedPath != null && new File(savedPath).exists()) {
-                            writeExifMetadata(savedPath, recipeName);
+                            try {
+                                writeExifMetadata(savedPath, recipeName);
+                            } catch (Throwable ignored) {}
                             sLastDiagnostic = "OK (MediaStore): " + savedPath + " (" + (new File(savedPath).length() / 1024) + "KB)";
                             Log.i(TAG, "Successfully saved via MediaStore: " + sLastDiagnostic);
-                            registerWithAvindex(context, savedPath);
+                            try {
+                                registerWithAvindex(context, savedPath);
+                            } catch (Throwable ignored) {}
                             return savedPath;
                         }
                     }
