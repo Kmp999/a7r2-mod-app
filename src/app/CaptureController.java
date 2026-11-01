@@ -465,7 +465,7 @@ public class CaptureController {
                 ? appState.getOutputResolutionMode()
                 : AppState.OutputResolutionMode.FAST_10MP;
 
-            int targetSample = (srcW > 4000) ? 2 : 1;
+            int targetSample = (srcW >= 7000) ? 2 : 1;
             int srcStripH = 128;
             if (resMode == AppState.OutputResolutionMode.MASTER_42MP) {
                 targetSample = 1;
@@ -479,7 +479,7 @@ public class CaptureController {
             File resolvedTarget = StorageResolver.getGradedOutputFile(seqNum);
             if (rawJpegPath != null) {
                 File rawDir = new File(rawJpegPath).getParentFile();
-                if (rawDir != null && rawDir.exists() && rawDir.isDirectory()) {
+                if (rawDir != null && rawDir.exists() && rawDir.isDirectory() && !rawDir.getAbsolutePath().contains("wv_cache")) {
                     resolvedTarget = new File(rawDir, String.format(Locale.US, "fuji_%04d.jpg", seqNum));
                 }
             }
@@ -552,7 +552,8 @@ public class CaptureController {
                     }
                     if (fallbackBmp != null) {
                         ColorEngine.applyLutAndGrainBitmapSafe(fallbackBmp, grainStrength, clarityStrength);
-                        String saved = StorageResolver.saveGradedJpegToSd(context, fallbackBmp, seqNum, presetName);
+                        File targetDir = (rawJpegPath != null) ? new File(rawJpegPath).getParentFile() : null;
+                        String saved = StorageResolver.saveGradedJpegToDirectory(context, fallbackBmp, targetDir, seqNum, presetName);
                         if (saved != null) {
                             StorageResolver.copyExifMetadata(rawJpegPath, saved, presetName, recipe.dynamicRange.label, fallbackBmp.getWidth(), fallbackBmp.getHeight());
                             StorageResolver.registerWithAvindex(context, saved);
@@ -576,8 +577,8 @@ public class CaptureController {
 
                 BitmapFactory.Options opts = new BitmapFactory.Options();
                 opts.inSampleSize = (srcW > 4000) ? 2 : 1;
-                if (resMode == AppState.OutputResolutionMode.MASTER_42MP) {
-                    opts.inSampleSize = 1;
+                if (srcW < 7000 || resMode == AppState.OutputResolutionMode.MASTER_42MP) {
+                    opts.inSampleSize = 1; // Preserve >=10.6MP floor! Never downsample 18MP to 4.5MP!
                 }
                 opts.inPreferredConfig = Bitmap.Config.ARGB_8888; // Enhancement 1: Upgrade to ARGB_8888 precision
                 opts.inDither = false;

@@ -99,8 +99,13 @@ public final class StorageResolver {
                         || mount.startsWith("/dev") || mount.startsWith("/tmp")) {
                         continue;
                     }
+                    // Explicitly ignore internal cache and non-removable system mounts
+                    if (mount.contains("wv_cache") || mount.contains("cache") || mount.contains("data")
+                        || mount.contains("system") || mount.contains("asec") || mount.contains("secure")) {
+                        continue;
+                    }
                     if (fs.contains("fat") || fs.contains("fuse") || fs.contains("sdcard")
-                        || mount.startsWith("/mnt/") || mount.startsWith("/storage/")) {
+                        || mount.startsWith("/mnt/sd") || mount.startsWith("/mnt/ext") || mount.startsWith("/storage/")) {
                         roots.add(mount);
                     }
                 }
@@ -408,20 +413,42 @@ public final class StorageResolver {
         return saveJpegInternal(context, bitmap, "fuji_", -1, null);
     }
 
+    /**
+     * Saves a color-graded JPEG bitmap directly to a specific target directory (e.g. where DSC0xxxx.JPG resides),
+     * avoiding any accidental redirection to internal partitions like /mnt/wv_cache.
+     */
+    public static String saveGradedJpegToDirectory(Context context, Bitmap bitmap, File targetDir, int sequenceNum, String recipeName) {
+        if (targetDir != null && !targetDir.getAbsolutePath().contains("wv_cache")) {
+            if (!targetDir.exists()) targetDir.mkdirs();
+            if (targetDir.exists() && targetDir.isDirectory()) {
+                List<File> specific = new ArrayList<File>();
+                specific.add(targetDir);
+                return saveJpegToDirList(context, bitmap, specific, "fuji_", sequenceNum, recipeName);
+            }
+        }
+        return saveGradedJpegToSd(context, bitmap, sequenceNum, recipeName);
+    }
+
     private static String saveJpegInternal(Context context, Bitmap bitmap, String prefix, int sequenceNum, String recipeName) {
+        return saveJpegToDirList(context, bitmap, getCandidateDcimDirs(), prefix, sequenceNum, recipeName);
+    }
+
+    private static String saveJpegToDirList(Context context, Bitmap bitmap, List<File> candidates, String prefix, int sequenceNum, String recipeName) {
         if (bitmap == null) {
             sLastDiagnostic = "FAIL: Bitmap is null";
             return null;
         }
 
-        List<File> candidates = getCandidateDcimDirs();
-        if (candidates.isEmpty()) {
+        if (candidates == null || candidates.isEmpty()) {
             sLastDiagnostic = "FAIL: No SD mount candidates found";
             Log.e(TAG, sLastDiagnostic);
             return null;
         }
 
         for (File dir : candidates) {
+            if (dir.getAbsolutePath().contains("wv_cache") || dir.getAbsolutePath().contains("cache")) {
+                continue;
+            }
             try {
                 if (!dir.exists()) {
                     dir.mkdirs();
