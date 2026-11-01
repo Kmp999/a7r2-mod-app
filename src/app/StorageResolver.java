@@ -482,9 +482,11 @@ public final class StorageResolver {
 
                 boolean compressed = false;
                 try {
-                    java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(tmpFile), 65536);
+                    FileOutputStream fos = new FileOutputStream(tmpFile);
+                    java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(fos, 65536);
                     compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
                     out.flush();
+                    try { fos.getFD().sync(); } catch (Throwable ignored) {}
                     out.close();
 
                     if (compressed && tmpFile.exists() && tmpFile.length() > 0) {
@@ -500,9 +502,11 @@ public final class StorageResolver {
                 } catch (Throwable tmpEx) {
                     Log.w(TAG, "Tmp write failed in " + dir.getAbsolutePath() + " (" + tmpEx.getMessage() + "), attempting direct write to " + file.getName());
                     try {
-                        java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(file), 65536);
+                        FileOutputStream fos = new FileOutputStream(file);
+                        java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(fos, 65536);
                         compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
                         out.flush();
+                        try { fos.getFD().sync(); } catch (Throwable ignored) {}
                         out.close();
                     } catch (Throwable dirEx) {
                         Log.w(TAG, "Direct write also failed in " + dir.getAbsolutePath() + ": " + dirEx.getMessage());
