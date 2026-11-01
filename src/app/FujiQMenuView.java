@@ -104,6 +104,17 @@ public class FujiQMenuView extends View {
     private final Rect dstRect = new Rect();
     private final String[] itemTitles = new String[TOTAL_CELLS];
     private final String[] cachedValues = new String[TOTAL_CELLS];
+    private AppState appState;
+
+    public void setAppState(AppState state) {
+        this.appState = state;
+        refreshCachedValues();
+        postInvalidate();
+    }
+
+    public AppState getAppState() {
+        return appState;
+    }
 
     public FujiQMenuView(Context context, FujiRecipe recipe, OnRecipeChangeListener listener) {
         super(context);
@@ -293,7 +304,7 @@ public class FujiQMenuView extends View {
         itemTitles[12] = "NR";
         itemTitles[13] = "CLARITY";
         itemTitles[14] = "RECIPE";
-        itemTitles[15] = "SLOT SAVE";
+        itemTitles[15] = "OUT RES";
 
         refreshCachedValues();
         updateTopStatus();
@@ -316,7 +327,7 @@ public class FujiQMenuView extends View {
         cachedValues[12] = (recipe.noiseReduction > 0 ? "+" : "") + recipe.noiseReduction;
         cachedValues[13] = (recipe.clarity > 0 ? "+" : "") + recipe.clarity;
         cachedValues[14] = "C" + (recipe.recipeSlotIndex + 1);
-        cachedValues[15] = "SAVE C" + (recipe.recipeSlotIndex + 1);
+        cachedValues[15] = (appState != null) ? appState.getOutputResolutionMode().label : "10.6MP (FAST)";
     }
 
     @Override
@@ -618,8 +629,10 @@ public class FujiQMenuView extends View {
                 recipe.loadFromSlot(getContext(), nextSlot);
                 break;
             }
-            case 15: { // Slot save
-                recipe.saveToSlot(getContext(), recipe.recipeSlotIndex);
+            case 15: { // Output resolution toggle (FAST 10.6MP vs MASTER 42.4MP)
+                if (appState != null) {
+                    appState.toggleOutputResolutionMode();
+                }
                 break;
             }
         }
@@ -652,7 +665,11 @@ public class FujiQMenuView extends View {
             case 12: recipe.noiseReduction = 0; break;
             case 13: recipe.clarity = 0; break;
             case 14: recipe.loadFromSlot(getContext(), 0); break;
-            case 15: recipe.saveToSlot(getContext(), recipe.recipeSlotIndex); break;
+            case 15:
+                if (appState != null) {
+                    appState.setOutputResolutionMode(AppState.OutputResolutionMode.FAST_10MP);
+                }
+                break;
         }
 
         refreshCachedValues();

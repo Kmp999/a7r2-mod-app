@@ -103,6 +103,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
             }
         });
+        qMenuView.setAppState(appState);
         qMenuView.setFocusable(false);
         qMenuView.setFocusableInTouchMode(false);
 

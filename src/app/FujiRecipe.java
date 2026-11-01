@@ -402,6 +402,19 @@ public class FujiRecipe {
             double z = centered * 3.0;
             double s = 0.5 + 0.5 * (z / (1.0 + Math.abs(z)));
 
+            // Step 2.2: DR200 / DR400 Shadow & Midtone Compensatory Lift
+            // Compensates for -1.0 EV (DR200) or -2.0 EV (DR400) hardware exposure pull
+            // with smooth highlight roll-off to protect specular highlights from clipping
+            double drLift = 0.0;
+            if (dynamicRange == DynamicRange.DR200) {
+                // +1.0 EV non-linear lift in shadows/midtones, smoothly rolling off to 0.0 at x = 1.0
+                drLift = 0.18 * (1.0 - Math.pow(x, 1.5));
+            } else if (dynamicRange == DynamicRange.DR400) {
+                // +2.0 EV non-linear lift in shadows/midtones, smoothly rolling off to 0.0 at x = 1.0
+                drLift = 0.32 * (1.0 - Math.pow(x, 1.3));
+            }
+            s += drLift;
+
             // Shadow adjustment below 0.35
             if (x < 0.35) {
                 s += ((double) shadowLift / 255.0) * ((0.35 - x) / 0.35);

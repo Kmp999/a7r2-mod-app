@@ -36,6 +36,16 @@ public class SonyToFujiHardwareMapper {
             // 3. Dynamic Range Hardware Exposure Protection (-1.0 EV for DR200, -2.0 EV for DR400)
             mapDynamicRangeHardware(params, recipe);
 
+            // Step 2.1: RAW / RAW+JPEG Format Guardrails for Camera.Parameters
+            try {
+                params.set("sony-quality", "fine");
+                params.set("sony-picture-format", "raw+jpeg");
+                String curPicFormat = params.get("picture-format");
+                if ("raw".equalsIgnoreCase(curPicFormat) || "arw".equalsIgnoreCase(curPicFormat)) {
+                    params.set("picture-format", "raw+jpeg");
+                }
+            } catch (Throwable ignored) {}
+
             // 4. Deep CameraEx ParametersModifier for DRO, WB shift, 10.6MP ImageSize, and Single DriveMode
             if (cameraEx != null) {
                 Camera.Parameters modifiedParams = applySonyExModifiers(cameraEx, params, recipe);
@@ -194,9 +204,24 @@ public class SonyToFujiHardwareMapper {
                 setAspect.invoke(modifier, "3:2");
             } catch (Throwable ignored) {}
 
+            // Step 2.1: RAW / RAW+JPEG Format Guardrail - Enforce JPEG or RAW+JPEG so DSC0xxxx.JPG is guaranteed
             try {
                 Method setFormat = findAccessibleMethod(modifier, "setPictureStorageFormat", String.class);
-                setFormat.invoke(modifier, "jpeg");
+                String currentFormat = null;
+                try {
+                    Method getFormat = findAccessibleMethod(modifier, "getPictureStorageFormat");
+                    if (getFormat != null) currentFormat = (String) getFormat.invoke(modifier);
+                } catch (Throwable ignored) {}
+                if ("raw".equalsIgnoreCase(currentFormat)) {
+                    setFormat.invoke(modifier, "raw+jpeg");
+                } else if (currentFormat == null || (!currentFormat.contains("jpeg") && !currentFormat.contains("raw+jpeg"))) {
+                    setFormat.invoke(modifier, "jpeg");
+                }
+            } catch (Throwable ignored) {}
+
+            try {
+                Method setQuality = findAccessibleMethod(modifier, "setImageQuality", String.class);
+                setQuality.invoke(modifier, "fine");
             } catch (Throwable ignored) {}
 
             try {

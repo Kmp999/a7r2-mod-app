@@ -8,6 +8,23 @@ public class AppState {
         ASYNC_FULLRES
     }
 
+    public enum OutputResolutionMode {
+        FAST_10MP("10.6MP (FAST)", 3976, 2652, 2),
+        MASTER_42MP("42.4MP (MASTER)", 7952, 5304, 1);
+
+        public final String label;
+        public final int width;
+        public final int height;
+        public final int inSampleSize;
+
+        OutputResolutionMode(String label, int width, int height, int inSampleSize) {
+            this.label = label;
+            this.width = width;
+            this.height = height;
+            this.inSampleSize = inSampleSize;
+        }
+    }
+
     // Film simulations matching FujiRecipe (Fujifilm, Kodak, Cinema stocks)
     public static final String[] PRESET_NAMES = {
         "Provia", "Velvia", "Astia", "Classic Chr", "Classic Neg",
@@ -19,10 +36,30 @@ public class AppState {
 
     private FujiRecipe activeRecipe = new FujiRecipe();
     private Mode currentMode = Mode.JPEG_PROXY;
+    private OutputResolutionMode outputResolutionMode = OutputResolutionMode.FAST_10MP;
     private boolean isProcessing = false;
     private long lastProcessingTimeMs = 0;
     private String lastErrorMessage = "";
     private boolean isQMenuVisible = false;
+
+    public OutputResolutionMode getOutputResolutionMode() {
+        return outputResolutionMode;
+    }
+
+    public void setOutputResolutionMode(OutputResolutionMode mode) {
+        if (mode != null) {
+            this.outputResolutionMode = mode;
+        }
+    }
+
+    public OutputResolutionMode toggleOutputResolutionMode() {
+        if (this.outputResolutionMode == OutputResolutionMode.FAST_10MP) {
+            this.outputResolutionMode = OutputResolutionMode.MASTER_42MP;
+        } else {
+            this.outputResolutionMode = OutputResolutionMode.FAST_10MP;
+        }
+        return this.outputResolutionMode;
+    }
 
     public FujiRecipe getActiveRecipe() {
         return activeRecipe;

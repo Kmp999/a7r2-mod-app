@@ -543,13 +543,19 @@ public final class StorageResolver {
 
     /**
      * Waits for a JPEG file to finish writing to the SD card (verifying file size stability and 0xFF 0xD9 EOI).
-     * Includes a non-aggressive settling backoff after EOI detection to ensure BIONZ X has flushed its file descriptor.
+     * Hardened against RAW+JPEG dual-flushing delays, ignores .ARW files, and scales timeout for slow SD cards.
      */
     public static boolean waitForJpegComplete(File file, int timeoutMs) {
         if (file == null) return false;
+        // Step 2.1: Ignore non-JPEG files (.ARW, etc.)
+        if (!file.getName().toUpperCase(Locale.US).endsWith(".JPG")) {
+            return false;
+        }
+        // Scale timeout for slow SD cards or RAW+JPEG dual-flushing (min 5000ms)
+        long actualTimeout = Math.max(timeoutMs, 5000);
         long start = System.currentTimeMillis();
         long prevLen = -1;
-        while (System.currentTimeMillis() - start < timeoutMs) {
+        while (System.currentTimeMillis() - start < actualTimeout) {
             if (file.exists()) {
                 long currentLen = file.length();
                 if (currentLen > 100000 && isJpegComplete(file)) {
@@ -569,7 +575,7 @@ public final class StorageResolver {
                 break;
             }
         }
-        return file.exists() && file.length() > 0;
+        return file.exists() && file.length() > 0 && isJpegComplete(file);
     }
 
     /**
@@ -603,7 +609,7 @@ public final class StorageResolver {
         if (filePath == null) return;
         File master = findRawMasterFile(sequenceNum);
         if (master != null && master.exists()) {
-            copyExifMetadata(master.getAbsolutePath(), filePath, recipeName, 3976, 2652);
+            copyExifMetadata(master.getAbsolutePath(), filePath, recipeName, null, 3976, 2652);
         } else {
             writeExifMetadata(filePath, recipeName);
         }
@@ -615,14 +621,18 @@ public final class StorageResolver {
      * Preserves hardware ISP tags and updates image dimensions to 3976 x 2652.
      */
     public static void copyExifMetadata(String srcPath, String dstPath, String recipeName) {
-        copyExifMetadata(srcPath, dstPath, recipeName, 3976, 2652);
+        copyExifMetadata(srcPath, dstPath, recipeName, null, 3976, 2652);
+    }
+
+    public static void copyExifMetadata(String srcPath, String dstPath, String recipeName, int width, int height) {
+        copyExifMetadata(srcPath, dstPath, recipeName, null, width, height);
     }
 
     /**
      * Copies all camera EXIF metadata from source master capture (DSC0xxxx.JPG) to graded JPEG (fuji_xxxx.jpg),
-     * setting specified output image dimensions.
+     * setting specified output image dimensions and stamping dynamic range mode into UserComment.
      */
-    public static void copyExifMetadata(String srcPath, String dstPath, String recipeName, int width, int height) {
+    public static void copyExifMetadata(String srcPath, String dstPath, String recipeName, String drMode, int width, int height) {
         if (dstPath == null) return;
         if (srcPath == null || !new File(srcPath).exists()) {
             writeExifMetadata(dstPath, recipeName);
@@ -680,11 +690,17 @@ public final class StorageResolver {
             dstExif.setAttribute(ExifInterface.TAG_MODEL, "ILCE-7RM2");
             dstExif.setAttribute(ExifInterface.TAG_IMAGE_WIDTH, String.valueOf(width));
             dstExif.setAttribute(ExifInterface.TAG_IMAGE_LENGTH, String.valueOf(height));
-            if (recipeName != null && !recipeName.trim().isEmpty()) {
-                dstExif.setAttribute("UserComment", "Fuji Recipe: " + recipeName);
+
+            // Step 2.2: Stamp preset and active DR mode into UserComment
+            String userComment = (recipeName != null && !recipeName.trim().isEmpty())
+                ? "Fuji Recipe: " + recipeName : "Fuji Recipe";
+            if (drMode != null && !drMode.trim().isEmpty()) {
+                userComment += " | DR: " + drMode;
             }
+            dstExif.setAttribute("UserComment", userComment);
+
             dstExif.saveAttributes();
-            Log.d(TAG, "EXIF metadata successfully preserved from " + srcPath + " to " + dstPath + " (dims: " + width + "x" + height + ")");
+            Log.d(TAG, "EXIF metadata successfully preserved from " + srcPath + " to " + dstPath + " (dims: " + width + "x" + height + ", " + userComment + ")");
         } catch (Throwable t) {
             Log.w(TAG, "Failed preserving EXIF metadata: " + t.getMessage());
             writeExifMetadata(dstPath, recipeName);

@@ -370,10 +370,21 @@ public class CaptureController {
 
             final int srcW = decoder.getWidth();
             final int srcH = decoder.getHeight();
-            // Downsampled 10.6MP dimensions (3976 x 2652 from 7952 x 5304)
-            final int dstW = (srcW > 4000) ? srcW / 2 : srcW;
-            final int dstH = (srcH > 3000) ? srcH / 2 : srcH;
-            Log.i(TAG, "Processing 42.4MP->10.6MP Strip-Streaming: " + srcW + "x" + srcH + " -> " + dstW + "x" + dstH + " (" + rawJpegPath + ")");
+
+            // Step 1: Mode Selection (FAST_10MP vs MASTER_42MP)
+            final AppState.OutputResolutionMode resMode = (appState != null)
+                ? appState.getOutputResolutionMode()
+                : AppState.OutputResolutionMode.FAST_10MP;
+
+            int targetSample = (srcW > 4000) ? 2 : 1;
+            int srcStripH = 128;
+            if (resMode == AppState.OutputResolutionMode.MASTER_42MP) {
+                targetSample = 1;
+                srcStripH = 64;
+            }
+            final int dstW = (targetSample == 1) ? srcW : (srcW > 4000 ? srcW / 2 : srcW); // dstW = (srcW > 4000) ? srcW / 2 : srcW
+            final int dstH = (targetSample == 1) ? srcH : ((srcH > 3000) ? srcH / 2 : srcH);
+            Log.i(TAG, "Processing Strip-Streaming [" + resMode.label + "]: " + srcW + "x" + srcH + " -> " + dstW + "x" + dstH + " (" + rawJpegPath + ")");
 
             // 3. Prepare target and temporary files (Safe temp-file-then-rename)
             final File targetOutputFile = StorageResolver.getGradedOutputFile(seqNum);
@@ -434,15 +445,17 @@ public class CaptureController {
                     return;
                 }
 
-                // 6. Strict Dalvik Heap Management: Process in source strips of 128 rows (producing 3976 x 64 strips)
-                final int srcStripH = 128;
+                // 6. Strict Dalvik Heap Management: Process in source strips (producing 64 output rows per strip)
                 final int numStrips = (srcH + srcStripH - 1) / srcStripH;
 
-                // Allocate single direct buffer once per image (3976 * 64 * 4 bytes = ~1.01 MB for ARGB_8888)
+                // Allocate direct buffer capped at 2.03 MB max (7952 * 64 * 4 for 42.4MP, 3976 * 64 * 4 for 10.6MP)
                 java.nio.ByteBuffer stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 4);
 
                 BitmapFactory.Options opts = new BitmapFactory.Options();
-                opts.inSampleSize = (srcW > 4000) ? 2 : 1; // Native 1/2 DCT downsampling: 7952x5304 -> 3976x2652
+                opts.inSampleSize = (srcW > 4000) ? 2 : 1;
+                if (resMode == AppState.OutputResolutionMode.MASTER_42MP) {
+                    opts.inSampleSize = 1;
+                }
                 opts.inPreferredConfig = Bitmap.Config.ARGB_8888; // Enhancement 1: Upgrade to ARGB_8888 precision
                 opts.inDither = false;
                 opts.inMutable = true;
@@ -476,8 +489,8 @@ public class CaptureController {
                                 streamSuccess = false;
                                 break;
                             }
-                            int outStripW = stripBmp.getWidth();  // 3976
-                            int outStripH = stripBmp.getHeight(); // 64 (or 28 for final strip)
+                            int outStripW = stripBmp.getWidth();  // 3976 or 7952
+                            int outStripH = stripBmp.getHeight(); // 64 (or 28 / 56 for final partial strip)
 
                             stripDirect.clear();
                             stripBmp.copyPixelsToBuffer(stripDirect);
@@ -529,7 +542,8 @@ public class CaptureController {
                 }
                 gradedSavedPath = targetOutputFile.getAbsolutePath();
 
-                // 8. Copy original camera EXIF metadata from DSC0xxxx.JPG to fuji_xxxx.jpg with 10.6MP dimensions
+                // 8. Copy original camera EXIF metadata from DSC0xxxx.JPG to fuji_xxxx.jpg with dynamic dims & DR mode stamp
+                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
                 StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
 
                 // 9. Register with Sony AvindexStore
