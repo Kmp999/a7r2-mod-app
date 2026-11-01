@@ -3,12 +3,14 @@ package com.fujilite.a7r2;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.ExifInterface;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Environment;
+import android.provider.MediaStore;
 import android.util.Log;
 
 import java.io.BufferedReader;
@@ -570,7 +572,7 @@ public final class StorageResolver {
                             c.close();
                         }
                         if (savedPath != null && new File(savedPath).exists()) {
-                            writeExifMetadata(savedPath, recipeName, bitmap.getWidth(), bitmap.getHeight());
+                            writeExifMetadata(savedPath, recipeName);
                             sLastDiagnostic = "OK (MediaStore): " + savedPath + " (" + (new File(savedPath).length() / 1024) + "KB)";
                             Log.i(TAG, "Successfully saved via MediaStore: " + sLastDiagnostic);
                             registerWithAvindex(context, savedPath);
