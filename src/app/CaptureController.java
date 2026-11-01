@@ -238,7 +238,8 @@ public class CaptureController {
                     @Override
                     public void run() {
                         // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                        String photoPath = StorageResolver.waitForNewCameraPhoto(4000);
+                        File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, 5000);
+                        String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
                         if (photoPath != null) {
                             processStripStreamingCapture(photoPath, null, seqNum, captureStartTime);
                         } else {

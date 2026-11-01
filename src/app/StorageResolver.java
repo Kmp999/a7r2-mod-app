@@ -895,6 +895,10 @@ public final class StorageResolver {
      * Waits up to timeoutMs, checking every 150-200ms.
      * Returns the newly saved File, or null if timed out.
      */
+    public static File waitForNewCameraPhoto(long timeoutMs) {
+        return waitForNewCameraPhoto(System.currentTimeMillis() - 3000, null, timeoutMs);
+    }
+
     public static File waitForNewCameraPhoto(long startTime, long timeoutMs) {
         return waitForNewCameraPhoto(startTime, null, timeoutMs);
     }
