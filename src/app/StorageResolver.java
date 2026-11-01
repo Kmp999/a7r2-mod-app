@@ -338,6 +338,10 @@ public final class StorageResolver {
                     ? String.format(Locale.US, "DSC0%04d.JPG", sequenceNum)
                     : generateDcfFilename(dir, "DSC0");
                 File file = new File(dir, filename);
+                if (file.exists() && file.length() > rawJpegData.length && file.length() > 2 * 1024 * 1024) {
+                    Log.i(TAG, "Preserving existing 42.4MP hardware master: " + file.getAbsolutePath());
+                    return file.getAbsolutePath();
+                }
                 FileOutputStream out = new FileOutputStream(file);
                 out.write(rawJpegData);
                 out.flush();

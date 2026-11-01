@@ -203,61 +203,110 @@ public class CaptureController {
         watchdogHandler.postDelayed(captureWatchdogRunnable, 3500);
 
         try {
-            cameraAdapter.takePicture(new Camera.PictureCallback() {
-                @Override
-                public void onPictureTaken(final byte[] jpegData, Camera camera) {
-                    watchdogHandler.removeCallbacks(captureWatchdogRunnable);
-                    try {
-                        // 1. Immediately cancel take picture and restore Live View EVF/LCD (< 20ms)
-                        cameraAdapter.cancelTakePicture();
-                        setState(CameraState.RESTORING_PREVIEW);
-                        cameraAdapter.resumePreview();
-                        restorePreviewWithWatchdog(3);
-
-                        if (jpegData == null || jpegData.length == 0) {
-                            uiController.updateStatusAsync("Capture failed: Empty buffer");
-                            return;
+            if (cameraAdapter instanceof SonyPmcaAdapter) {
+                // SONY HARDWARE CAPTURE: Trip BIONZ X with (shutter, null, null) to bypass 1.7MP HAL proxy!
+                // BIONZ X writes the full 42.4MP (7952 x 5304) DSC0xxxx.JPG directly to the SD card.
+                Camera.ShutterCallback shutterCb = new Camera.ShutterCallback() {
+                    @Override
+                    public void onShutter() {
+                        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+                        try {
+                            cameraAdapter.cancelTakePicture();
+                            setState(CameraState.RESTORING_PREVIEW);
+                            cameraAdapter.resumePreview();
+                            restorePreviewWithWatchdog(3);
+                        } catch (Throwable t) {
+                            Log.e(TAG, "onShutter preview restore error", t);
+                        } finally {
+                            isCapturing.set(false);
                         }
+                    }
+                };
+                ((SonyPmcaAdapter) cameraAdapter).takeHardwarePicture(shutterCb);
 
-                        // 2. Synchronize DCF Sequence Number
-                        final int seqNum = StorageResolver.allocateNextSequenceNumber();
-
-                        // Enhancement 2: Check queue bounding (MAX_PENDING_JOBS = 8)
-                        if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
-                            Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
-                            if (uiController != null) {
-                                uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
+                final int seqNum = StorageResolver.allocateNextSequenceNumber();
+                if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
+                    Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
+                    if (uiController != null) {
+                        uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
+                    }
+                    return true;
+                }
+                pendingJobsCount.incrementAndGet();
+                updateQueueHud();
+                processingExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
+                        String photoPath = StorageResolver.waitForNewCameraPhoto(4000);
+                        if (photoPath != null) {
+                            processStripStreamingCapture(photoPath, null, seqNum, captureStartTime);
+                        } else {
+                            File master = StorageResolver.findRawMasterFile(seqNum);
+                            if (master != null) {
+                                processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
                             }
-                            ioExecutor.execute(new Runnable() {
+                        }
+                    }
+                });
+                return true;
+            } else {
+                cameraAdapter.takePicture(new Camera.PictureCallback() {
+                    @Override
+                    public void onPictureTaken(final byte[] jpegData, Camera camera) {
+                        watchdogHandler.removeCallbacks(captureWatchdogRunnable);
+                        try {
+                            // 1. Immediately cancel take picture and restore Live View EVF/LCD (< 20ms)
+                            cameraAdapter.cancelTakePicture();
+                            setState(CameraState.RESTORING_PREVIEW);
+                            cameraAdapter.resumePreview();
+                            restorePreviewWithWatchdog(3);
+
+                            if (jpegData == null || jpegData.length == 0) {
+                                uiController.updateStatusAsync("Capture failed: Empty buffer");
+                                return;
+                            }
+
+                            // 2. Synchronize DCF Sequence Number
+                            final int seqNum = StorageResolver.allocateNextSequenceNumber();
+
+                            // Enhancement 2: Check queue bounding (MAX_PENDING_JOBS = 8)
+                            if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
+                                Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
+                                if (uiController != null) {
+                                    uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
+                                }
+                                ioExecutor.execute(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        StorageResolver.saveRawJpegToSd(context, jpegData, seqNum);
+                                    }
+                                });
+                                return;
+                            }
+
+                            // 3. Immediately hand off jpegData to background processingExecutor and return (< 30ms UI return)
+                            pendingJobsCount.incrementAndGet();
+                            updateQueueHud();
+                            processingExecutor.execute(new Runnable() {
                                 @Override
                                 public void run() {
-                                    StorageResolver.saveRawJpegToSd(context, jpegData, seqNum);
+                                    processStripStreamingCapture(null, jpegData, seqNum, captureStartTime);
                                 }
                             });
-                            return;
-                        }
 
-                        // 3. Immediately hand off jpegData to background processingExecutor and return (< 30ms UI return)
-                        pendingJobsCount.incrementAndGet();
-                        updateQueueHud();
-                        processingExecutor.execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                processStripStreamingCapture(null, jpegData, seqNum, captureStartTime);
+                        } catch (Throwable t) {
+                            Log.e(TAG, "onPictureTaken error", t);
+                            if (uiController != null) {
+                                uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
                             }
-                        });
-
-                    } catch (Throwable t) {
-                        Log.e(TAG, "onPictureTaken error", t);
-                        if (uiController != null) {
-                            uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                        } finally {
+                            isCapturing.set(false);
                         }
-                    } finally {
-                        isCapturing.set(false);
                     }
-                }
-            });
-            return true;
+                });
+                return true;
+            }
         } catch (Throwable t) {
             watchdogHandler.removeCallbacks(captureWatchdogRunnable);
             Log.e(TAG, "takePicture failed", t);
