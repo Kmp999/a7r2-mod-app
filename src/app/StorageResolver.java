@@ -469,20 +469,37 @@ public final class StorageResolver {
                 }
                 File file = new File(dir, filename);
                 File tmpFile = new File(dir, filename + ".tmp");
-                java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(tmpFile), 65536);
-                boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
-                out.flush();
-                out.close();
 
-                if (compressed && tmpFile.exists() && tmpFile.length() > 0) {
-                    if (file.exists()) {
-                        file.delete();
+                boolean compressed = false;
+                try {
+                    java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(tmpFile), 65536);
+                    compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
+                    out.flush();
+                    out.close();
+
+                    if (compressed && tmpFile.exists() && tmpFile.length() > 0) {
+                        if (file.exists()) {
+                            file.delete();
+                        }
+                        boolean renamed = tmpFile.renameTo(file);
+                        if (!renamed) {
+                            copyFile(tmpFile, file);
+                            tmpFile.delete();
+                        }
                     }
-                    boolean renamed = tmpFile.renameTo(file);
-                    if (!renamed) {
-                        copyFile(tmpFile, file);
-                        tmpFile.delete();
+                } catch (Throwable tmpEx) {
+                    Log.w(TAG, "Tmp write failed in " + dir.getAbsolutePath() + " (" + tmpEx.getMessage() + "), attempting direct write to " + file.getName());
+                    try {
+                        java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(new FileOutputStream(file), 65536);
+                        compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
+                        out.flush();
+                        out.close();
+                    } catch (Throwable dirEx) {
+                        Log.w(TAG, "Direct write also failed in " + dir.getAbsolutePath() + ": " + dirEx.getMessage());
                     }
+                }
+
+                if (compressed && file.exists() && file.length() > 0) {
                     String savedPath = file.getAbsolutePath();
                     File master = findRawMasterFile(sequenceNum);
                     if (master != null && master.exists()) {
@@ -506,8 +523,65 @@ public final class StorageResolver {
             }
         }
 
+        // Failsafe: Android MediaStore provider (LightLab saveViaMedia strategy)
+        if (context != null) {
+            String fallbackName = (sequenceNum > 0)
+                ? String.format(Locale.US, "fuji_%04d.jpg", sequenceNum)
+                : ("fuji_" + System.currentTimeMillis() + ".jpg");
+            String mediaSaved = saveViaMediaStore(context, bitmap, fallbackName, recipeName);
+            if (mediaSaved != null) {
+                return mediaSaved;
+            }
+        }
+
         sLastDiagnostic = "FAIL: All " + candidates.size() + " mount attempts failed";
         Log.e(TAG, sLastDiagnostic);
+        return null;
+    }
+
+    /**
+     * Fallback to Android MediaStore provider (LightLab saveViaMedia strategy).
+     * Bypasses Linux POSIX filesystem permission restrictions by having MediaProvider
+     * perform the write on external SD storage with system privileges.
+     */
+    public static String saveViaMediaStore(Context context, Bitmap bitmap, String filename, String recipeName) {
+        if (context == null || bitmap == null) return null;
+        try {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Images.Media.TITLE, filename);
+            cv.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+            cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+            cv.put(MediaStore.Images.Media.DESCRIPTION, "Fuji Recipe: " + (recipeName != null ? recipeName : "Default"));
+
+            Uri uri = context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+            if (uri != null) {
+                java.io.OutputStream out = context.getContentResolver().openOutputStream(uri);
+                if (out != null) {
+                    boolean ok = bitmap.compress(Bitmap.CompressFormat.JPEG, 94, out);
+                    out.flush();
+                    out.close();
+                    if (ok) {
+                        Cursor c = context.getContentResolver().query(uri, new String[]{MediaStore.Images.Media.DATA}, null, null, null);
+                        String savedPath = null;
+                        if (c != null) {
+                            if (c.moveToFirst()) {
+                                savedPath = c.getString(0);
+                            }
+                            c.close();
+                        }
+                        if (savedPath != null && new File(savedPath).exists()) {
+                            writeExifMetadata(savedPath, recipeName, bitmap.getWidth(), bitmap.getHeight());
+                            sLastDiagnostic = "OK (MediaStore): " + savedPath + " (" + (new File(savedPath).length() / 1024) + "KB)";
+                            Log.i(TAG, "Successfully saved via MediaStore: " + sLastDiagnostic);
+                            registerWithAvindex(context, savedPath);
+                            return savedPath;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "saveViaMediaStore failed: " + t.getMessage(), t);
+        }
         return null;
     }
 
