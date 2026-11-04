@@ -236,6 +236,7 @@ public class CaptureController {
                 // Hardware trigger dispatched: immediately release gate so next shot is never locked out
                 isCapturing.set(false);
 
+                final File preCaptureLatest = StorageResolver.getLatestSavedPhoto();
                 final int seqNum = StorageResolver.allocateNextSequenceNumber();
                 if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
                     Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
@@ -252,7 +253,7 @@ public class CaptureController {
                         boolean jobStarted = false;
                         try {
                             // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                            File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, 7000);
+                            File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCaptureLatest, 7000);
                             String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
                             int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
                             if (actualSeq <= 0) actualSeq = seqNum;
@@ -268,9 +269,15 @@ public class CaptureController {
                                 } else {
                                     File latest = StorageResolver.getLatestSavedPhoto();
                                     if (latest != null && latest.length() > 200 * 1024) {
-                                        int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
-                                        jobStarted = true;
-                                        processStripStreamingCapture(latest.getAbsolutePath(), null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
+                                        String latestPath = latest.getAbsolutePath();
+                                        if (preCaptureLatest == null || !latestPath.equals(preCaptureLatest.getAbsolutePath())) {
+                                            int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
+                                            jobStarted = true;
+                                            processStripStreamingCapture(latestPath, null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
+                                        } else {
+                                            Log.e(TAG, "No new photo found on SD card after hardware capture");
+                                            if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
+                                        }
                                     } else {
                                         Log.e(TAG, "No photo found on SD card after hardware capture");
                                         if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
@@ -467,7 +474,7 @@ public class CaptureController {
             // Step 1: Mode Selection (FAST_10MP vs MASTER_42MP)
             final AppState.OutputResolutionMode resMode = (appState != null)
                 ? appState.getOutputResolutionMode()
-                : AppState.OutputResolutionMode.FAST_10MP;
+                : AppState.OutputResolutionMode.MASTER_42MP;
 
             int targetSample = (srcW >= 7000) ? 2 : 1;
             int srcStripH = 128;
@@ -533,6 +540,9 @@ public class CaptureController {
                     Log.w(TAG, "Native stream unavailable, falling back to downsampled bitmap grading (10.6MP)");
                     BitmapFactory.Options fallbackOpts = new BitmapFactory.Options();
                     fallbackOpts.inSampleSize = (srcW > 4000) ? 2 : 1;
+                    if (resMode == AppState.OutputResolutionMode.MASTER_42MP || srcW < 7000) {
+                        fallbackOpts.inSampleSize = 1;
+                    }
                     fallbackOpts.inPreferredConfig = Bitmap.Config.RGB_565;
                     fallbackOpts.inDither = true;
 

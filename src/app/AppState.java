@@ -36,7 +36,7 @@ public class AppState {
 
     private FujiRecipe activeRecipe = new FujiRecipe();
     private Mode currentMode = Mode.JPEG_PROXY;
-    private OutputResolutionMode outputResolutionMode = OutputResolutionMode.FAST_10MP;
+    private OutputResolutionMode outputResolutionMode = OutputResolutionMode.MASTER_42MP;
     private boolean isProcessing = false;
     private long lastProcessingTimeMs = 0;
     private String lastErrorMessage = "";
