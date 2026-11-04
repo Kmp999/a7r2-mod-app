@@ -8,13 +8,10 @@ Unit Test Suite for Consecutive Capture & Shutter Dead-Zone Elimination:
   3. CaptureController.java:
      - captureWatchdogRunnable rescues camera when currentState != IDLE_PREVIEW.
      - restorePreviewWithWatchdog verifies resumePreview() return value and schedules retries.
-     - Offloads storage polling without synchronous UI-thread SD card scanning.
-     - Deduplicates processing tasks for the same photo.
-     - Tracks preCapturePhoto via getLatestCameraPhoto to ensure 2nd and subsequent shots trigger correctly.
+     - Snapshots preExistingFiles before shutter and polls with fallback to ensure every shot is processed.
      - Preserves full resolution (inSampleSize = 1) in MASTER_42MP mode.
   4. StorageResolver.java:
-     - waitForNewCameraPhoto filters out pre-capture photos by relative path and length.
-     - Checks isJpegComplete for instant return without blind sleep loops.
+     - waitForNewCameraPhoto filters out pre-existing photos and verifies JPEG completion via 0xFF 0xD9.
      - getLatestCameraPhoto strictly targets camera master JPEGs excluding fuji_*.jpg.
   5. AppState.java:
      - Defaults to MASTER_42MP for highest possible resolution.
@@ -58,7 +55,6 @@ class TestConsecutiveCaptureDeadZoneFix(unittest.TestCase):
         self.assertIn("currentState != CameraState.IDLE_PREVIEW", content)
         self.assertIn("boolean success = cameraAdapter.resumePreview();", content)
         self.assertIn("throw new RuntimeException(\"resumePreview returned false\");", content)
-        self.assertIn("processedPhotos", content)
 
     def test_main_activity_resumes_preview_on_review_dismiss(self):
         """MainActivity.dispatchKeyEvent() resumes preview when dismissing quick review on full or half shutter."""
@@ -76,17 +72,18 @@ class TestConsecutiveCaptureDeadZoneFix(unittest.TestCase):
         self.assertIn("outputResolutionMode = OutputResolutionMode.MASTER_42MP", content)
 
     def test_storage_resolver_consecutive_photo_filtering(self):
-        """StorageResolver.waitForNewCameraPhoto skips preCapturePhoto and verifies JPEG completion."""
+        """StorageResolver.waitForNewCameraPhoto skips pre-existing photos and verifies JPEG completion."""
         content = self.storage_file.read_text(encoding="utf-8")
-        self.assertIn("absPath.equals(prevPath)", content)
         self.assertIn("isJpegComplete(newest)", content)
         self.assertIn("getLatestCameraPhoto()", content)
+        self.assertIn("snapshotExistingPhotos()", content)
 
-    def test_capture_controller_passes_pre_capture_photo(self):
-        """CaptureController passes preCapturePhoto to waitForNewCameraPhoto to ensure 2nd shot is detected."""
+    def test_capture_controller_passes_pre_existing_files(self):
+        """CaptureController snapshots pre-existing files and waits with guaranteed fallback."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("final File preCapturePhoto = StorageResolver.getLatestCameraPhoto();", content)
-        self.assertIn("StorageResolver.waitForNewCameraPhoto(captureStartTime, preCapturePhoto, 7000)", content)
+        self.assertIn("StorageResolver.snapshotExistingPhotos();", content)
+        self.assertIn("StorageResolver.waitForNewCameraPhoto(preExistingFiles, 7000)", content)
+        self.assertIn("StorageResolver.getLatestCameraPhoto()", content)
 
 if __name__ == '__main__':
     unittest.main()

@@ -204,6 +204,9 @@ public class CaptureController {
 
         try {
             if (cameraAdapter instanceof SonyPmcaAdapter) {
+                // Snapshot all existing photos on the SD card BEFORE tripping the shutter!
+                final java.util.Set<String> preExistingFiles = StorageResolver.snapshotExistingPhotos();
+
                 // SONY HARDWARE CAPTURE: Trip BIONZ X with (shutter, null, null) to bypass 1.7MP HAL proxy!
                 // BIONZ X writes the full 42.4MP (7952 x 5304) DSC0xxxx.JPG directly to the SD card.
                 Camera.ShutterCallback shutterCb = new Camera.ShutterCallback() {
@@ -225,7 +228,7 @@ public class CaptureController {
                                         isCapturing.set(false);
                                     }
                                 }
-                            }, 120);
+                            }, 250);
                         } catch (Throwable t) {
                             Log.e(TAG, "onShutter preview restore error", t);
                             isCapturing.set(false);
@@ -236,7 +239,6 @@ public class CaptureController {
                 // Hardware trigger dispatched: immediately release gate so next shot is never locked out
                 isCapturing.set(false);
 
-                final File preCapturePhoto = StorageResolver.getLatestCameraPhoto();
                 final int seqNum = StorageResolver.allocateNextSequenceNumber();
                 if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
                     Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
@@ -253,7 +255,13 @@ public class CaptureController {
                         boolean jobStarted = false;
                         try {
                             // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                            File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCapturePhoto, 7000);
+                            File newPhoto = StorageResolver.waitForNewCameraPhoto(preExistingFiles, 7000);
+                            if (newPhoto == null) {
+                                newPhoto = StorageResolver.getLatestCameraPhoto();
+                            }
+                            if (newPhoto == null) {
+                                newPhoto = StorageResolver.getLatestSavedPhoto();
+                            }
                             String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
                             int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
                             if (actualSeq <= 0) actualSeq = seqNum;
@@ -262,32 +270,13 @@ public class CaptureController {
                                 jobStarted = true;
                                 processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
                             } else {
-                                File latest = StorageResolver.getLatestCameraPhoto();
-                                if (latest != null && latest.length() > 50000) {
-                                    String latestPath = latest.getAbsolutePath();
-                                    if (preCapturePhoto == null || !latestPath.equals(preCapturePhoto.getAbsolutePath())) {
-                                        int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
-                                        jobStarted = true;
-                                        processStripStreamingCapture(latestPath, null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
-                                    } else {
-                                        File master = StorageResolver.findRawMasterFile(seqNum);
-                                        if (master != null) {
-                                            jobStarted = true;
-                                            processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
-                                        } else {
-                                            Log.e(TAG, "No photo found on SD card after hardware capture");
-                                            if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
-                                        }
-                                    }
+                                File master = StorageResolver.findRawMasterFile(seqNum);
+                                if (master != null) {
+                                    jobStarted = true;
+                                    processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
                                 } else {
-                                    File master = StorageResolver.findRawMasterFile(seqNum);
-                                    if (master != null) {
-                                        jobStarted = true;
-                                        processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
-                                    } else {
-                                        Log.e(TAG, "No photo found on SD card after hardware capture");
-                                        if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
-                                    }
+                                    Log.e(TAG, "No photo found on SD card after hardware capture");
+                                    if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
                                 }
                             }
                         } finally {

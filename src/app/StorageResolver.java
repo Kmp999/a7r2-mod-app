@@ -672,9 +672,9 @@ public final class StorageResolver {
                     return true;
                 }
             }
-            return len > 200000;
+            return false;
         } catch (Throwable t) {
-            return len > 200000;
+            return false;
         } finally {
             if (raf != null) {
                 try { raf.close(); } catch (Throwable ignored) {}
