@@ -214,6 +214,7 @@ public class UIController {
         // Mode 1: Quick Photo Review Overlay is Active
         if (qMenuView != null && qMenuView.isReviewing()) {
             qMenuView.clearQuickReview();
+            if (cameraAdapter != null) cameraAdapter.resumePreview();
             if (action == SonyKeyCodes.FujiAction.FULL_SHUTTER) {
                 if (callback != null) callback.onTriggerCapture();
             } else if (action == SonyKeyCodes.FujiAction.HALF_SHUTTER) {

@@ -12,7 +12,7 @@ public interface CameraAdapter {
     void startPreview(SurfaceHolder holder);
     void takePicture(Camera.PictureCallback jpegCallback);
     void cancelTakePicture();
-    void resumePreview();
+    boolean resumePreview();
     void release();
     // TODO(SONY_SDK): Verify if we can set picture profiles natively here.
     boolean supportsInternalColorPipeline();

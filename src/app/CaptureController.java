@@ -148,12 +148,16 @@ public class CaptureController {
 
     private volatile ResultListener resultListener;
 
+    private final java.util.Set<String> processedPhotos = java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
     private final Runnable captureWatchdogRunnable = new Runnable() {
         @Override
         public void run() {
-            if (isCapturing.compareAndSet(true, false)) {
-                Log.w(TAG, "Capture watchdog triggered (>2500ms without completion); restoring preview");
+            boolean wasCapturing = isCapturing.compareAndSet(true, false);
+            if (wasCapturing || currentState != CameraState.IDLE_PREVIEW) {
+                Log.w(TAG, "Capture watchdog triggered (>3500ms without completion); restoring preview");
                 setState(CameraState.IDLE_PREVIEW);
+                isCapturing.set(false);
                 appState.setProcessing(false);
                 restorePreviewWithWatchdog(3);
                 uiController.updateStatusAsync("Ready");
@@ -200,9 +204,6 @@ public class CaptureController {
 
         try {
             if (cameraAdapter instanceof SonyPmcaAdapter) {
-                // Snapshot all existing photos on the SD card BEFORE tripping the shutter!
-                final java.util.Set<String> preExistingFiles = StorageResolver.snapshotExistingPhotos();
-
                 // SONY HARDWARE CAPTURE: Trip BIONZ X with (shutter, null, null) to bypass 1.7MP HAL proxy!
                 // BIONZ X writes the full 42.4MP (7952 x 5304) DSC0xxxx.JPG directly to the SD card.
                 Camera.ShutterCallback shutterCb = new Camera.ShutterCallback() {
@@ -210,14 +211,13 @@ public class CaptureController {
                     public void onShutter() {
                         watchdogHandler.removeCallbacks(captureWatchdogRunnable);
                         try {
-                            // Note: Do NOT call cancelTakePicture() here as it aborts the hardware exposure.
+                            cameraAdapter.cancelTakePicture();
                             setState(CameraState.RESTORING_PREVIEW);
                             // Restore preview after mechanical shutter exposure cycle
                             watchdogHandler.postDelayed(new Runnable() {
                                 @Override
                                 public void run() {
                                     try {
-                                        cameraAdapter.resumePreview();
                                         restorePreviewWithWatchdog(3);
                                     } catch (Throwable t) {
                                         Log.w(TAG, "Delayed preview restore failed", t);
@@ -252,7 +252,7 @@ public class CaptureController {
                         boolean jobStarted = false;
                         try {
                             // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                            File newPhoto = StorageResolver.waitForNewCameraPhoto(preExistingFiles, 7000);
+                            File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, 7000);
                             String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
                             int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
                             if (actualSeq <= 0) actualSeq = seqNum;
@@ -371,7 +371,7 @@ public class CaptureController {
     }
 
     /**
-     * Retries preview restoration up to 3 times (20ms apart) to prevent black EVF screens.
+     * Retries preview restoration up to 3 times (50ms apart) to prevent black EVF screens.
      */
     private void restorePreviewWithWatchdog(final int retriesLeft) {
         if (retriesLeft <= 0) {
@@ -380,17 +380,20 @@ public class CaptureController {
         }
 
         try {
-            cameraAdapter.resumePreview();
+            boolean success = cameraAdapter.resumePreview();
+            if (!success) {
+                throw new RuntimeException("resumePreview returned false");
+            }
             setState(CameraState.IDLE_PREVIEW);
             Log.d(TAG, "EVF preview restored successfully");
         } catch (Throwable t) {
-            Log.w(TAG, "Preview restore retry scheduled (" + retriesLeft + " left)");
+            Log.w(TAG, "Preview restore retry scheduled (" + retriesLeft + " left): " + t.getMessage());
             watchdogHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     restorePreviewWithWatchdog(retriesLeft - 1);
                 }
-            }, 20);
+            }, 50);
         }
     }
 

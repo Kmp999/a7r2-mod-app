@@ -368,6 +368,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 // Seamless dismissal: if reviewing or in Q-Menu, exit overlay immediately to shoot
                 if (qMenuView != null && qMenuView.isReviewing()) {
                     qMenuView.clearQuickReview();
+                    if (cameraAdapter != null) cameraAdapter.resumePreview();
                 }
                 if (qMenuView != null && qMenuView.isQMenuOpen()) {
                     qMenuView.setQMenuOpen(false);
@@ -395,6 +396,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 // Half-press dismisses review or Q-Menu immediately back to Live View
                 if (qMenuView != null && qMenuView.isReviewing()) {
                     qMenuView.clearQuickReview();
+                    if (cameraAdapter != null) cameraAdapter.resumePreview();
                 }
                 if (qMenuView != null && qMenuView.isQMenuOpen()) {
                     qMenuView.setQMenuOpen(false);
