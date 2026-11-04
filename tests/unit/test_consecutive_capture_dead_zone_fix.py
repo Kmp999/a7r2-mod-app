@@ -3,18 +3,19 @@
 Unit Test Suite for Consecutive Capture & Shutter Dead-Zone Elimination:
   1. CameraAdapter.java: resumePreview() returns boolean for explicit failure propagation.
   2. SonyPmcaAdapter.java:
-     - Direct hardware capture via normalCamera.takePicture(shutterCallback, null, null).
+     - Direct hardware capture via CameraEx.burstableTakePicture() and fallback normalCamera.takePicture.
      - resumePreview() returns boolean (true on success, false on failure).
   3. CaptureController.java:
      - captureWatchdogRunnable rescues camera when currentState != IDLE_PREVIEW.
      - restorePreviewWithWatchdog verifies resumePreview() return value and schedules retries.
      - Offloads storage polling without synchronous UI-thread SD card scanning.
      - Deduplicates processing tasks for the same photo.
-     - Passes preCaptureLatest to waitForNewCameraPhoto so 2nd and subsequent shots trigger correctly.
+     - Tracks preCapturePhoto via getLatestCameraPhoto to ensure 2nd and subsequent shots trigger correctly.
      - Preserves full resolution (inSampleSize = 1) in MASTER_42MP mode.
   4. StorageResolver.java:
-     - waitForNewCameraPhoto filters out pre-capture photos by path and sequence number.
+     - waitForNewCameraPhoto filters out pre-capture photos by relative path and length.
      - Checks isJpegComplete for instant return without blind sleep loops.
+     - getLatestCameraPhoto strictly targets camera master JPEGs excluding fuji_*.jpg.
   5. AppState.java:
      - Defaults to MASTER_42MP for highest possible resolution.
   6. MainActivity.java & UIController.java:
@@ -43,8 +44,9 @@ class TestConsecutiveCaptureDeadZoneFix(unittest.TestCase):
         self.assertIn("boolean resumePreview();", content)
 
     def test_sony_pmca_adapter_primary_hardware_capture_and_preview_return(self):
-        """SonyPmcaAdapter invokes normalCamera.takePicture(shutterCallback, null, null) and returns boolean in resumePreview."""
+        """SonyPmcaAdapter invokes CameraEx.burstableTakePicture() and returns boolean in resumePreview."""
         content = self.sony_pmca_file.read_text(encoding="utf-8")
+        self.assertIn("burstableTakePicture", content)
         self.assertIn("normalCamera.takePicture(shutterCallback, null, null)", content)
         self.assertIn("public boolean resumePreview()", content)
         self.assertIn("return true;", content)
@@ -74,17 +76,17 @@ class TestConsecutiveCaptureDeadZoneFix(unittest.TestCase):
         self.assertIn("outputResolutionMode = OutputResolutionMode.MASTER_42MP", content)
 
     def test_storage_resolver_consecutive_photo_filtering(self):
-        """StorageResolver.waitForNewCameraPhoto skips preCaptureLatest by path and seq number."""
+        """StorageResolver.waitForNewCameraPhoto skips preCapturePhoto and verifies JPEG completion."""
         content = self.storage_file.read_text(encoding="utf-8")
         self.assertIn("absPath.equals(prevPath)", content)
-        self.assertIn("seq <= prevSeq", content)
         self.assertIn("isJpegComplete(newest)", content)
+        self.assertIn("getLatestCameraPhoto()", content)
 
-    def test_capture_controller_passes_pre_capture_latest(self):
-        """CaptureController passes preCaptureLatest to waitForNewCameraPhoto to ensure 2nd shot is detected."""
+    def test_capture_controller_passes_pre_capture_photo(self):
+        """CaptureController passes preCapturePhoto to waitForNewCameraPhoto to ensure 2nd shot is detected."""
         content = self.capture_file.read_text(encoding="utf-8")
-        self.assertIn("final File preCaptureLatest = StorageResolver.getLatestSavedPhoto();", content)
-        self.assertIn("StorageResolver.waitForNewCameraPhoto(captureStartTime, preCaptureLatest, 7000)", content)
+        self.assertIn("final File preCapturePhoto = StorageResolver.getLatestCameraPhoto();", content)
+        self.assertIn("StorageResolver.waitForNewCameraPhoto(captureStartTime, preCapturePhoto, 7000)", content)
 
 if __name__ == '__main__':
     unittest.main()

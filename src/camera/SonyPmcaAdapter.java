@@ -441,42 +441,39 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public void takeHardwarePicture(final Camera.ShutterCallback shutterCallback) {
         if (!ensureOpen()) return;
 
-        // 1. Direct hardware capture: normalCamera.takePicture(shutterCallback, null, null)
-        // Bypasses 1.7MP HAL proxy and writes 42.4MP directly to SD via BIONZ X.
-        // Sony PMCA HAL invokes shutterCallback.onShutter() when mechanical curtain completes.
-        try {
-            normalCamera.takePicture(shutterCallback, null, null);
-            Log.i(TAG, "Hardware normalCamera.takePicture(shutterCallback, null, null) invoked");
-            return;
-        } catch (Throwable t) {
-            Log.w(TAG, "takePicture(shutter, null, null) failed; attempting CameraEx fallback", t);
-        }
-
-        // 2. Fallback: CameraEx.burstableTakePicture() if standard call rejected
+        // 1. Preferred Sony PMCA method (LightLab hardware trigger): CameraEx.burstableTakePicture()
         if (cameraEx != null) {
             try {
                 Method burstM = cameraEx.getClass().getMethod("burstableTakePicture");
                 burstM.setAccessible(true);
                 burstM.invoke(cameraEx);
-                Log.i(TAG, "Hardware CameraEx.burstableTakePicture() invoked as fallback");
+                Log.i(TAG, "Hardware CameraEx.burstableTakePicture() invoked successfully");
                 if (shutterCallback != null) {
                     shutterCallback.onShutter();
                 }
                 return;
             } catch (Throwable t) {
-                Log.w(TAG, "CameraEx.burstableTakePicture() fallback unavailable", t);
+                Log.w(TAG, "CameraEx.burstableTakePicture() unavailable; trying normalCamera.takePicture", t);
             }
         }
 
-        // 3. Last-resort fallback: takePicture(null, null, null)
+        // 2. Direct hardware capture: normalCamera.takePicture(shutterCallback, null, null)
+        // Bypasses 1.7MP HAL proxy and writes 42.4MP directly to SD via BIONZ X.
         try {
-            normalCamera.takePicture(null, null, null);
-            Log.i(TAG, "Hardware takePicture(null, null, null) invoked");
-            if (shutterCallback != null) {
-                shutterCallback.onShutter();
+            normalCamera.takePicture(shutterCallback, null, null);
+            Log.i(TAG, "Hardware normalCamera.takePicture(shutterCallback, null, null) invoked");
+            return;
+        } catch (Throwable t) {
+            Log.w(TAG, "takePicture(shutter, null, null) failed; attempting (null, null, null)", t);
+            try {
+                normalCamera.takePicture(null, null, null);
+                Log.i(TAG, "Hardware takePicture(null, null, null) invoked");
+                if (shutterCallback != null) {
+                    shutterCallback.onShutter();
+                }
+            } catch (Throwable t2) {
+                Log.e(TAG, "takePicture(null, null, null) failed", t2);
             }
-        } catch (Throwable t2) {
-            Log.e(TAG, "takePicture(null, null, null) failed", t2);
         }
     }
 

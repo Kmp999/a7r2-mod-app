@@ -211,7 +211,7 @@ public class CaptureController {
                     public void onShutter() {
                         watchdogHandler.removeCallbacks(captureWatchdogRunnable);
                         try {
-                            cameraAdapter.cancelTakePicture();
+                            // Note: Do NOT call cancelTakePicture() here as it aborts the hardware exposure.
                             setState(CameraState.RESTORING_PREVIEW);
                             // Restore preview after mechanical shutter exposure cycle
                             watchdogHandler.postDelayed(new Runnable() {
@@ -236,7 +236,7 @@ public class CaptureController {
                 // Hardware trigger dispatched: immediately release gate so next shot is never locked out
                 isCapturing.set(false);
 
-                final File preCaptureLatest = StorageResolver.getLatestSavedPhoto();
+                final File preCapturePhoto = StorageResolver.getLatestCameraPhoto();
                 final int seqNum = StorageResolver.allocateNextSequenceNumber();
                 if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
                     Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
@@ -253,7 +253,7 @@ public class CaptureController {
                         boolean jobStarted = false;
                         try {
                             // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                            File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCaptureLatest, 7000);
+                            File newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, preCapturePhoto, 7000);
                             String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
                             int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
                             if (actualSeq <= 0) actualSeq = seqNum;
@@ -262,22 +262,28 @@ public class CaptureController {
                                 jobStarted = true;
                                 processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
                             } else {
-                                File master = StorageResolver.findRawMasterFile(seqNum);
-                                if (master != null) {
-                                    jobStarted = true;
-                                    processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
-                                } else {
-                                    File latest = StorageResolver.getLatestSavedPhoto();
-                                    if (latest != null && latest.length() > 200 * 1024) {
-                                        String latestPath = latest.getAbsolutePath();
-                                        if (preCaptureLatest == null || !latestPath.equals(preCaptureLatest.getAbsolutePath())) {
-                                            int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
+                                File latest = StorageResolver.getLatestCameraPhoto();
+                                if (latest != null && latest.length() > 50000) {
+                                    String latestPath = latest.getAbsolutePath();
+                                    if (preCapturePhoto == null || !latestPath.equals(preCapturePhoto.getAbsolutePath())) {
+                                        int lSeq = StorageResolver.parseSequenceNumber(latest.getName());
+                                        jobStarted = true;
+                                        processStripStreamingCapture(latestPath, null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
+                                    } else {
+                                        File master = StorageResolver.findRawMasterFile(seqNum);
+                                        if (master != null) {
                                             jobStarted = true;
-                                            processStripStreamingCapture(latestPath, null, (lSeq > 0 ? lSeq : seqNum), captureStartTime);
+                                            processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
                                         } else {
-                                            Log.e(TAG, "No new photo found on SD card after hardware capture");
+                                            Log.e(TAG, "No photo found on SD card after hardware capture");
                                             if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
                                         }
+                                    }
+                                } else {
+                                    File master = StorageResolver.findRawMasterFile(seqNum);
+                                    if (master != null) {
+                                        jobStarted = true;
+                                        processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
                                     } else {
                                         Log.e(TAG, "No photo found on SD card after hardware capture");
                                         if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");

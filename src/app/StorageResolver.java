@@ -1000,6 +1000,35 @@ public final class StorageResolver {
     }
 
     /**
+     * Finds the latest camera JPEG master (DSC0xxxx.JPG / _DSCxxxx.JPG) across candidate DCIM directories,
+     * strictly excluding fuji_*.jpg graded files.
+     */
+    public static File getLatestCameraPhoto() {
+        List<File> candidates = getCandidateDcimDirs();
+        File latestFile = null;
+        long latestTime = 0;
+
+        for (File dir : candidates) {
+            if (!dir.exists() || !dir.isDirectory()) continue;
+            File[] files = dir.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                if (f.isFile() && f.length() > 50000) {
+                    String name = f.getName().toUpperCase(Locale.US);
+                    if (name.endsWith(".JPG") && !name.startsWith("FUJI")) {
+                        long mod = f.lastModified();
+                        if (latestFile == null || mod >= latestTime) {
+                            latestTime = mod;
+                            latestFile = f;
+                        }
+                    }
+                }
+            }
+        }
+        return latestFile;
+    }
+
+    /**
      * Safely decodes a photo file into a display-safe Bitmap (e.g. 640x480 max).
      */
     public static Bitmap loadPhotoForReview(File photoFile, int maxDim) {
@@ -1099,50 +1128,45 @@ public final class StorageResolver {
      * Returns the newly saved File, or null if timed out.
      */
     public static File waitForNewCameraPhoto(long timeoutMs) {
-        return waitForNewCameraPhoto(System.currentTimeMillis() - 3000, getLatestSavedPhoto(), timeoutMs);
+        return waitForNewCameraPhoto(System.currentTimeMillis() - 3000, getLatestCameraPhoto(), timeoutMs);
     }
 
     public static File waitForNewCameraPhoto(long startTime, long timeoutMs) {
-        return waitForNewCameraPhoto(startTime, getLatestSavedPhoto(), timeoutMs);
+        return waitForNewCameraPhoto(startTime, getLatestCameraPhoto(), timeoutMs);
     }
 
     public static File waitForNewCameraPhoto(long startTime, File preCaptureLatest, long timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
-        long minTime = startTime - 2500; // Account for FAT32 2-second timestamp resolution
         String prevPath = (preCaptureLatest != null) ? preCaptureLatest.getAbsolutePath() : null;
+        long prevTime = (preCaptureLatest != null) ? preCaptureLatest.lastModified() : 0;
+        long prevLen = (preCaptureLatest != null) ? preCaptureLatest.length() : 0;
         int prevSeq = (preCaptureLatest != null) ? parseSequenceNumber(preCaptureLatest.getName()) : -1;
 
         while (System.currentTimeMillis() < deadline) {
             List<File> candidates = getCandidateDcimDirs();
             File newest = null;
-            long newestTime = minTime;
+            long newestTime = prevTime;
 
             for (File dir : candidates) {
                 if (!dir.exists() || !dir.isDirectory()) continue;
                 File[] files = dir.listFiles();
                 if (files == null) continue;
                 for (File f : files) {
-                    if (!f.isFile()) continue;
+                    if (!f.isFile() || f.length() < 50000) continue;
                     String name = f.getName().toUpperCase(Locale.US);
-                    if ((name.startsWith("DSC") || name.contains("DSC")) && name.endsWith(".JPG")) {
+                    if (name.endsWith(".JPG") && !name.startsWith("FUJI")) {
                         String absPath = f.getAbsolutePath();
-                        // 1. Explicitly ignore pre-capture photo
+                        // 1. Explicitly ignore pre-capture photo unless modified/grown
                         if (prevPath != null && absPath.equals(prevPath)) {
-                            continue;
+                            if (f.length() == prevLen) {
+                                continue;
+                            }
                         }
-                        // 2. Ignore any photo with sequence number <= preCaptureLatest sequence number
-                        int seq = parseSequenceNumber(name);
-                        if (prevSeq > 0 && seq > 0 && seq <= prevSeq) {
-                            continue;
-                        }
-                        // 3. Enforce modification timestamp >= captureStartTime (with FAT32 tolerance)
                         long mod = f.lastModified();
-                        if (mod < minTime && (prevSeq <= 0 || seq <= 0)) {
-                            continue;
-                        }
-                        // 4. Candidate must be growing or settled (> 50KB)
-                        if (f.length() > 50000) {
-                            if (newest == null || mod > newestTime || (seq > prevSeq && (newestTime == minTime || mod >= newestTime))) {
+                        int seq = parseSequenceNumber(name);
+                        // Accept any photo newer than preCapturePhoto or with a higher sequence number
+                        if (prevPath == null || mod >= prevTime || (prevSeq > 0 && seq > prevSeq)) {
+                            if (newest == null || mod >= newestTime || (seq > prevSeq)) {
                                 newestTime = mod;
                                 newest = f;
                             }
@@ -1172,7 +1196,7 @@ public final class StorageResolver {
             }
         }
 
-        File fallbackLatest = getLatestSavedPhoto();
+        File fallbackLatest = getLatestCameraPhoto();
         if (fallbackLatest != null && prevPath != null && fallbackLatest.getAbsolutePath().equals(prevPath)) {
             return null; // Don't falsely return the previous photo on timeout!
         }
