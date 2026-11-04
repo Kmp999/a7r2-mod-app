@@ -4,9 +4,6 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.BitmapRegionDecoder;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.Paint;
 import android.graphics.Rect;
 import android.hardware.Camera;
 import android.os.Handler;
@@ -15,7 +12,6 @@ import android.util.Log;
 
 import java.io.File;
 import java.nio.ByteBuffer;
-import java.nio.ShortBuffer;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -51,9 +47,6 @@ public class CaptureController {
 
     // Use native 17x17x17 3D LUT when available, gracefully fallback to Java engine
     private static final boolean USE_NATIVE_ENGINE = true;
-
-    // Heap-safe pixel budget
-    private static final int MAX_GRADE_PIXELS = 12 * 1024 * 1024;
 
     private final Context context;
     private final CameraAdapter cameraAdapter;
@@ -768,81 +761,6 @@ public class CaptureController {
         } else if (bitmap != null && !bitmap.isRecycled()) {
             bitmap.recycle();
         }
-    }
-
-    public void runDemo() {
-        if (appState.isProcessing()) {
-            return;
-        }
-        appState.setProcessing(true);
-        uiController.updateStatusAsync("Rendering demo...");
-
-        processingExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                final long start = System.currentTimeMillis();
-                try {
-                    int w = 640;
-                    int h = 480;
-                    Bitmap bitmap = makeTestImage(w, h);
-
-                    short[] pixels = new short[w * h];
-                    ShortBuffer buffer = ShortBuffer.wrap(pixels);
-                    bitmap.copyPixelsToBuffer(buffer);
-
-                    boolean graded = false;
-                    if (USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable()) {
-                        FujiRecipe recipe = appState.getActiveRecipe();
-                        ColorEngine.precomputeLut17Safe(
-                            recipe.computeCcmQ8(),
-                            recipe.generateToneCurve('R'),
-                            recipe.generateToneCurve('G'),
-                            recipe.generateToneCurve('B')
-                        );
-                        graded = ColorEngine.applyLut17RGB565Safe(pixels, w * h);
-                    }
-                    if (!graded) {
-                        javaEngine.init(appState.getCurrentPresetId());
-                        javaEngine.processRGB565(pixels, w, h);
-                    }
-
-                    buffer.rewind();
-                    bitmap.copyPixelsFromBuffer(buffer);
-
-                    String savedPath = StorageResolver.saveJpegToSd(context, bitmap);
-                    long duration = System.currentTimeMillis() - start;
-                    appState.setLastProcessingTimeMs(duration);
-                    deliverResult(bitmap, appState.getCurrentPresetName() + " (demo)", w, h, duration, savedPath);
-                } catch (Throwable t) {
-                    Log.e(TAG, "Demo failed", t);
-                    uiController.updateStatusAsync("Demo error: " + t.getClass().getSimpleName());
-                } finally {
-                    appState.setProcessing(false);
-                }
-            }
-        });
-    }
-
-    private Bitmap makeTestImage(int w, int h) {
-        Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565);
-        Canvas c = new Canvas(bmp);
-        Paint p = new Paint();
-        int[] bars = {
-            Color.rgb(255, 255, 255), Color.rgb(255, 0, 0), Color.rgb(0, 255, 0),
-            Color.rgb(0, 0, 255), Color.rgb(255, 255, 0), Color.rgb(0, 255, 255),
-            Color.rgb(255, 0, 255), Color.rgb(128, 128, 128)
-        };
-        int bw = w / bars.length;
-        for (int i = 0; i < bars.length; i++) {
-            p.setColor(bars[i]);
-            c.drawRect(i * bw, 0, (i + 1) * bw, h / 2, p);
-        }
-        for (int x = 0; x < w; x++) {
-            int v = (int) (255L * x / w);
-            p.setColor(Color.rgb(v, v, v));
-            c.drawRect(x, h / 2, x + 1, h, p);
-        }
-        return bmp;
     }
 
     public void shutdown() {
