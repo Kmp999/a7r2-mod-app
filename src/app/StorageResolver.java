@@ -672,9 +672,9 @@ public final class StorageResolver {
                     return true;
                 }
             }
-            return false;
+            return len > 200000;
         } catch (Throwable t) {
-            return false;
+            return len > 200000;
         } finally {
             if (raf != null) {
                 try { raf.close(); } catch (Throwable ignored) {}
@@ -1119,7 +1119,8 @@ public final class StorageResolver {
                 break;
             }
         }
-        return getLatestSavedPhoto();
+        File fallback = getLatestCameraPhoto();
+        return (fallback != null) ? fallback : getLatestSavedPhoto();
     }
 
     /**

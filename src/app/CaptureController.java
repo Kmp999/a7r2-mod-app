@@ -98,6 +98,11 @@ public class CaptureController {
                 @Override
                 public void onImageStored(String dir, String filename) {
                     final File rawFile = new File(dir, filename);
+                    final String absPath = rawFile.getAbsolutePath();
+                    if (processedPhotoPaths.contains(absPath)) {
+                        return;
+                    }
+                    processedPhotoPaths.add(absPath);
                     final int seqNum = StorageResolver.parseSequenceNumber(filename);
                     if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
                         Log.w(TAG, "Grading queue full on hardware store; skipping background grading.");
@@ -121,6 +126,7 @@ public class CaptureController {
 
     public static final int MAX_PENDING_JOBS = 8;
     private final java.util.concurrent.atomic.AtomicInteger pendingJobsCount = new java.util.concurrent.atomic.AtomicInteger(0);
+    private final java.util.Set<String> processedPhotoPaths = java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
     private volatile boolean isShuttingDown = false;
 
     public int getPendingJobsCount() {

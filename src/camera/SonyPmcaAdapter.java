@@ -441,7 +441,18 @@ public class SonyPmcaAdapter implements CameraAdapter {
     public void takeHardwarePicture(final Camera.ShutterCallback shutterCallback) {
         if (!ensureOpen()) return;
 
-        // 1. Preferred Sony PMCA method (LightLab hardware trigger): CameraEx.burstableTakePicture()
+        // 1. Direct hardware capture: normalCamera.takePicture(shutterCallback, null, null)
+        // Directly trips the mechanical shutter curtain and instructs BIONZ X to save the
+        // full 42.4MP (7952x5304) master JPEG directly to SD card, bypassing HAL downsampling.
+        try {
+            normalCamera.takePicture(shutterCallback, null, null);
+            Log.i(TAG, "Hardware normalCamera.takePicture(shutterCallback, null, null) invoked");
+            return;
+        } catch (Throwable t) {
+            Log.w(TAG, "takePicture(shutterCallback, null, null) failed; trying burstableTakePicture", t);
+        }
+
+        // 2. Preferred Sony PMCA method (LightLab hardware trigger): CameraEx.burstableTakePicture()
         if (cameraEx != null) {
             try {
                 Method burstM = cameraEx.getClass().getMethod("burstableTakePicture");
@@ -457,23 +468,16 @@ public class SonyPmcaAdapter implements CameraAdapter {
             }
         }
 
-        // 2. Direct hardware capture: normalCamera.takePicture(shutterCallback, null, null)
-        // Bypasses 1.7MP HAL proxy and writes 42.4MP directly to SD via BIONZ X.
+        // 3. Fallback: normalCamera.takePicture(null, null, null)
         try {
-            normalCamera.takePicture(shutterCallback, null, null);
-            Log.i(TAG, "Hardware normalCamera.takePicture(shutterCallback, null, null) invoked");
-            return;
-        } catch (Throwable t) {
-            Log.w(TAG, "takePicture(shutter, null, null) failed; attempting (null, null, null)", t);
-            try {
-                normalCamera.takePicture(null, null, null);
-                Log.i(TAG, "Hardware takePicture(null, null, null) invoked");
-                if (shutterCallback != null) {
-                    shutterCallback.onShutter();
-                }
-            } catch (Throwable t2) {
-                Log.e(TAG, "takePicture(null, null, null) failed", t2);
+            normalCamera.takePicture(null, null, null);
+            Log.i(TAG, "Hardware takePicture(null, null, null) invoked");
+            if (shutterCallback != null) {
+                shutterCallback.onShutter();
             }
+        } catch (Throwable t2) {
+            Log.e(TAG, "takePicture(null, null, null) failed", t2);
+            cancelTakePicture();
         }
     }
 
