@@ -242,8 +242,6 @@ public class CaptureController {
                     }
                 };
                 ((SonyPmcaAdapter) cameraAdapter).takeHardwarePicture(shutterCb);
-                // Hardware trigger dispatched: immediately release gate so next shot is never locked out
-                isCapturing.set(false);
 
                 final int seqNum = StorageResolver.allocateNextSequenceNumber();
                 if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {

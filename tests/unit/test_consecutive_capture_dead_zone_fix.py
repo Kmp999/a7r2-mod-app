@@ -87,13 +87,15 @@ class TestConsecutiveCaptureDeadZoneFix(unittest.TestCase):
         self.assertIn("processedPhotoPaths", content)
 
     def test_hardware_shutter_direct_actuation_ordering(self):
-        """SonyPmcaAdapter prioritizes direct normalCamera.takePicture before burstableTakePicture fallback."""
+        """SonyPmcaAdapter prioritizes CameraEx.burstableTakePicture before normalCamera.takePicture fallback."""
         content = self.sony_pmca_file.read_text(encoding="utf-8")
         idx_direct = content.find("normalCamera.takePicture(shutterCallback, null, null);")
         idx_burst = content.find("burstableTakePicture")
         self.assertNotEqual(idx_direct, -1)
         self.assertNotEqual(idx_burst, -1)
-        self.assertLess(idx_direct, idx_burst, "Direct mechanical takePicture must precede burstableTakePicture fallback")
+        self.assertLess(idx_burst, idx_direct, "burstableTakePicture must precede normalCamera.takePicture fallback")
+        self.assertIn("setShutterListener", content)
+        self.assertIn("CameraEx$ShutterListener", content)
 
     def test_storage_resolver_jpeg_completion_size_fallback(self):
         """StorageResolver.isJpegComplete contains len > 200000 fallback for Sony trailer metadata."""

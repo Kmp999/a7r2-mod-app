@@ -38,6 +38,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
         void onImageStored(String dir, String filename);
     }
     private volatile StoreImageListener storeImageListener;
+    private volatile Camera.ShutterCallback activeShutterCallback;
 
     public void setStoreImageListener(StoreImageListener listener) {
         this.storeImageListener = listener;
@@ -252,6 +253,39 @@ public class SonyPmcaAdapter implements CameraAdapter {
             } catch (Throwable t) {
                 Log.w(TAG, "StoreImageCompleteListener unsupported or failed to register", t);
             }
+
+            // CameraEx.ShutterListener (LightLab mechanism: handles burstableTakePicture shutter sync)
+            try {
+                Class<?> shutterListenerCls = Class.forName("com.sony.scalar.hardware.CameraEx$ShutterListener");
+                Object shutterProxy = java.lang.reflect.Proxy.newProxyInstance(
+                    shutterListenerCls.getClassLoader(),
+                    new Class<?>[]{shutterListenerCls},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, Method method, Object[] args) {
+                            String mName = method.getName();
+                            if ("onShutter".equals(mName)) {
+                                Log.i(TAG, "Hardware CameraEx.ShutterListener.onShutter received");
+                                // 1. Terminate burst capture immediately so exactly one shot is taken
+                                cancelTakePicture();
+                                // 2. Dispatch to active shutter callback
+                                Camera.ShutterCallback cb = activeShutterCallback;
+                                if (cb != null) {
+                                    activeShutterCallback = null;
+                                    cb.onShutter();
+                                }
+                            }
+                            return null;
+                        }
+                    }
+                );
+                Method setShutterListenerMethod = cls.getMethod("setShutterListener", shutterListenerCls);
+                setShutterListenerMethod.setAccessible(true);
+                setShutterListenerMethod.invoke(cameraEx, shutterProxy);
+                Log.i(TAG, "CameraEx.ShutterListener registered successfully");
+            } catch (Throwable t) {
+                Log.w(TAG, "CameraEx.ShutterListener registration unsupported or failed", t);
+            }
         } catch (Throwable t) {
             Log.w(TAG, "Hardware listener registration unsupported on this body", t);
         }
@@ -434,41 +468,38 @@ public class SonyPmcaAdapter implements CameraAdapter {
 
     /**
      * Triggers full-resolution hardware capture by passing (shutter, null, null).
-     * On Sony PMCA bodies (A7R II), passing null for raw and jpeg callbacks directs BIONZ X
-     * to save the original 42.4MP image directly to the SD card, while passing a non-null
-     * jpegCallback restricts capture to a 1.7MP proxy.
+     * On Sony PMCA bodies (A7R II), CameraEx.burstableTakePicture() paired with
+     * CameraEx.ShutterListener halts burst at 1 frame via cancelTakePicture() and
+     * directs BIONZ X to write the full 42.4MP master JPEG directly to SD card.
      */
     public void takeHardwarePicture(final Camera.ShutterCallback shutterCallback) {
         if (!ensureOpen()) return;
 
-        // 1. Direct hardware capture: normalCamera.takePicture(shutterCallback, null, null)
-        // Directly trips the mechanical shutter curtain and instructs BIONZ X to save the
-        // full 42.4MP (7952x5304) master JPEG directly to SD card, bypassing HAL downsampling.
+        // 1. Preferred Sony PMCA method (proven LightLab hardware trigger): CameraEx.burstableTakePicture()
+        if (cameraEx != null) {
+            try {
+                Method burstM = cameraEx.getClass().getMethod("burstableTakePicture");
+                burstM.setAccessible(true);
+                this.activeShutterCallback = shutterCallback;
+                burstM.invoke(cameraEx);
+                Log.i(TAG, "Hardware CameraEx.burstableTakePicture() invoked successfully");
+                return;
+            } catch (Throwable t) {
+                Log.w(TAG, "CameraEx.burstableTakePicture() unavailable; trying normalCamera.takePicture", t);
+                this.activeShutterCallback = null;
+            }
+        }
+
+        // 2. Direct hardware capture fallback: normalCamera.takePicture(shutterCallback, null, null)
         try {
             normalCamera.takePicture(shutterCallback, null, null);
             Log.i(TAG, "Hardware normalCamera.takePicture(shutterCallback, null, null) invoked");
             return;
         } catch (Throwable t) {
-            Log.w(TAG, "takePicture(shutterCallback, null, null) failed; trying burstableTakePicture", t);
+            Log.w(TAG, "takePicture(shutterCallback, null, null) failed; trying (null, null, null)", t);
         }
 
-        // 2. Preferred Sony PMCA method (LightLab hardware trigger): CameraEx.burstableTakePicture()
-        if (cameraEx != null) {
-            try {
-                Method burstM = cameraEx.getClass().getMethod("burstableTakePicture");
-                burstM.setAccessible(true);
-                burstM.invoke(cameraEx);
-                Log.i(TAG, "Hardware CameraEx.burstableTakePicture() invoked successfully");
-                if (shutterCallback != null) {
-                    shutterCallback.onShutter();
-                }
-                return;
-            } catch (Throwable t) {
-                Log.w(TAG, "CameraEx.burstableTakePicture() unavailable; trying normalCamera.takePicture", t);
-            }
-        }
-
-        // 3. Fallback: normalCamera.takePicture(null, null, null)
+        // 3. Last-resort fallback: normalCamera.takePicture(null, null, null)
         try {
             normalCamera.takePicture(null, null, null);
             Log.i(TAG, "Hardware takePicture(null, null, null) invoked");
@@ -497,6 +528,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
      * Interrupts BIONZ X exposure and resets hardware trigger logic.
      */
     public void cancelTakePicture() {
+        activeShutterCallback = null;
         if (cameraEx != null) {
             try {
                 Method cancelM = cameraEx.getClass().getMethod("cancelTakePicture");
