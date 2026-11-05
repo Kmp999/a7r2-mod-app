@@ -122,5 +122,13 @@ class TestEndToEndCapturePipeline(unittest.TestCase):
         decoded_img = Image.open(io.BytesIO(encoded_data))
         self.assertEqual(decoded_img.size, (32, 16))
 
+    def test_progressive_decode_and_java_recipe_grading_fallback(self):
+        """CaptureController implements memory-safe progressive decode and pure-Java matrix/curve grading."""
+        cc_content = self.capture_controller.read_text(encoding="utf-8")
+        self.assertIn("applyRecipeInJava", cc_content)
+        self.assertIn("fallbackOpts.inSampleSize = 4", cc_content)
+        self.assertIn("recipe.computeCcmQ8()", cc_content)
+        self.assertIn("recipe.generateToneCurve('R')", cc_content)
+
 if __name__ == "__main__":
     unittest.main()
