@@ -409,7 +409,7 @@ public class CaptureController {
                                     newPhoto = pendingHardwareStoredQueue.pollFirst();
                                 } else if (storeImageListenerSeen && !isShuttingDown) {
                                     try {
-                                        hardwareStoreLock.wait(350);
+                                        hardwareStoreLock.wait(1200);
                                     } catch (InterruptedException ignored) {}
                                     if (!pendingHardwareStoredQueue.isEmpty()) {
                                         newPhoto = pendingHardwareStoredQueue.pollFirst();
@@ -623,34 +623,21 @@ public class CaptureController {
                 StorageResolver.waitForJpegComplete(rawMasterFile, 1500);
             }
 
+            final long tSdReady = System.currentTimeMillis();
+            final long sdWaitMs = tSdReady - captureStartTime;
+
             final FujiRecipe recipe = appState.getActiveRecipe();
             final String presetName = appState.getCurrentPresetName();
 
-            // 2. Initialize BitmapRegionDecoder ONLY when native strip streaming is available
-            //    (skips 1.5-2.5s JPEG tile-index scan if native JNI is unavailable)
+            // 2. Read source JPEG dimensions in ~1ms via inJustDecodeBounds (DO NOT construct
+            //    BitmapRegionDecoder yet, which wastes 2.5s building a full-file Huffman index!)
             final boolean nativeReady = USE_NATIVE_ENGINE && ColorEngine.isNativeAvailable();
             BitmapRegionDecoder decoder = null;
-            int srcW = 0;
-            int srcH = 0;
-            if (nativeReady) {
-                try {
-                    decoder = BitmapRegionDecoder.newInstance(rawJpegPath, false);
-                    if (decoder != null) {
-                        srcW = decoder.getWidth();
-                        srcH = decoder.getHeight();
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "BitmapRegionDecoder initialization failed for " + rawJpegPath + ": " + t.getMessage());
-                }
-            }
-
-            if (decoder == null) {
-                BitmapFactory.Options boundsOpts = new BitmapFactory.Options();
-                boundsOpts.inJustDecodeBounds = true;
-                BitmapFactory.decodeFile(rawJpegPath, boundsOpts);
-                srcW = boundsOpts.outWidth;
-                srcH = boundsOpts.outHeight;
-            }
+            BitmapFactory.Options boundsOpts = new BitmapFactory.Options();
+            boundsOpts.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(rawJpegPath, boundsOpts);
+            int srcW = boundsOpts.outWidth;
+            int srcH = boundsOpts.outHeight;
 
             // Fallback for mock test environments or images where bounds cannot be determined
             if (srcW <= 0 || srcH <= 0) {
@@ -711,24 +698,69 @@ public class CaptureController {
             final int grainStrength = recipe.grainEffect.ordinal();
             final int clarityStrength = recipe.clarity;
 
-            // 5. Check Pure Native C Zero-JNI-Copy Fast-Path
+            // 5. Pure Native C Single-Pass 4-Core Fast-Path (bypasses BitmapRegionDecoder, Dalvik heap & copyPixelsToBuffer!)
             boolean streamSuccess = false;
             boolean inlineExifWritten = false;
             boolean usedDirectTarget = false;
             boolean usedCacheStream = false;
+            boolean usedFastTranscode = false;
             File cacheStreamFile = null;
-            if (nativeReady && ColorEngine.nativeProcessImageStreamFastSafe(rawJpegPath, tmpFile.getAbsolutePath(), grainStrength, clarityStrength)) {
-                streamSuccess = true;
+            long fastTranscodeMs = 0;
+            long brdIdxMs = 0;
+            long brdDecMs = 0;
+            long brdJniMs = 0;
+
+            if (nativeReady) {
+                long tFast0 = System.currentTimeMillis();
+                if (uiController != null) {
+                    uiController.updateStatusAsync("Fast 4-Core Grading...");
+                }
+                if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, tmpFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                    streamSuccess = true;
+                    usedFastTranscode = true;
+                    inlineExifWritten = true;
+                } else if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, targetOutputFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                    streamSuccess = true;
+                    usedFastTranscode = true;
+                    usedDirectTarget = true;
+                    inlineExifWritten = true;
+                } else if (context != null && context.getCacheDir() != null) {
+                    cacheStreamFile = new File(context.getCacheDir(), String.format(Locale.US, "fuji_stream_%04d.jpg", seqNum));
+                    if (cacheStreamFile.exists()) cacheStreamFile.delete();
+                    if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, cacheStreamFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                        streamSuccess = true;
+                        usedFastTranscode = true;
+                        usedCacheStream = true;
+                        inlineExifWritten = true;
+                    } else {
+                        if (cacheStreamFile.exists()) cacheStreamFile.delete();
+                        cacheStreamFile = null;
+                    }
+                }
+                fastTranscodeMs = System.currentTimeMillis() - tFast0;
+            }
+
+            if (usedFastTranscode) {
                 if (decoder != null) {
                     decoder.recycle();
                     decoder = null;
                 }
             } else {
+                // Lazy-initialize BitmapRegionDecoder ONLY when pure-C fast path needed fallback (e.g. progressive JPEG)
+                if (nativeReady && decoder == null) {
+                    long tIdx0 = System.currentTimeMillis();
+                    try {
+                        decoder = BitmapRegionDecoder.newInstance(rawJpegPath, false);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "BitmapRegionDecoder initialization failed for " + rawJpegPath + ": " + t.getMessage());
+                    }
+                    brdIdxMs = System.currentTimeMillis() - tIdx0;
+                }
                 // 3-Tier Native Stream Open:
                 //   Tier 1: DCIM fuji_xxxx.jpg.tmp (atomic rename)
                 //   Tier 2: DCIM fuji_xxxx.jpg direct (if Sony FAT32 rejects .tmp extension)
                 //   Tier 3: App cache file -> raw MediaStore byte stream (if SD POSIX write returns EACCES)
-                byte[] inlineExifApp1 = nativeReady ? StorageResolver.extractExifApp1Segment(rawJpegPath) : null;
+                byte[] inlineExifApp1 = null; // Avoid copying raw Sony MakerNotes/stale IFD1 thumbnail verbatim
                 long streamHandle = 0;
                 if (nativeReady && decoder != null) {
                     streamHandle = openNativeStreamTier(tmpFile, dstW, dstH, inlineExifApp1);
@@ -846,16 +878,15 @@ public class CaptureController {
                 }
 
                 // 6. Strict Dalvik Heap Management: Process in source strips
-                // Allocate direct buffer (upgraded to 256-row 4-core SMP bands when native engine is active,
-                // cutting Skia decodeRegion file seeks by 4x and keeping all 4 Cortex-A5 cores saturated)
-                java.nio.ByteBuffer stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 4);
                 final int maxOutStripH;
+                java.nio.ByteBuffer stripDirect;
                 if (nativeReady) {
                     srcStripH *= 4; // 256 output rows per band (64 rows per Cortex-A5 core)
                     maxOutStripH = 256;
                     stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * maxOutStripH * 4);
                 } else {
                     maxOutStripH = 64;
+                    stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 4);
                 }
                 final int numStrips = (srcH + srcStripH - 1) / srcStripH;
 
@@ -898,6 +929,7 @@ public class CaptureController {
 
                         Bitmap stripBmp = null;
                         try {
+                            long tDec0 = System.currentTimeMillis();
                             try {
                                 if (canReuseRegionBitmap && reusableStripBmp != null && currentSrcH == srcStripH) {
                                     opts.inBitmap = reusableStripBmp;
@@ -918,13 +950,16 @@ public class CaptureController {
                                     reusableStripBmp = null;
                                 }
                                 opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                                stripDirect = null;
+                                System.gc();
                                 // Resize direct buffer so native JNI accurately detects RGB_565 (2 bytes/px)
                                 stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2);
-                                if (nativeReady) {
+                                if (nativeReady && maxOutStripH != 64) {
                                     stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * maxOutStripH * 2);
                                 }
                                 stripBmp = decoder.decodeRegion(rect, opts);
                             }
+                            brdDecMs += (System.currentTimeMillis() - tDec0);
                             if (stripBmp == null) {
                                 Log.e(TAG, "decodeRegion returned null for strip at source row " + srcY);
                                 streamSuccess = false;
@@ -935,10 +970,13 @@ public class CaptureController {
                             }
                             int outStripW = stripBmp.getWidth();  // 3976, 5168, or 7952
                             int outStripH = stripBmp.getHeight(); // 256 (or partial final strip)
-                            if (stripBmp.getConfig() == Bitmap.Config.RGB_565 && stripDirect.capacity() >= outStripW * outStripH * 4) {
+                            boolean isRgb565 = (opts.inPreferredConfig == Bitmap.Config.RGB_565)
+                                || (stripBmp.getConfig() == Bitmap.Config.RGB_565);
+                            if (isRgb565 && stripDirect.capacity() >= outStripW * outStripH * 4) {
                                 stripDirect = java.nio.ByteBuffer.allocateDirect(outStripW * outStripH * 2);
                             }
 
+                            long tJni0 = System.currentTimeMillis();
                             stripDirect.clear();
                             stripBmp.copyPixelsToBuffer(stripDirect);
                             stripDirect.rewind();
@@ -947,6 +985,7 @@ public class CaptureController {
                             boolean stripOk = ColorEngine.gradeAndWriteStreamStripSafe(
                                 streamHandle, stripDirect, outStripW, outStripH, outputRowOffset, grainStrength, clarityStrength
                             );
+                            brdJniMs += (System.currentTimeMillis() - tJni0);
                             if (!stripOk) {
                                 Log.e(TAG, "Failed encoding strip at output row " + outputRowOffset);
                                 streamSuccess = false;
@@ -1061,32 +1100,31 @@ public class CaptureController {
             final long totalMs = System.currentTimeMillis() - captureStartTime;
             final float mp = (float)(dstW * dstH) / 1000000.0f;
             final String savedFileName = (gradedSavedPath != null) ? new File(gradedSavedPath).getName() : String.format(Locale.US, "fuji_%04d.jpg", seqNum);
+            final String perfDetail = usedFastTranscode
+                ? String.format(Locale.US, " [C-FAST sd:%d c:%d]", sdWaitMs, fastTranscodeMs)
+                : String.format(Locale.US, " [BRD sd:%d idx:%d dec:%d jni:%d]", sdWaitMs, brdIdxMs, brdDecMs, brdJniMs);
             final String telemetry = String.format(Locale.US, "SAVED %s (%dx%d | %.1fMP) in %dms",
-                savedFileName, dstW, dstH, mp, totalMs);
+                savedFileName, dstW, dstH, mp, totalMs) + perfDetail;
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
-            // 10. Load display-safe review bitmap (<= 640x480; triggers libjpeg 1/8 DC-only IDCT fast path on 5168x3448)
+            // 10. Load crisp display-safe review bitmap (<= 960px, aspect-preserving letterbox in FujiQMenuView)
             Bitmap reviewBmp = null;
             File reviewFile = (gradedSavedPath != null && new File(gradedSavedPath).exists())
                 ? new File(gradedSavedPath) : targetOutputFile;
             if (reviewFile != null && reviewFile.exists()) {
-                reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 640);
+                reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 960);
             }
             if (reviewBmp == null && rawMasterFile.exists()) {
-                reviewBmp = StorageResolver.loadPhotoForReview(rawMasterFile, 640);
+                reviewBmp = StorageResolver.loadPhotoForReview(rawMasterFile, 960);
                 if (reviewBmp != null) {
                     if (!ColorEngine.applyLutAndGrainBitmapSafe(reviewBmp, grainStrength, clarityStrength)) {
                         reviewBmp = applyRecipeInJava(reviewBmp, recipe);
                     }
-                    if (gradedSavedPath == null || !new File(gradedSavedPath).exists()) {
-                        gradedSavedPath = StorageResolver.saveGradedJpegToDirectory(
-                            context, reviewBmp, rawMasterFile.getParentFile(), seqNum, presetName, true);
-                    }
                 }
             }
             if (reviewBmp != null) {
-                String tierTag = usedCacheStream ? "C-MS" : (usedDirectTarget ? "C-DIR" : "C");
+                String tierTag = usedFastTranscode ? "C-FAST" : (usedCacheStream ? "C-MS" : (usedDirectTarget ? "C-DIR" : "C"));
                 if (resultListener != null) {
                     deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, gradedSavedPath, tierTag);
                 } else if (uiController != null) {

@@ -21,6 +21,8 @@ int native_jpeg_quantize_mcu_row_argb8888(const JpegStreamState* state, const ui
                                           int strip_w, int strip_h, int row_offset, int my, JpegQuantBlock* out_blocks);
 int native_jpeg_quantize_mcu_row_rgb565(const JpegStreamState* state, const uint16_t* strip_pixels,
                                         int strip_w, int strip_h, int row_offset, int my, JpegQuantBlock* out_blocks);
+int native_jpeg_quantize_ycbcr_mcu(const JpegStreamState* state, int16_t y_blk[4][64],
+                                   int16_t cb_blk[64], int16_t cr_blk[64], JpegQuantBlock* out_blocks);
 int native_jpeg_emit_quantized_blocks(JpegStreamState* state, const JpegQuantBlock* blocks, int num_mcus);
 
 /**

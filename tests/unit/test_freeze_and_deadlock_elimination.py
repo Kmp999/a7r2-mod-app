@@ -50,9 +50,11 @@ class TestFreezeAndDeadlockElimination(unittest.TestCase):
         self.assertIn("if (diff > 2047) diff = 2047; else if (diff < -2047) diff = -2047;", writer_c)
         self.assertIn("native_jpeg_quantize_mcu_row_argb8888", self.jni_c)
         self.assertIn("native_jpeg_emit_quantized_blocks", self.jni_c)
+        self.assertIn("native_fast_transcode_jpeg", self.jni_c)
         self.assertIn("grade_slice_thread_fn", self.jni_c)
         self.assertIn("canReuseRegionBitmap", self.capture_java)
         self.assertIn("opts.inBitmap = reusableStripBmp;", self.capture_java)
+        self.assertIn("if (file.length() != len) return false;", self.storage_java)
 
     def test_capture_controller_granular_hud_telemetry(self):
         """CaptureController reports granular HUD updates across all pipeline stages and keeps Java 7 final vars."""

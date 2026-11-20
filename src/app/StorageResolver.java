@@ -807,7 +807,7 @@ public final class StorageResolver {
         java.io.RandomAccessFile raf = null;
         try {
             raf = new java.io.RandomAccessFile(file, "r");
-            long searchLen = Math.min(len, 4096L);
+            long searchLen = Math.min(len, 16384L);
             raf.seek(len - searchLen);
             byte[] tail = new byte[(int)searchLen];
             raf.readFully(tail);
@@ -816,9 +816,12 @@ public final class StorageResolver {
                     return true;
                 }
             }
+            // Fallback for Sony MPF trailer metadata > 16KB: require size stability before accepting
+            try { Thread.sleep(80); } catch (InterruptedException ignored) {}
+            if (file.length() != len) return false;
             return len > 200000;
         } catch (Throwable t) {
-            return len > 200000;
+            return false;
         } finally {
             if (raf != null) {
                 try { raf.close(); } catch (Throwable ignored) {}

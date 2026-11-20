@@ -378,14 +378,19 @@ public class ColorEngine {
      * Decompresses, grades with 17^3 3D LUT + Grain + Clarity, and streams JPEG directly in native C.
      */
     public static boolean nativeProcessImageStreamFastSafe(String inputPath, String outputPath, int grainStrength, int clarityStrength) {
+        return nativeProcessImageStreamFastScaledSafe(inputPath, outputPath, 0, grainStrength, clarityStrength);
+    }
+
+    public static boolean nativeProcessImageStreamFastScaledSafe(String inputPath, String outputPath, int scaleDenom, int grainStrength, int clarityStrength) {
         if (!sNativeAvailable || inputPath == null || outputPath == null) return false;
         try {
-            return nativeProcessImageStreamFast(inputPath, outputPath, grainStrength, clarityStrength);
+            return nativeProcessImageStreamFastScaled(inputPath, outputPath, scaleDenom, grainStrength, clarityStrength);
         } catch (Throwable t) {
-            Log.d(TAG, "nativeProcessImageStreamFastSafe fallback: " + t.getMessage());
+            Log.d(TAG, "nativeProcessImageStreamFastScaledSafe fallback: " + t.getMessage());
             return false;
         }
     }
 
     public static native boolean nativeProcessImageStreamFast(String inputPath, String outputPath, int grainStrength, int clarityStrength);
+    public static native boolean nativeProcessImageStreamFastScaled(String inputPath, String outputPath, int scaleDenom, int grainStrength, int clarityStrength);
 }

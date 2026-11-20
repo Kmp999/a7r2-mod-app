@@ -253,13 +253,10 @@ static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma
 
 static void write_headers(FILE* fp, int width, int height, uint8_t* q_luma, uint8_t* q_chroma,
                           const uint8_t* exif_app1, size_t exif_len) {
+    static const uint8_t APP0_HDR[] = { 0xFF,0xD8, 0xFF,0xE0, 0,16, 'J','F','I','F',0, 1,1, 0, 0,1, 0,1, 0,0 };
+    fwrite(APP0_HDR, 1, sizeof(APP0_HDR), fp);
     if (exif_app1 != NULL && exif_len >= 4 && exif_app1[0] == 0xFF && exif_app1[1] == 0xE1) {
-        static const uint8_t SOI_HDR[] = { 0xFF, 0xD8 };
-        fwrite(SOI_HDR, 1, sizeof(SOI_HDR), fp);
         fwrite(exif_app1, 1, exif_len, fp);
-    } else {
-        static const uint8_t APP0_HDR[] = { 0xFF,0xD8, 0xFF,0xE0, 0,16, 'J','F','I','F',0, 1,1, 0, 0,1, 0,1, 0,0 };
-        fwrite(APP0_HDR, 1, sizeof(APP0_HDR), fp);
     }
     fputc(0xFF, fp); fputc(0xDB, fp); fputc(0x00, fp); fputc(0x84, fp); fputc(0x00, fp);
     for (int i = 0; i < 64; i++) fputc(q_luma[ZIGZAG[i]], fp);
@@ -495,6 +492,15 @@ int native_jpeg_quantize_mcu_row_argb8888(const JpegStreamState* state, const ui
         quantize_block_fast(cb_block, state->inv_q_chroma, qb++);
         quantize_block_fast(cr_block, state->inv_q_chroma, qb++);
     }
+    return 1;
+}
+
+int native_jpeg_quantize_ycbcr_mcu(const JpegStreamState* state, int16_t y_blk[4][64],
+                                   int16_t cb_blk[64], int16_t cr_blk[64], JpegQuantBlock* out_blocks) {
+    if (!state || !out_blocks) return 0;
+    for (int i = 0; i < 4; i++) quantize_block_fast(y_blk[i], state->inv_q_luma, out_blocks + i);
+    quantize_block_fast(cb_blk, state->inv_q_chroma, out_blocks + 4);
+    quantize_block_fast(cr_blk, state->inv_q_chroma, out_blocks + 5);
     return 1;
 }
 

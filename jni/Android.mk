@@ -24,6 +24,7 @@ LOCAL_SRC_FILES := \
     ../src/image/image_buffer.c \
     ../src/image/downscaler.c \
     ../src/image/native_jpeg_writer.c \
+    ../src/image/native_jpeg_fast_stream.c \
     ../src/perf/timestamp.c \
     ../src/perf/profiler.c \
     ../src/util/memory_pool.c

@@ -377,8 +377,20 @@ public class FujiQMenuView extends View {
         // Mode 1: Quick Review Overlay (Instant Capture Feedback)
         // --------------------------------------------------------------------
         if (reviewBitmap != null) {
-            srcRect.set(0, 0, reviewBitmap.getWidth(), reviewBitmap.getHeight());
-            dstRect.set(0, 0, w, h);
+            canvas.drawRect(0, 0, w, h, bgPaint);
+            int bw = reviewBitmap.getWidth();
+            int bh = reviewBitmap.getHeight();
+            srcRect.set(0, 0, bw, bh);
+            if (bw > 0 && bh > 0) {
+                float scale = Math.min((float) w / (float) bw, (float) h / (float) bh);
+                int dw = Math.round(bw * scale);
+                int dh = Math.round(bh * scale);
+                int left = (w - dw) / 2;
+                int top = (h - dh) / 2;
+                dstRect.set(left, top, left + dw, top + dh);
+            } else {
+                dstRect.set(0, 0, w, h);
+            }
             canvas.drawBitmap(reviewBitmap, srcRect, dstRect, null);
 
             canvas.drawRect(0, h - 48, w, h, barBgPaint);

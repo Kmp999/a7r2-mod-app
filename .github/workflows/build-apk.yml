@@ -44,6 +44,72 @@ jobs:
           readelf -d libs/armeabi-v7a/libcolor_engine_jni.so
           nm -D -u libs/armeabi-v7a/libcolor_engine_jni.so
 
+      - name: Host C Self-Test (4:2:2 Sony / 4:2:0 / 4:4:4 / 1:2 Scaled Fast JPEG Transcoder + EXIF)
+        run: |
+          python3 -m pip install --quiet pillow numpy || true
+          cat << 'EOF' > /tmp/test_fast_stream.c
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include "lut_cube_17.h"
+          #include "native_jpeg_fast_stream.h"
+          int main(int argc, char** argv) {
+              if (argc < 4) return 2;
+              Lut17Context lut;
+              int16_t id_ccm[9] = {256,0,0, 0,256,0, 0,0,256};
+              uint8_t id_curve[256];
+              for (int i = 0; i < 256; i++) id_curve[i] = (uint8_t)i;
+              lut17_precompute(&lut, id_ccm, id_curve, id_curve, id_curve);
+              int scale = atoi(argv[3]);
+              int ok = native_fast_transcode_jpeg(&lut, argv[1], argv[2], scale, 92, 0, 0);
+              return ok ? 0 : 1;
+          }
+          EOF
+          gcc -std=gnu99 -O2 -Wall -Werror -Wno-unused-const-variable -pthread -Isrc/color -Isrc/image \
+            /tmp/test_fast_stream.c src/image/native_jpeg_fast_stream.c src/image/native_jpeg_writer.c \
+            -o /tmp/test_fast_stream
+          python3 - << 'PYEOF'
+          import subprocess, numpy as np
+          from PIL import Image, ImageDraw
+          def make_img(w, h):
+              im = Image.new("RGB", (w, h))
+              arr = np.zeros((h, w, 3), dtype=np.uint8)
+              xs = np.linspace(0, 255, w, dtype=np.uint8)
+              ys = np.linspace(0, 255, h, dtype=np.uint8)
+              arr[:, :, 0] = xs[None, :]
+              arr[:, :, 1] = ys[:, None]
+              arr[:, :, 2] = 128
+              im = Image.fromarray(arr)
+              d = ImageDraw.Draw(im)
+              d.rectangle([40, 40, 140, 140], fill=(230, 40, 40))
+              d.rectangle([160, 60, 260, 160], fill=(40, 210, 60))
+              d.rectangle([280, 80, 380, 180], fill=(30, 80, 240))
+              return im
+          for name, w, h, sub, scale in [
+              ("sony_422", 528, 344, 1, 1),
+              ("std_420", 528, 344, 2, 1),
+              ("full_444", 320, 232, 0, 1),
+              ("scale2_422", 1040, 688, 1, 2),
+          ]:
+              src_im = make_img(w, h)
+              exif = src_im.getexif()
+              exif[0x0112] = 6
+              exif[0x0132] = "2026:11:20 21:00:00"
+              in_p = f"/tmp/in_{name}.jpg"
+              out_p = f"/tmp/out_{name}.jpg"
+              src_im.save(in_p, format="JPEG", quality=95, subsampling=sub, exif=exif)
+              subprocess.check_call(["/tmp/test_fast_stream", in_p, out_p, str(scale)])
+              out_im = Image.open(out_p)
+              out_im.load()
+              exp_size = (w // scale, h // scale)
+              assert out_im.size == exp_size, f"{name}: {out_im.size} != {exp_size}"
+              out_exif = out_im.getexif()
+              assert out_exif.get(0x0112) == 6, f"{name}: orientation lost: {out_exif.get(0x0112)}"
+              ref = src_im if scale == 1 else src_im.resize(exp_size, Image.BOX)
+              mae = float(np.mean(np.abs(np.array(ref, dtype=np.float32) - np.array(out_im, dtype=np.float32))))
+              print(f"PASS {name}: size={out_im.size}, orientation={out_exif.get(0x0112)}, MAE={mae:.2f}")
+              assert mae < 4.0, f"{name}: MAE too high: {mae}"
+          PYEOF
+
       - name: Prepare APK Build Directories
         run: |
           mkdir -p bin/classes
