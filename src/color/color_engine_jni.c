@@ -28,7 +28,7 @@ static pthread_mutex_t g_int_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Serializes dispatch to strip operations
 static pthread_mutex_t g_strip_call_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Kernel-backed fork-join async JPEG strip encoder (overlaps Band N JPEG encode on Core 1
+// Kernel-backed fork-join async JPEG strip encoder (overlaps Band N Huffman bitstream emission on Core 1
 // with Band N+1 Skia decodeRegion on Core 0 using pthread_create + pthread_join, ZERO pthread_cond_wait!)
 typedef struct {
     JpegStreamState* state;
@@ -38,22 +38,35 @@ typedef struct {
     int width;
     int height;
     int row_offset;
+    int use_quant_blocks;
+    JpegQuantBlock* qblocks;
+    int quant_mcus;
     int thread_active;
     int last_ok;
     pthread_t thread;
 } AsyncEncodeTask;
 
 static AsyncEncodeTask g_async_enc = {
-    NULL, 0, NULL, 0, 0, 0, 0, 0, 1, (pthread_t)0
+    NULL, 0, NULL, 0, 0, 0, 0, 0, NULL, 0, 0, 1, (pthread_t)0
 };
+
+// Double-buffered quantized DCT block pools (eliminates 74MB memcpy and lets all 4 cores DCT-quantize in parallel)
+static JpegQuantBlock* g_qstrip_work = NULL;
+static JpegQuantBlock* g_qstrip_emit = NULL;
+static size_t g_qstrip_cap = 0;
 
 static void* encode_strip_once_fn(void* arg) {
     (void)arg;
-    int ok = g_async_enc.is_argb
-        ? native_jpeg_stream_write_strip_argb8888(g_async_enc.state, (const uint32_t*)g_async_enc.buf,
-                                                  g_async_enc.width, g_async_enc.height, g_async_enc.row_offset)
-        : native_jpeg_stream_write_strip_rgb565(g_async_enc.state, (const uint16_t*)g_async_enc.buf,
-                                                g_async_enc.width, g_async_enc.height, g_async_enc.row_offset);
+    int ok;
+    if (g_async_enc.use_quant_blocks) {
+        ok = native_jpeg_emit_quantized_blocks(g_async_enc.state, g_async_enc.qblocks, g_async_enc.quant_mcus);
+    } else {
+        ok = g_async_enc.is_argb
+            ? native_jpeg_stream_write_strip_argb8888(g_async_enc.state, (const uint32_t*)g_async_enc.buf,
+                                                      g_async_enc.width, g_async_enc.height, g_async_enc.row_offset)
+            : native_jpeg_stream_write_strip_rgb565(g_async_enc.state, (const uint16_t*)g_async_enc.buf,
+                                                    g_async_enc.width, g_async_enc.height, g_async_enc.row_offset);
+    }
     if (!ok) g_async_enc.last_ok = 0;
     return NULL;
 }
@@ -69,6 +82,26 @@ static int encode_worker_wait(void) {
 static void encode_worker_reset_for_open(void) {
     encode_worker_wait();
     g_async_enc.last_ok = 1;
+}
+
+static int encode_worker_submit_quantized(JpegStreamState* state, int total_mcus) {
+    if (!state || !g_qstrip_work || total_mcus <= 0) return 0;
+    if (!encode_worker_wait()) return 0;
+
+    // Zero-copy pointer swap between 4-core quantized work buffer and background Huffman emit buffer
+    JpegQuantBlock* tmp = g_qstrip_work;
+    g_qstrip_work = g_qstrip_emit;
+    g_qstrip_emit = tmp;
+
+    g_async_enc.state = state;
+    g_async_enc.use_quant_blocks = 1;
+    g_async_enc.qblocks = g_qstrip_emit;
+    g_async_enc.quant_mcus = total_mcus;
+    if (pthread_create(&g_async_enc.thread, NULL, encode_strip_once_fn, NULL) == 0) {
+        g_async_enc.thread_active = 1;
+        return 1;
+    }
+    return native_jpeg_emit_quantized_blocks(state, g_qstrip_emit, total_mcus);
 }
 
 static int encode_worker_submit(JpegStreamState* state, int is_argb, const void* pixels,
@@ -91,6 +124,7 @@ static int encode_worker_submit(JpegStreamState* state, int is_argb, const void*
         g_async_enc.width = width;
         g_async_enc.height = height;
         g_async_enc.row_offset = row_offset;
+        g_async_enc.use_quant_blocks = 0;
         if (pthread_create(&g_async_enc.thread, NULL, encode_strip_once_fn, NULL) == 0) {
             g_async_enc.thread_active = 1;
             return 1;
@@ -101,7 +135,7 @@ static int encode_worker_submit(JpegStreamState* state, int is_argb, const void*
         : native_jpeg_stream_write_strip_rgb565(state, (const uint16_t*)pixels, width, height, row_offset);
 }
 
-// 4-Core SMP Parallel Strip Grader for Sony A7R II Quad-Core ARM Cortex-A5
+// 4-Core SMP Parallel Strip Grader + Fused 2D AAN FDCT & Quantizer for Sony A7R II Quad-Core ARM Cortex-A5
 // Uses scoped fork-join (pthread_create + pthread_join) with zero condition variables.
 typedef struct {
     int is_argb;
@@ -111,10 +145,40 @@ typedef struct {
     int row_offset;
     int grain_strength;
     int clarity_strength;
+    const JpegStreamState* jpeg_state;
+    JpegQuantBlock* qblocks_base;
+    int strip_h;
+    int mcus_x;
+    int mcu_row_start;
+    int mcu_row_end;
 } GradeSliceTask;
 
 static void* grade_slice_thread_fn(void* arg) {
     GradeSliceTask* t = (GradeSliceTask*)arg;
+    if (t->jpeg_state != NULL && t->qblocks_base != NULL) {
+        // Fused L2-cached 16-row (1 MCU row) 3D LUT grading + RGB->YCbCr + 2D AAN FDCT + Quantization + ZigZag
+        for (int m = t->mcu_row_start; m < t->mcu_row_end; m++) {
+            int my = m << 4;
+            int cur_h = t->strip_h - my;
+            if (cur_h <= 0) break;
+            if (cur_h > 16) cur_h = 16;
+            JpegQuantBlock* out_qb = t->qblocks_base + (size_t)m * (size_t)t->mcus_x * 6U;
+            if (t->is_argb) {
+                uint32_t* row_ptr = ((uint32_t*)t->pixels) + (size_t)my * (size_t)t->width;
+                lut17_process_argb8888_advanced_offset(&g_lut17, row_ptr, t->width, cur_h,
+                                                       t->row_offset + my, t->grain_strength, t->clarity_strength);
+                native_jpeg_quantize_mcu_row_argb8888(t->jpeg_state, (const uint32_t*)t->pixels,
+                                                      t->width, t->strip_h, t->row_offset, my, out_qb);
+            } else {
+                uint16_t* row_ptr = ((uint16_t*)t->pixels) + (size_t)my * (size_t)t->width;
+                lut17_process_rgb565_advanced_offset(&g_lut17, row_ptr, t->width, cur_h,
+                                                     t->row_offset + my, t->grain_strength, t->clarity_strength);
+                native_jpeg_quantize_mcu_row_rgb565(t->jpeg_state, (const uint16_t*)t->pixels,
+                                                    t->width, t->strip_h, t->row_offset, my, out_qb);
+            }
+        }
+        return NULL;
+    }
     if (t->is_argb) {
         lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)t->pixels, t->width, t->height,
                                                t->row_offset, t->grain_strength, t->clarity_strength);
@@ -153,6 +217,7 @@ static void grade_strip_parallel(int is_argb, void* pixels, int width, int heigh
     for (int k = 0; k < 4; k++) {
         int slice_h = (k == 3) ? (height - cur_y) : base_h;
         if (slice_h < 0) slice_h = 0;
+        memset(&tasks[k], 0, sizeof(GradeSliceTask));
         tasks[k].is_argb = is_argb;
         tasks[k].pixels = is_argb
             ? (void*)(((uint32_t*)pixels) + (size_t)cur_y * (size_t)width)
@@ -165,26 +230,101 @@ static void grade_strip_parallel(int is_argb, void* pixels, int width, int heigh
         cur_y += slice_h;
     }
 
-    // Launch cores 1..3
     for (int k = 1; k < 4; k++) {
-        if (tasks[k].height > 0) {
+        if (tasks[k].height > 0 && pthread_create(&threads[k - 1], NULL, grade_slice_thread_fn, &tasks[k]) == 0) {
+            spawned[k - 1] = 1;
+        }
+    }
+    if (tasks[0].height > 0) grade_slice_thread_fn(&tasks[0]);
+    for (int k = 1; k < 4; k++) {
+        if (tasks[k].height > 0 && !spawned[k - 1]) grade_slice_thread_fn(&tasks[k]);
+    }
+    for (int k = 1; k < 4; k++) {
+        if (spawned[k - 1]) pthread_join(threads[k - 1], NULL);
+    }
+
+    pthread_mutex_unlock(&g_lut_mutex);
+    pthread_mutex_unlock(&g_strip_call_mutex);
+}
+
+static int grade_and_encode_strip_parallel(JpegStreamState* state, int is_argb, void* pixels, int width, int height,
+                                           int row_offset, int grain_strength, int clarity_strength) {
+    if (!state || !pixels || width <= 0 || height <= 0) return 0;
+    int stream_w = native_jpeg_get_stream_width(state);
+    int stream_h = native_jpeg_get_stream_height(state);
+    if (width != stream_w || row_offset >= stream_h) return 1;
+
+    int eff_h = height;
+    if (row_offset + eff_h > stream_h) eff_h = stream_h - row_offset;
+    int num_mcu_rows = (eff_h + 15) >> 4;
+    int mcus_x = (width + 15) >> 4;
+    int total_mcus = num_mcu_rows * mcus_x;
+    size_t needed_blocks = (size_t)total_mcus * 6U;
+
+    init_static_grain_table();
+    pthread_mutex_lock(&g_strip_call_mutex);
+
+    if (g_qstrip_cap < needed_blocks) {
+        if (!encode_worker_wait()) {
+            pthread_mutex_unlock(&g_strip_call_mutex);
+            return 0;
+        }
+        JpegQuantBlock* w_grown = (JpegQuantBlock*)realloc(g_qstrip_work, needed_blocks * sizeof(JpegQuantBlock));
+        JpegQuantBlock* e_grown = (JpegQuantBlock*)realloc(g_qstrip_emit, needed_blocks * sizeof(JpegQuantBlock));
+        if (w_grown != NULL) g_qstrip_work = w_grown;
+        if (e_grown != NULL) g_qstrip_emit = e_grown;
+        if (w_grown != NULL && e_grown != NULL) {
+            g_qstrip_cap = needed_blocks;
+        }
+    }
+
+    if (g_qstrip_work == NULL || g_qstrip_emit == NULL || g_qstrip_cap < needed_blocks) {
+        pthread_mutex_unlock(&g_strip_call_mutex);
+        grade_strip_parallel(is_argb, pixels, width, height, row_offset, grain_strength, clarity_strength);
+        return encode_worker_submit(state, is_argb, pixels, width, height, row_offset);
+    }
+
+    pthread_mutex_lock(&g_lut_mutex);
+
+    GradeSliceTask tasks[4];
+    pthread_t threads[3];
+    int spawned[3] = { 0, 0, 0 };
+    int cur_m = 0;
+    for (int k = 0; k < 4; k++) {
+        int rem_m = num_mcu_rows - cur_m;
+        int rem_cores = 4 - k;
+        int slice_m = (rem_m > 0) ? ((rem_m + rem_cores - 1) / rem_cores) : 0;
+        memset(&tasks[k], 0, sizeof(GradeSliceTask));
+        tasks[k].is_argb = is_argb;
+        tasks[k].pixels = pixels;
+        tasks[k].width = width;
+        tasks[k].strip_h = height;
+        tasks[k].row_offset = row_offset;
+        tasks[k].grain_strength = grain_strength;
+        tasks[k].clarity_strength = clarity_strength;
+        tasks[k].jpeg_state = state;
+        tasks[k].qblocks_base = g_qstrip_work;
+        tasks[k].mcus_x = mcus_x;
+        tasks[k].mcu_row_start = cur_m;
+        tasks[k].mcu_row_end = cur_m + slice_m;
+        cur_m += slice_m;
+    }
+
+    for (int k = 1; k < 4; k++) {
+        if (tasks[k].mcu_row_end > tasks[k].mcu_row_start) {
             if (pthread_create(&threads[k - 1], NULL, grade_slice_thread_fn, &tasks[k]) == 0) {
                 spawned[k - 1] = 1;
             }
         }
     }
-
-    // Core 0 grades slice 0 + any fallback slice if pthread_create failed
-    if (tasks[0].height > 0) {
+    if (tasks[0].mcu_row_end > tasks[0].mcu_row_start) {
         grade_slice_thread_fn(&tasks[0]);
     }
     for (int k = 1; k < 4; k++) {
-        if (tasks[k].height > 0 && !spawned[k - 1]) {
+        if (tasks[k].mcu_row_end > tasks[k].mcu_row_start && !spawned[k - 1]) {
             grade_slice_thread_fn(&tasks[k]);
         }
     }
-
-    // Join cores 1..3 (woken directly by Linux kernel CLONE_CHILD_CLEARTID on exit)
     for (int k = 1; k < 4; k++) {
         if (spawned[k - 1]) {
             pthread_join(threads[k - 1], NULL);
@@ -192,7 +332,9 @@ static void grade_strip_parallel(int is_argb, void* pixels, int width, int heigh
     }
 
     pthread_mutex_unlock(&g_lut_mutex);
+    int ok = encode_worker_submit_quantized(state, total_mcus);
     pthread_mutex_unlock(&g_strip_call_mutex);
+    return ok;
 }
 
 // 4x4 Bayer Ordered Dithering Matrix for RGB_565 banding reduction
@@ -746,22 +888,16 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWrit
         uint32_t* argb_pixels = (uint32_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
         if (argb_pixels == NULL) return JNI_FALSE;
 
-        // 1. Grade ARGB_8888 strip in parallel (runs concurrently with previous strip's JPEG encode!)
-        grade_strip_parallel(1, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
-                             (int)grainStrength, (int)clarityStrength);
-
-        // 2. Hand off graded strip to async JPEG encode worker and return immediately for next decode
-        ok = encode_worker_submit(state, 1, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset);
+        // Fused 4-Core L2-Cached 3D LUT + 2D AAN FDCT + Quantization + Zero-Copy Async Huffman Emission
+        ok = grade_and_encode_strip_parallel(state, 1, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
+                                             (int)grainStrength, (int)clarityStrength);
     } else {
         uint16_t* rgb_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
         if (rgb_pixels == NULL) return JNI_FALSE;
 
-        // 1. Grade RGB_565 strip in parallel with exact row-offset boundary continuity
-        grade_strip_parallel(0, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
-                             (int)grainStrength, (int)clarityStrength);
-
-        // 2. Hand off graded strip to async JPEG encode worker
-        ok = encode_worker_submit(state, 0, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset);
+        // Fused 4-Core L2-Cached 3D LUT + 2D AAN FDCT + Quantization + Zero-Copy Async Huffman Emission
+        ok = grade_and_encode_strip_parallel(state, 0, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
+                                             (int)grainStrength, (int)clarityStrength);
     }
 
     return ok ? JNI_TRUE : JNI_FALSE;
@@ -779,6 +915,15 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeCloseJpegStr
         g_async_enc.buf = NULL;
         g_async_enc.buf_cap = 0;
     }
+    if (g_qstrip_work != NULL) {
+        free(g_qstrip_work);
+        g_qstrip_work = NULL;
+    }
+    if (g_qstrip_emit != NULL) {
+        free(g_qstrip_emit);
+        g_qstrip_emit = NULL;
+    }
+    g_qstrip_cap = 0;
     JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
     int ok = native_jpeg_stream_close(state, (success && encode_ok) ? 1 : 0);
     return ok ? JNI_TRUE : JNI_FALSE;

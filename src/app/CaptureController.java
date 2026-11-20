@@ -119,7 +119,14 @@ public class CaptureController {
             ((SonyPmcaAdapter) cameraAdapter).setStoreImageListener(new SonyPmcaAdapter.StoreImageListener() {
                 @Override
                 public void onImageStored(String dir, String filename) {
-                    if (filename == null) return;
+                    storeImageListenerSeen = true;
+                    if (filename == null) {
+                        // ScalarOS CameraEx$StoreImageCompleteListener(int mediaId, CameraEx) wakes poller immediately
+                        synchronized (hardwareStoreLock) {
+                            hardwareStoreLock.notifyAll();
+                        }
+                        return;
+                    }
                     File resolvedFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
                     if (resolvedFile == null || !resolvedFile.exists()) {
                         try { Thread.sleep(50); } catch (InterruptedException ignored) {}
@@ -128,9 +135,11 @@ public class CaptureController {
                     final File rawFile = resolvedFile;
                     if (rawFile == null || !rawFile.exists()) {
                         Log.w(TAG, "StoreImageCompleteListener unresolved path: " + dir + "/" + filename);
+                        synchronized (hardwareStoreLock) {
+                            hardwareStoreLock.notifyAll();
+                        }
                         return;
                     }
-                    storeImageListenerSeen = true;
                     recordKnownPhoto(rawFile);
 
                     // If triggerSingleCapture workers are waiting for shots, enqueue FIFO handoff (ZERO duplicate grading!)
@@ -176,6 +185,36 @@ public class CaptureController {
     private int waitingPollerJobs = 0;
     private volatile boolean storeImageListenerSeen = false;
     private volatile boolean isShuttingDown = false;
+    private volatile String lastPrecomputedLutSig = null;
+
+    private void ensureRecipeLutPrecomputed(FujiRecipe recipe) {
+        if (recipe == null || !USE_NATIVE_ENGINE || !ColorEngine.isNativeAvailable()) return;
+        String sig = recipe.filmSim.name() + ":" + recipe.color + ":" + recipe.highlightTone + ":" +
+                     recipe.shadowTone + ":" + recipe.whiteBalance.name() + ":" +
+                     recipe.wbShiftR + ":" + recipe.wbShiftB + ":" + recipe.colorChromeEffect.name();
+        if (sig.equals(lastPrecomputedLutSig)) {
+            return;
+        }
+        byte[] baseLut = (context != null && recipe.filmSim.lutFile != null)
+            ? LutManager.getLutTable(context, recipe.filmSim.lutFile) : null;
+        if (baseLut != null) {
+            ColorEngine.precomputeLut17WithBaseSafe(
+                baseLut,
+                recipe.computeCcmQ8(),
+                recipe.generateToneCurve('R'),
+                recipe.generateToneCurve('G'),
+                recipe.generateToneCurve('B')
+            );
+        } else {
+            ColorEngine.precomputeLut17Safe(
+                recipe.computeCcmQ8(),
+                recipe.generateToneCurve('R'),
+                recipe.generateToneCurve('G'),
+                recipe.generateToneCurve('B')
+            );
+        }
+        lastPrecomputedLutSig = sig;
+    }
 
     private static String dedupKeyForFile(File f) {
         if (f == null) return "";
@@ -359,6 +398,9 @@ public class CaptureController {
                     public void run() {
                         boolean jobStarted = false;
                         try {
+                            // 0. Pre-warm 17^3 3D LUT in parallel while BIONZ X is still flushing DSC0xxxx.JPG to SD card
+                            ensureRecipeLutPrecomputed(appState.getActiveRecipe());
+
                             File newPhoto = null;
                             // 1. Check FIFO instant handoff from StoreImageCompleteListener (zero SD polling!)
                             synchronized (hardwareStoreLock) {
@@ -366,7 +408,7 @@ public class CaptureController {
                                     newPhoto = pendingHardwareStoredQueue.pollFirst();
                                 } else if (storeImageListenerSeen && !isShuttingDown) {
                                     try {
-                                        hardwareStoreLock.wait(2000);
+                                        hardwareStoreLock.wait(350);
                                     } catch (InterruptedException ignored) {}
                                     if (!pendingHardwareStoredQueue.isEmpty()) {
                                         newPhoto = pendingHardwareStoredQueue.pollFirst();
@@ -660,25 +702,31 @@ public class CaptureController {
                 tmpFile.delete();
             }
 
-            // 4. Precompute 17^3 3D LUT once per image in native memory
+            // 4. Precompute 17^3 3D LUT once per recipe in native memory (cached if unchanged)
             if (nativeReady) {
-                byte[] baseLut = (context != null && recipe.filmSim.lutFile != null)
-                    ? LutManager.getLutTable(context, recipe.filmSim.lutFile) : null;
-                if (baseLut != null) {
-                    ColorEngine.precomputeLut17WithBaseSafe(
-                        baseLut,
-                        recipe.computeCcmQ8(),
-                        recipe.generateToneCurve('R'),
-                        recipe.generateToneCurve('G'),
-                        recipe.generateToneCurve('B')
-                    );
-                } else {
-                    ColorEngine.precomputeLut17Safe(
-                        recipe.computeCcmQ8(),
-                        recipe.generateToneCurve('R'),
-                        recipe.generateToneCurve('G'),
-                        recipe.generateToneCurve('B')
-                    );
+                String sig = recipe.filmSim.name() + ":" + recipe.color + ":" + recipe.highlightTone + ":" +
+                             recipe.shadowTone + ":" + recipe.whiteBalance.name() + ":" +
+                             recipe.wbShiftR + ":" + recipe.wbShiftB + ":" + recipe.colorChromeEffect.name();
+                if (!sig.equals(lastPrecomputedLutSig)) {
+                    byte[] baseLut = (context != null && recipe.filmSim.lutFile != null)
+                        ? LutManager.getLutTable(context, recipe.filmSim.lutFile) : null;
+                    if (baseLut != null) {
+                        ColorEngine.precomputeLut17WithBaseSafe(
+                            baseLut,
+                            recipe.computeCcmQ8(),
+                            recipe.generateToneCurve('R'),
+                            recipe.generateToneCurve('G'),
+                            recipe.generateToneCurve('B')
+                        );
+                    } else {
+                        ColorEngine.precomputeLut17Safe(
+                            recipe.computeCcmQ8(),
+                            recipe.generateToneCurve('R'),
+                            recipe.generateToneCurve('G'),
+                            recipe.generateToneCurve('B')
+                        );
+                    }
+                    lastPrecomputedLutSig = sig;
                 }
             }
 
@@ -846,6 +894,10 @@ public class CaptureController {
 
                 streamSuccess = true;
                 int outputRowOffset = 0;
+                // Note: BitmapRegionDecoder.decodeRegion only supports opts.inBitmap on Android 4.4+ (API 19+).
+                // On A7R II (Android 2.3.7/4.1.2), keeping reusableStripBmp alive pins 5.29MB in the 24MB Dalvik heap
+                // and triggers 13 full GC_FOR_ALLOC pauses! Only retain reusableStripBmp on API >= 19.
+                final boolean canReuseRegionBitmap = android.os.Build.VERSION.SDK_INT >= 19;
                 Bitmap reusableStripBmp = null;
                 try {
                     for (int stripIdx = 0; stripIdx < numStrips; stripIdx++) {
@@ -869,7 +921,7 @@ public class CaptureController {
                         Bitmap stripBmp = null;
                         try {
                             try {
-                                if (reusableStripBmp != null && currentSrcH == srcStripH) {
+                                if (canReuseRegionBitmap && reusableStripBmp != null && currentSrcH == srcStripH) {
                                     opts.inBitmap = reusableStripBmp;
                                 } else {
                                     opts.inBitmap = null;
@@ -900,7 +952,7 @@ public class CaptureController {
                                 streamSuccess = false;
                                 break;
                             }
-                            if (reusableStripBmp == null && currentSrcH == srcStripH && stripBmp.isMutable()) {
+                            if (canReuseRegionBitmap && reusableStripBmp == null && currentSrcH == srcStripH && stripBmp.isMutable()) {
                                 reusableStripBmp = stripBmp;
                             }
                             int outStripW = stripBmp.getWidth();  // 3976, 5168, or 7952
@@ -1036,15 +1088,15 @@ public class CaptureController {
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
-            // 10. Load display-safe review bitmap (<= 960x640) for UI display (single delivery; prevents recycled-bitmap hazard)
+            // 10. Load display-safe review bitmap (<= 640x480; triggers libjpeg 1/8 DC-only IDCT fast path on 5168x3448)
             Bitmap reviewBmp = null;
             File reviewFile = (gradedSavedPath != null && new File(gradedSavedPath).exists())
                 ? new File(gradedSavedPath) : targetOutputFile;
             if (reviewFile != null && reviewFile.exists()) {
-                reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 960);
+                reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 640);
             }
             if (reviewBmp == null && rawMasterFile.exists()) {
-                reviewBmp = StorageResolver.loadPhotoForReview(rawMasterFile, 960);
+                reviewBmp = StorageResolver.loadPhotoForReview(rawMasterFile, 640);
                 if (reviewBmp != null) {
                     if (!ColorEngine.applyLutAndGrainBitmapSafe(reviewBmp, grainStrength, clarityStrength)) {
                         reviewBmp = applyRecipeInJava(reviewBmp, recipe);

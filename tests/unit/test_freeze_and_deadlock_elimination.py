@@ -48,7 +48,10 @@ class TestFreezeAndDeadlockElimination(unittest.TestCase):
         self.assertIn("r[0]  = (int16_t)((t0 + t1) >> 3);", writer_c)
         self.assertIn("int nat = ZIGZAG[i];", writer_c)
         self.assertIn("if (diff > 2047) diff = 2047; else if (diff < -2047) diff = -2047;", writer_c)
+        self.assertIn("native_jpeg_quantize_mcu_row_argb8888", self.jni_c)
+        self.assertIn("native_jpeg_emit_quantized_blocks", self.jni_c)
         self.assertIn("grade_slice_thread_fn", self.jni_c)
+        self.assertIn("canReuseRegionBitmap", self.capture_java)
         self.assertIn("opts.inBitmap = reusableStripBmp;", self.capture_java)
 
     def test_capture_controller_granular_hud_telemetry(self):

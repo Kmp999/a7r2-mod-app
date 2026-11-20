@@ -10,6 +10,19 @@ extern "C" {
 
 typedef struct JpegStreamState JpegStreamState;
 
+typedef struct {
+    int16_t q[64];
+    uint8_t last_nz;
+} JpegQuantBlock;
+
+int native_jpeg_get_stream_width(const JpegStreamState* state);
+int native_jpeg_get_stream_height(const JpegStreamState* state);
+int native_jpeg_quantize_mcu_row_argb8888(const JpegStreamState* state, const uint32_t* strip_pixels,
+                                          int strip_w, int strip_h, int row_offset, int my, JpegQuantBlock* out_blocks);
+int native_jpeg_quantize_mcu_row_rgb565(const JpegStreamState* state, const uint16_t* strip_pixels,
+                                        int strip_w, int strip_h, int row_offset, int my, JpegQuantBlock* out_blocks);
+int native_jpeg_emit_quantized_blocks(JpegStreamState* state, const JpegQuantBlock* blocks, int num_mcus);
+
 /**
  * Writes an RGB565 image directly to a JPEG file on disk in one shot.
  * High-performance baseline JPEG encoder (4:2:0 chroma subsampling)
