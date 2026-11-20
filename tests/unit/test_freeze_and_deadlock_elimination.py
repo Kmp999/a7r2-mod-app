@@ -42,11 +42,14 @@ class TestFreezeAndDeadlockElimination(unittest.TestCase):
         self.assertIn("native_jpeg_stream_write_strip_rgb565", self.jni_c)
 
     def test_native_jpeg_writer_fdct_and_zigzag_valid_huffman(self):
-        """native_jpeg_writer.c normalizes DC by >>13, maps ZIGZAG[i] natural index, and clamps DC/AC categories."""
+        """native_jpeg_writer.c uses 5-multiply AAN FDCT with AAN_IFACT pre-scaled inv_q, natural ZIGZAG[i], and DC/AC clamps."""
         writer_c = (self.src / "image" / "native_jpeg_writer.c").read_text(encoding="utf-8")
-        self.assertIn("r[0]  = (int16_t)(((t0 + t1) * 362) >> 13);", writer_c)
+        self.assertIn("AAN_IFACT[8]", writer_c)
+        self.assertIn("r[0]  = (int16_t)((t0 + t1) >> 3);", writer_c)
         self.assertIn("int nat = ZIGZAG[i];", writer_c)
         self.assertIn("if (diff > 2047) diff = 2047; else if (diff < -2047) diff = -2047;", writer_c)
+        self.assertIn("grade_slice_thread_fn", self.jni_c)
+        self.assertIn("opts.inBitmap = reusableStripBmp;", self.capture_java)
 
     def test_capture_controller_granular_hud_telemetry(self):
         """CaptureController reports granular HUD updates across all pipeline stages and keeps Java 7 final vars."""

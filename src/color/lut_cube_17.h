@@ -364,14 +364,22 @@ static inline void lut17_process_argb8888_advanced_offset(const Lut17Context* __
 
     if (grain_scale == 0 && clarity_strength == 0) {
         int total = width * height;
+        uint32_t prev_px = buffer[0] ^ 0xFFFFFFFFU;
+        uint32_t prev_out = 0;
         for (int i = 0; i < total; i++) {
             uint32_t px = buffer[i];
+            if (px == prev_px) {
+                buffer[i] = prev_out;
+                continue;
+            }
+            prev_px = px;
             uint8_t r = (uint8_t)(px & 0xFF);
             uint8_t g = (uint8_t)((px >> 8) & 0xFF);
             uint8_t b = (uint8_t)((px >> 16) & 0xFF);
             uint8_t or_val, og_val, ob_val;
             lut17_interpolate_pixel(lut, r, g, b, &or_val, &og_val, &ob_val);
-            buffer[i] = (uint32_t)((0xFFU << 24) | ((uint32_t)ob_val << 16) | ((uint32_t)og_val << 8) | (uint32_t)or_val);
+            prev_out = (uint32_t)((0xFFU << 24) | ((uint32_t)ob_val << 16) | ((uint32_t)og_val << 8) | (uint32_t)or_val);
+            buffer[i] = prev_out;
         }
         return;
     }

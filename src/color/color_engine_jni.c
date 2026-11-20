@@ -28,20 +28,101 @@ static pthread_mutex_t g_int_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Serializes dispatch to strip operations
 static pthread_mutex_t g_strip_call_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Direct synchronous strip encoder (eliminates multi-threaded condition variable deadlocks & memcpy overhead)
+// Kernel-backed fork-join async JPEG strip encoder (overlaps Band N JPEG encode on Core 1
+// with Band N+1 Skia decodeRegion on Core 0 using pthread_create + pthread_join, ZERO pthread_cond_wait!)
+typedef struct {
+    JpegStreamState* state;
+    int is_argb;
+    uint8_t* buf;
+    size_t buf_cap;
+    int width;
+    int height;
+    int row_offset;
+    int thread_active;
+    int last_ok;
+    pthread_t thread;
+} AsyncEncodeTask;
+
+static AsyncEncodeTask g_async_enc = {
+    NULL, 0, NULL, 0, 0, 0, 0, 0, 1, (pthread_t)0
+};
+
+static void* encode_strip_once_fn(void* arg) {
+    (void)arg;
+    int ok = g_async_enc.is_argb
+        ? native_jpeg_stream_write_strip_argb8888(g_async_enc.state, (const uint32_t*)g_async_enc.buf,
+                                                  g_async_enc.width, g_async_enc.height, g_async_enc.row_offset)
+        : native_jpeg_stream_write_strip_rgb565(g_async_enc.state, (const uint16_t*)g_async_enc.buf,
+                                                g_async_enc.width, g_async_enc.height, g_async_enc.row_offset);
+    if (!ok) g_async_enc.last_ok = 0;
+    return NULL;
+}
+
+static int encode_worker_wait(void) {
+    if (g_async_enc.thread_active) {
+        pthread_join(g_async_enc.thread, NULL);
+        g_async_enc.thread_active = 0;
+    }
+    return g_async_enc.last_ok;
+}
+
+static void encode_worker_reset_for_open(void) {
+    encode_worker_wait();
+    g_async_enc.last_ok = 1;
+}
+
 static int encode_worker_submit(JpegStreamState* state, int is_argb, const void* pixels,
                                 int width, int height, int row_offset) {
     if (!state || !pixels || width <= 0 || height <= 0) return 0;
+    if (!encode_worker_wait()) return 0;
+
+    size_t bytes = (size_t)width * (size_t)height * (is_argb ? 4U : 2U);
+    if (g_async_enc.buf_cap < bytes) {
+        uint8_t* grown = (uint8_t*)realloc(g_async_enc.buf, bytes);
+        if (grown != NULL) {
+            g_async_enc.buf = grown;
+            g_async_enc.buf_cap = bytes;
+        }
+    }
+    if (g_async_enc.buf != NULL && g_async_enc.buf_cap >= bytes) {
+        memcpy(g_async_enc.buf, pixels, bytes);
+        g_async_enc.state = state;
+        g_async_enc.is_argb = is_argb;
+        g_async_enc.width = width;
+        g_async_enc.height = height;
+        g_async_enc.row_offset = row_offset;
+        if (pthread_create(&g_async_enc.thread, NULL, encode_strip_once_fn, NULL) == 0) {
+            g_async_enc.thread_active = 1;
+            return 1;
+        }
+    }
     return is_argb
         ? native_jpeg_stream_write_strip_argb8888(state, (const uint32_t*)pixels, width, height, row_offset)
         : native_jpeg_stream_write_strip_rgb565(state, (const uint16_t*)pixels, width, height, row_offset);
 }
 
-static int encode_worker_wait(void) {
-    return 1;
-}
+// 4-Core SMP Parallel Strip Grader for Sony A7R II Quad-Core ARM Cortex-A5
+// Uses scoped fork-join (pthread_create + pthread_join) with zero condition variables.
+typedef struct {
+    int is_argb;
+    void* pixels;
+    int width;
+    int height;
+    int row_offset;
+    int grain_strength;
+    int clarity_strength;
+} GradeSliceTask;
 
-static void encode_worker_reset_for_open(void) {
+static void* grade_slice_thread_fn(void* arg) {
+    GradeSliceTask* t = (GradeSliceTask*)arg;
+    if (t->is_argb) {
+        lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)t->pixels, t->width, t->height,
+                                               t->row_offset, t->grain_strength, t->clarity_strength);
+    } else {
+        lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)t->pixels, t->width, t->height,
+                                             t->row_offset, t->grain_strength, t->clarity_strength);
+    }
+    return NULL;
 }
 
 static void grade_strip_parallel(int is_argb, void* pixels, int width, int height,
@@ -49,11 +130,67 @@ static void grade_strip_parallel(int is_argb, void* pixels, int width, int heigh
     init_static_grain_table();
     pthread_mutex_lock(&g_strip_call_mutex);
     pthread_mutex_lock(&g_lut_mutex);
-    if (is_argb) {
-        lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
-    } else {
-        lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
+
+    if (height < 32) {
+        if (is_argb) {
+            lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
+        } else {
+            lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
+        }
+        pthread_mutex_unlock(&g_lut_mutex);
+        pthread_mutex_unlock(&g_strip_call_mutex);
+        return;
     }
+
+    // Partition strip across all 4 ARM Cortex-A5 cores (even-row aligned for Bayer 2x2)
+    GradeSliceTask tasks[4];
+    pthread_t threads[3];
+    int spawned[3] = { 0, 0, 0 };
+    int base_h = (height >> 2) & ~1;
+    if (base_h < 8) base_h = 8;
+
+    int cur_y = 0;
+    for (int k = 0; k < 4; k++) {
+        int slice_h = (k == 3) ? (height - cur_y) : base_h;
+        if (slice_h < 0) slice_h = 0;
+        tasks[k].is_argb = is_argb;
+        tasks[k].pixels = is_argb
+            ? (void*)(((uint32_t*)pixels) + (size_t)cur_y * (size_t)width)
+            : (void*)(((uint16_t*)pixels) + (size_t)cur_y * (size_t)width);
+        tasks[k].width = width;
+        tasks[k].height = slice_h;
+        tasks[k].row_offset = row_offset + cur_y;
+        tasks[k].grain_strength = grain_strength;
+        tasks[k].clarity_strength = clarity_strength;
+        cur_y += slice_h;
+    }
+
+    // Launch cores 1..3
+    for (int k = 1; k < 4; k++) {
+        if (tasks[k].height > 0) {
+            if (pthread_create(&threads[k - 1], NULL, grade_slice_thread_fn, &tasks[k]) == 0) {
+                spawned[k - 1] = 1;
+            }
+        }
+    }
+
+    // Core 0 grades slice 0 + any fallback slice if pthread_create failed
+    if (tasks[0].height > 0) {
+        grade_slice_thread_fn(&tasks[0]);
+    }
+    for (int k = 1; k < 4; k++) {
+        if (tasks[k].height > 0 && !spawned[k - 1]) {
+            grade_slice_thread_fn(&tasks[k]);
+        }
+    }
+
+    // Join cores 1..3 (woken directly by Linux kernel CLONE_CHILD_CLEARTID on exit)
+    for (int k = 1; k < 4; k++) {
+        if (spawned[k - 1]) {
+            pthread_join(threads[k - 1], NULL);
+        }
+    }
+
     pthread_mutex_unlock(&g_lut_mutex);
     pthread_mutex_unlock(&g_strip_call_mutex);
 }
@@ -636,8 +773,14 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWrit
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeCloseJpegStream(
     JNIEnv *env, jclass clazz, jlong handle, jint success) {
     if (handle == 0) return JNI_FALSE;
+    int encode_ok = encode_worker_wait();
+    if (g_async_enc.buf != NULL) {
+        free(g_async_enc.buf);
+        g_async_enc.buf = NULL;
+        g_async_enc.buf_cap = 0;
+    }
     JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
-    int ok = native_jpeg_stream_close(state, success ? 1 : 0);
+    int ok = native_jpeg_stream_close(state, (success && encode_ok) ? 1 : 0);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

@@ -130,35 +130,52 @@ static inline void get_cat_bits(int val, int* cat, int* bits) {
     *bits = (val < 0) ? ((val - 1) & ((1 << c) - 1)) : val;
 }
 
-// Fast 1D FDCT (AAN / Loeffler Q10 separable butterfly)
+// Precomputed Q12 AAN 1D inverse scale factors: round(4096 / (a_k))
+static const uint16_t AAN_IFACT[8] = { 4096, 2953, 3135, 3483, 4096, 5213, 7568, 14846 };
+
+// Fast 1D FDCT (True 5-multiply AAN butterfly; 80 multiplies/block vs 320, post-scaling folded into inv_q)
 static inline void fdct_1d(int16_t* blk) {
     for (int i = 0; i < 8; i++) {
         int16_t* r = blk + i * 8;
         int s0 = r[0] + r[7], s1 = r[1] + r[6], s2 = r[2] + r[5], s3 = r[3] + r[4];
-        int d0 = r[0] - r[7], d1 = r[1] - r[6], d2 = r[2] - r[5], d3 = r[3] - r[4];
-        int t0 = s0 + s3, t1 = s1 + s2, t2 = s1 - s2, t3 = s0 - s3;
-        r[0] = (int16_t)(((t0 + t1) * 362) >> 7);
-        r[4] = (int16_t)(((t0 - t1) * 362) >> 7);
-        r[2] = (int16_t)((t3 * 473 + t2 * 196) >> 7);
-        r[6] = (int16_t)((t3 * 196 - t2 * 473) >> 7);
-        r[1] = (int16_t)((d0 * 502 + d1 * 426 + d2 * 284 + d3 * 100) >> 7);
-        r[3] = (int16_t)((d0 * 426 - d1 * 100 - d2 * 502 - d3 * 284) >> 7);
-        r[5] = (int16_t)((d0 * 284 - d1 * 502 + d2 * 100 + d3 * 426) >> 7);
-        r[7] = (int16_t)((d0 * 100 - d1 * 284 + d2 * 426 - d3 * 502) >> 7);
+        int d3 = r[3] - r[4], d2 = r[2] - r[5], d1 = r[1] - r[6], d0 = r[0] - r[7];
+        int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
+        r[0] = (int16_t)(t0 + t1);
+        r[4] = (int16_t)(t0 - t1);
+        int z1 = ((t2 + t3) * 181) >> 8;
+        r[2] = (int16_t)(t3 + z1);
+        r[6] = (int16_t)(t3 - z1);
+        int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
+        int z5 = ((t4 - t6) * 98) >> 8;
+        int z2 = ((t4 * 139) >> 8) + z5;
+        int z4 = ((t6 * 334) >> 8) + z5;
+        int z3 = (t5 * 181) >> 8;
+        int z11 = d0 + z3, z13 = d0 - z3;
+        r[5] = (int16_t)(z13 + z2);
+        r[3] = (int16_t)(z13 - z2);
+        r[1] = (int16_t)(z11 + z4);
+        r[7] = (int16_t)(z11 - z4);
     }
     for (int i = 0; i < 8; i++) {
         int16_t* r = blk + i;
         int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
-        int d0 = r[0] - r[56], d1 = r[8] - r[48], d2 = r[16] - r[40], d3 = r[24] - r[32];
-        int t0 = s0 + s3, t1 = s1 + s2, t2 = s1 - s2, t3 = s0 - s3;
-        r[0]  = (int16_t)(((t0 + t1) * 362) >> 13);
-        r[32] = (int16_t)(((t0 - t1) * 362) >> 13);
-        r[16] = (int16_t)((t3 * 473 + t2 * 196) >> 13);
-        r[48] = (int16_t)((t3 * 196 - t2 * 473) >> 13);
-        r[8]  = (int16_t)((d0 * 502 + d1 * 426 + d2 * 284 + d3 * 100) >> 13);
-        r[24] = (int16_t)((d0 * 426 - d1 * 100 - d2 * 502 - d3 * 284) >> 13);
-        r[40] = (int16_t)((d0 * 284 - d1 * 502 + d2 * 100 + d3 * 426) >> 13);
-        r[56] = (int16_t)((d0 * 100 - d1 * 284 + d2 * 426 - d3 * 502) >> 13);
+        int d3 = r[24] - r[32], d2 = r[16] - r[40], d1 = r[8] - r[48], d0 = r[0] - r[56];
+        int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
+        r[0]  = (int16_t)((t0 + t1) >> 3);
+        r[32] = (int16_t)((t0 - t1) >> 3);
+        int z1 = ((t2 + t3) * 181) >> 8;
+        r[16] = (int16_t)((t3 + z1) >> 3);
+        r[48] = (int16_t)((t3 - z1) >> 3);
+        int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
+        int z5 = ((t4 - t6) * 98) >> 8;
+        int z2 = ((t4 * 139) >> 8) + z5;
+        int z4 = ((t6 * 334) >> 8) + z5;
+        int z3 = (t5 * 181) >> 8;
+        int z11 = d0 + z3, z13 = d0 - z3;
+        r[40] = (int16_t)((z13 + z2) >> 3);
+        r[24] = (int16_t)((z13 - z2) >> 3);
+        r[8]  = (int16_t)((z11 + z4) >> 3);
+        r[56] = (int16_t)((z11 - z4) >> 3);
     }
 }
 
@@ -174,9 +191,13 @@ static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q
         int sign = coeff < 0;
         int abs_c = sign ? -coeff : coeff;
         int q_val = (abs_c * inv_q[nat] + 32768) >> 16;
-        if (i > 0 && q_val > 1023) q_val = 1023;
-        q_block[i] = (int16_t)(sign ? -q_val : q_val);
-        if (q_val != 0) last_nz = i;
+        if (q_val != 0) {
+            if (i > 0 && q_val > 1023) q_val = 1023;
+            q_block[i] = (int16_t)(sign ? -q_val : q_val);
+            last_nz = i;
+        } else {
+            q_block[i] = 0;
+        }
     }
 
     int diff = q_block[0] - *last_dc;
@@ -209,8 +230,11 @@ static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma
         int vc = (BASE_Q_CHROMA[i] * s + 50) / 100;
         q_luma[i] = (uint8_t)(vl < 1 ? 1 : (vl > 255 ? 255 : vl));
         q_chroma[i] = (uint8_t)(vc < 1 ? 1 : (vc > 255 ? 255 : vc));
-        inv_q_luma[i] = (uint16_t)((65536 + (q_luma[i] >> 1)) / q_luma[i]);
-        inv_q_chroma[i] = (uint16_t)((65536 + (q_chroma[i] >> 1)) / q_chroma[i]);
+        uint32_t aan_num = (uint32_t)AAN_IFACT[i >> 3] * (uint32_t)AAN_IFACT[i & 7];
+        uint32_t il = (aan_num + ((uint32_t)q_luma[i] << 7)) / ((uint32_t)q_luma[i] << 8);
+        uint32_t ic = (aan_num + ((uint32_t)q_chroma[i] << 7)) / ((uint32_t)q_chroma[i] << 8);
+        inv_q_luma[i] = (uint16_t)(il > 65535U ? 65535U : il);
+        inv_q_chroma[i] = (uint16_t)(ic > 65535U ? 65535U : ic);
     }
 }
 

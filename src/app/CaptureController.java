@@ -819,11 +819,19 @@ public class CaptureController {
                     return;
                 }
 
-                // 6. Strict Dalvik Heap Management: Process in source strips (producing 64 output rows per strip)
-                final int numStrips = (srcH + srcStripH - 1) / srcStripH;
-
-                // Allocate direct buffer capped at 2.03 MB max (7952 * 64 * 4 for 42.4MP, 3976 * 64 * 4 for 10.6MP)
+                // 6. Strict Dalvik Heap Management: Process in source strips
+                // Allocate direct buffer (upgraded to 256-row 4-core SMP bands when native engine is active,
+                // cutting Skia decodeRegion file seeks by 4x and keeping all 4 Cortex-A5 cores saturated)
                 java.nio.ByteBuffer stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 4);
+                final int maxOutStripH;
+                if (nativeReady) {
+                    srcStripH *= 4; // 256 output rows per band (64 rows per Cortex-A5 core)
+                    maxOutStripH = 256;
+                    stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * maxOutStripH * 4);
+                } else {
+                    maxOutStripH = 64;
+                }
+                final int numStrips = (srcH + srcStripH - 1) / srcStripH;
 
                 BitmapFactory.Options opts = new BitmapFactory.Options();
                 opts.inSampleSize = (srcW > 4000) ? 2 : 1;
@@ -833,9 +841,12 @@ public class CaptureController {
                 opts.inPreferredConfig = Bitmap.Config.ARGB_8888; // Enhancement 1: Upgrade to ARGB_8888 precision
                 opts.inDither = false;
                 opts.inMutable = true;
+                opts.inPurgeable = true;
+                opts.inInputShareable = true;
 
                 streamSuccess = true;
                 int outputRowOffset = 0;
+                Bitmap reusableStripBmp = null;
                 try {
                     for (int stripIdx = 0; stripIdx < numStrips; stripIdx++) {
                         // Enhancement 3: Check abort flag on power-off / shutdown
@@ -845,7 +856,7 @@ public class CaptureController {
                             break;
                         }
 
-                        if (stripIdx % 10 == 0 || stripIdx == numStrips - 1) {
+                        if (stripIdx % 4 == 0 || stripIdx == numStrips - 1) {
                             if (uiController != null) {
                                 uiController.updateStatusAsync(String.format(Locale.US, "Grading strip %d/%d...", (stripIdx + 1), numStrips));
                             }
@@ -858,12 +869,30 @@ public class CaptureController {
                         Bitmap stripBmp = null;
                         try {
                             try {
-                                stripBmp = decoder.decodeRegion(rect, opts);
+                                if (reusableStripBmp != null && currentSrcH == srcStripH) {
+                                    opts.inBitmap = reusableStripBmp;
+                                } else {
+                                    opts.inBitmap = null;
+                                }
+                                try {
+                                    stripBmp = decoder.decodeRegion(rect, opts);
+                                } catch (IllegalArgumentException inBmpErr) {
+                                    opts.inBitmap = null;
+                                    stripBmp = decoder.decodeRegion(rect, opts);
+                                }
                             } catch (OutOfMemoryError oom) {
                                 Log.w(TAG, "OOM decoding strip in ARGB_8888, falling back to RGB_565", oom);
+                                opts.inBitmap = null;
+                                if (reusableStripBmp != null && !reusableStripBmp.isRecycled()) {
+                                    reusableStripBmp.recycle();
+                                    reusableStripBmp = null;
+                                }
                                 opts.inPreferredConfig = Bitmap.Config.RGB_565;
                                 // Resize direct buffer so native JNI accurately detects RGB_565 (2 bytes/px)
                                 stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2);
+                                if (nativeReady) {
+                                    stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * maxOutStripH * 2);
+                                }
                                 stripBmp = decoder.decodeRegion(rect, opts);
                             }
                             if (stripBmp == null) {
@@ -871,14 +900,20 @@ public class CaptureController {
                                 streamSuccess = false;
                                 break;
                             }
-                            int outStripW = stripBmp.getWidth();  // 3976 or 7952
-                            int outStripH = stripBmp.getHeight(); // 64 (or 28 / 56 for final partial strip)
+                            if (reusableStripBmp == null && currentSrcH == srcStripH && stripBmp.isMutable()) {
+                                reusableStripBmp = stripBmp;
+                            }
+                            int outStripW = stripBmp.getWidth();  // 3976, 5168, or 7952
+                            int outStripH = stripBmp.getHeight(); // 256 (or partial final strip)
+                            if (stripBmp.getConfig() == Bitmap.Config.RGB_565 && stripDirect.capacity() >= outStripW * outStripH * 4) {
+                                stripDirect = java.nio.ByteBuffer.allocateDirect(outStripW * outStripH * 2);
+                            }
 
                             stripDirect.clear();
                             stripBmp.copyPixelsToBuffer(stripDirect);
                             stripDirect.rewind();
 
-                            // Native C fused grading (deterministic row-seeded PRNG) + JPEG stream write
+                            // Native C 4-core parallel grading + pipelined JPEG stream write
                             boolean stripOk = ColorEngine.gradeAndWriteStreamStripSafe(
                                 streamHandle, stripDirect, outStripW, outStripH, outputRowOffset, grainStrength, clarityStrength
                             );
@@ -889,14 +924,19 @@ public class CaptureController {
                             }
                             outputRowOffset += outStripH;
                         } finally {
-                            // Crucial: immediately recycle strip Bitmap before decoding next row block
-                            if (stripBmp != null && !stripBmp.isRecycled()) {
+                            // Crucial: recycle non-reusable strip Bitmap immediately
+                            if (stripBmp != null && stripBmp != reusableStripBmp && !stripBmp.isRecycled()) {
                                 stripBmp.recycle();
                                 stripBmp = null;
                             }
                         }
                     }
                 } finally {
+                    opts.inBitmap = null;
+                    if (reusableStripBmp != null && !reusableStripBmp.isRecycled()) {
+                        reusableStripBmp.recycle();
+                        reusableStripBmp = null;
+                    }
                     // Deterministic stream closure in finally block
                     boolean closed = ColorEngine.closeJpegStreamSafe(streamHandle, streamSuccess);
                     streamHandle = 0;
