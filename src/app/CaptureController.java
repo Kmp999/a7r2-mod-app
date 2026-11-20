@@ -191,7 +191,8 @@ public class CaptureController {
         if (recipe == null || !USE_NATIVE_ENGINE || !ColorEngine.isNativeAvailable()) return;
         String sig = recipe.filmSim.name() + ":" + recipe.color + ":" + recipe.highlightTone + ":" +
                      recipe.shadowTone + ":" + recipe.whiteBalance.name() + ":" +
-                     recipe.wbShiftR + ":" + recipe.wbShiftB + ":" + recipe.colorChromeEffect.name();
+                     recipe.wbShiftR + ":" + recipe.wbShiftB + ":" + recipe.colorChrome.name() + ":" +
+                     recipe.dynamicRange.name();
         if (sig.equals(lastPrecomputedLutSig)) {
             return;
         }
@@ -704,30 +705,7 @@ public class CaptureController {
 
             // 4. Precompute 17^3 3D LUT once per recipe in native memory (cached if unchanged)
             if (nativeReady) {
-                String sig = recipe.filmSim.name() + ":" + recipe.color + ":" + recipe.highlightTone + ":" +
-                             recipe.shadowTone + ":" + recipe.whiteBalance.name() + ":" +
-                             recipe.wbShiftR + ":" + recipe.wbShiftB + ":" + recipe.colorChromeEffect.name();
-                if (!sig.equals(lastPrecomputedLutSig)) {
-                    byte[] baseLut = (context != null && recipe.filmSim.lutFile != null)
-                        ? LutManager.getLutTable(context, recipe.filmSim.lutFile) : null;
-                    if (baseLut != null) {
-                        ColorEngine.precomputeLut17WithBaseSafe(
-                            baseLut,
-                            recipe.computeCcmQ8(),
-                            recipe.generateToneCurve('R'),
-                            recipe.generateToneCurve('G'),
-                            recipe.generateToneCurve('B')
-                        );
-                    } else {
-                        ColorEngine.precomputeLut17Safe(
-                            recipe.computeCcmQ8(),
-                            recipe.generateToneCurve('R'),
-                            recipe.generateToneCurve('G'),
-                            recipe.generateToneCurve('B')
-                        );
-                    }
-                    lastPrecomputedLutSig = sig;
-                }
+                ensureRecipeLutPrecomputed(recipe);
             }
 
             final int grainStrength = recipe.grainEffect.ordinal();
