@@ -262,7 +262,25 @@ public class ColorEngine {
         }
     }
 
+    /**
+     * Opens a streaming JPEG writer session embedding raw EXIF APP1 bytes inline in the header
+     * (eliminates post-write full-file ExifInterface rewrite on FAT32 SD cards).
+     */
+    public static long openJpegStreamWithExifSafe(String outputPath, int width, int height, int quality, byte[] exifApp1) {
+        if (!sNativeAvailable || outputPath == null || width <= 0 || height <= 0) return 0;
+        if (exifApp1 == null || exifApp1.length < 4) {
+            return openJpegStreamSafe(outputPath, width, height, quality);
+        }
+        try {
+            return nativeOpenJpegStreamWithExif(outputPath, width, height, quality, exifApp1);
+        } catch (Throwable t) {
+            Log.w(TAG, "openJpegStreamWithExifSafe fallback to standard open: " + t.getMessage());
+            return openJpegStreamSafe(outputPath, width, height, quality);
+        }
+    }
+
     public static native long nativeOpenJpegStream(String outputPath, int width, int height, int quality);
+    public static native long nativeOpenJpegStreamWithExif(String outputPath, int width, int height, int quality, byte[] exifApp1);
 
     /**
      * Writes an RGB_565 strip buffer to the active JPEG stream.

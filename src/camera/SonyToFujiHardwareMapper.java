@@ -37,9 +37,13 @@ public class SonyToFujiHardwareMapper {
             mapDynamicRangeHardware(params, recipe);
 
             // Step 2.1: RAW / RAW+JPEG Format Guardrails for Camera.Parameters
+            // Only upgrade to raw+jpeg when camera is in RAW-only mode (avoids unnecessary 42-84MB .ARW SD flushes)
             try {
                 params.set("sony-quality", "fine");
-                params.set("sony-picture-format", "raw+jpeg");
+                String curSonyFormat = params.get("sony-picture-format");
+                if ("raw".equalsIgnoreCase(curSonyFormat) || "arw".equalsIgnoreCase(curSonyFormat)) {
+                    params.set("sony-picture-format", "raw+jpeg");
+                }
                 String curPicFormat = params.get("picture-format");
                 if ("raw".equalsIgnoreCase(curPicFormat) || "arw".equalsIgnoreCase(curPicFormat)) {
                     params.set("picture-format", "raw+jpeg");
@@ -122,6 +126,11 @@ public class SonyToFujiHardwareMapper {
         // Removed fake sony-* parameters
     }
 
+    private static int sLastAppliedDrEvOffset = 0;
+    private static volatile Class<?> sCachedModifierIface = null;
+    private static volatile boolean sModifierIfaceLookedUp = false;
+    private static final java.util.HashMap<String, Method> sMethodCache = new java.util.HashMap<String, Method>();
+
     private static void mapDynamicRangeHardware(Camera.Parameters params, FujiRecipe recipe) {
         float step = params.getExposureCompensationStep();
         if (step <= 0f) step = 0.33333334f;
@@ -136,45 +145,76 @@ public class SonyToFujiHardwareMapper {
             evOffset = -Math.round(2.0f / step);
         }
 
-        if (evOffset != 0) {
-            int targetEvIndex = clamp(currentEvIndex + evOffset,
+        // Apply only the delta vs previous DR offset so repeated recipe updates don't compound EV down
+        int delta = evOffset - sLastAppliedDrEvOffset;
+        if (delta != 0) {
+            int targetEvIndex = clamp(currentEvIndex + delta,
                 params.getMinExposureCompensation(),
                 params.getMaxExposureCompensation());
             params.setExposureCompensation(targetEvIndex);
-            Log.d(TAG, "Applied hardware DR EV protection: " + evOffset + " steps");
+            sLastAppliedDrEvOffset = evOffset;
+            Log.d(TAG, "Applied hardware DR EV protection: " + evOffset + " steps (delta " + delta + ")");
         }
     }
 
     // ------------------------------------------------------------------------
-    // Strict Reflection Resolver
+    // Cached Reflection Resolver (Zero per-call Class.forName overhead)
     // ------------------------------------------------------------------------
     private static Method findAccessibleMethod(Object target, String name, Class<?>... paramTypes) throws NoSuchMethodException {
         if (target == null) throw new NoSuchMethodException("Target is null for method " + name);
+
+        StringBuilder keySb = new StringBuilder(64);
+        keySb.append(target.getClass().getName()).append('#').append(name);
+        if (paramTypes != null) {
+            for (Class<?> pt : paramTypes) {
+                keySb.append(':').append(pt.getName());
+            }
+        }
+        String cacheKey = keySb.toString();
+        synchronized (sMethodCache) {
+            Method cached = sMethodCache.get(cacheKey);
+            if (cached != null) return cached;
+        }
+
+        if (!sModifierIfaceLookedUp) {
+            try {
+                sCachedModifierIface = Class.forName("com.sony.scalar.hardware.CameraEx$ParametersModifier");
+            } catch (Throwable ignored) {}
+            sModifierIfaceLookedUp = true;
+        }
+
+        Method resolved = null;
         try {
-            Class<?> iface = Class.forName("com.sony.scalar.hardware.CameraEx$ParametersModifier");
-            if (iface.isInstance(target)) {
-                Method m = iface.getMethod(name, paramTypes);
-                m.setAccessible(true);
-                return m;
+            Class<?> iface = sCachedModifierIface;
+            if (iface != null && iface.isInstance(target)) {
+                resolved = iface.getMethod(name, paramTypes);
+                resolved.setAccessible(true);
             }
         } catch (Throwable ignored) {}
 
-        Class<?> clazz = target.getClass();
-        while (clazz != null) {
-            try {
-                Method m = clazz.getDeclaredMethod(name, paramTypes);
-                m.setAccessible(true);
-                return m;
-            } catch (NoSuchMethodException e) {
+        if (resolved == null) {
+            Class<?> clazz = target.getClass();
+            while (clazz != null && resolved == null) {
                 try {
-                    Method m = clazz.getMethod(name, paramTypes);
-                    m.setAccessible(true);
-                    return m;
-                } catch (NoSuchMethodException ignored) {}
+                    resolved = clazz.getDeclaredMethod(name, paramTypes);
+                    resolved.setAccessible(true);
+                } catch (NoSuchMethodException e) {
+                    try {
+                        resolved = clazz.getMethod(name, paramTypes);
+                        resolved.setAccessible(true);
+                    } catch (NoSuchMethodException ignored) {}
+                }
+                clazz = clazz.getSuperclass();
             }
-            clazz = clazz.getSuperclass();
         }
-        throw new NoSuchMethodException(name);
+
+        if (resolved == null) {
+            throw new NoSuchMethodException(name);
+        }
+        synchronized (sMethodCache) {
+            sMethodCache.put(cacheKey, resolved);
+        }
+        return resolved;
     }
 
     private static Camera.Parameters applySonyExModifiers(Object cameraEx, Camera.Parameters params, FujiRecipe recipe) {

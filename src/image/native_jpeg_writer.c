@@ -48,7 +48,7 @@ static const int16_t DCT_M[8][8] = {
     { 196,-473, 473,-196,-196, 473,-473, 196}, { 100,-284, 426,-502, 502,-426, 284,-100}
 };
 
-// Buffered BitWriter
+// Buffered BitWriter (32KB write buffer tuned for FAT32 clusters; heap-allocated to avoid JNI stack overflow)
 typedef struct {
     FILE* fp;
     uint32_t buf;
@@ -59,21 +59,17 @@ typedef struct {
 
 static inline void bw_put_byte(BitWriter* bw, uint8_t b) {
     bw->obuf[bw->opos++] = b;
+    if (b == 0xFF) {
+        bw->obuf[bw->opos++] = 0x00;
+    }
     if (bw->opos >= 32760) {
         fwrite(bw->obuf, 1, bw->opos, bw->fp);
         bw->opos = 0;
     }
-    if (b == 0xFF) {
-        bw->obuf[bw->opos++] = 0x00;
-        if (bw->opos >= 32760) {
-            fwrite(bw->obuf, 1, bw->opos, bw->fp);
-            bw->opos = 0;
-        }
-    }
 }
 
 static inline void bw_put_bits(BitWriter* bw, uint32_t code, int len) {
-    bw->buf = (bw->buf << len) | (code & ((1 << len) - 1));
+    bw->buf = (bw->buf << len) | (code & ((1U << len) - 1U));
     bw->bits += len;
     while (bw->bits >= 8) {
         bw->bits -= 8;
@@ -83,7 +79,7 @@ static inline void bw_put_bits(BitWriter* bw, uint32_t code, int len) {
 
 static void bw_flush(BitWriter* bw) {
     if (bw->bits > 0) {
-        bw->buf = (bw->buf << (8 - bw->bits)) | ((1 << (8 - bw->bits)) - 1);
+        bw->buf = (bw->buf << (8 - bw->bits)) | ((1U << (8 - bw->bits)) - 1U);
         bw_put_byte(bw, (uint8_t)bw->buf);
         bw->buf = 0;
         bw->bits = 0;
@@ -107,8 +103,13 @@ static void build_huff_table(const uint8_t* bits, const uint8_t* vals, uint16_t*
 
 static inline void get_cat_bits(int val, int* cat, int* bits) {
     if (val == 0) { *cat = 0; *bits = 0; return; }
-    int v = val < 0 ? -val : val, c = 0;
+    int v = val < 0 ? -val : val;
+#if defined(__GNUC__) || defined(__clang__)
+    int c = 32 - __builtin_clz((unsigned int)v); // 1-cycle ARM CLZ instruction
+#else
+    int c = 0;
     while (v > 0) { c++; v >>= 1; }
+#endif
     *cat = c;
     *bits = (val < 0) ? ((val - 1) & ((1 << c) - 1)) : val;
 }
@@ -161,14 +162,17 @@ static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q
                               const uint16_t* ac_codes, const uint8_t* ac_sizes, int* last_dc) {
     fdct_1d(blk);
     int16_t q_block[64];
+    int last_nz = 0;
     for (int i = 0; i < 64; i++) {
         int coeff = blk[i];
         int sign = coeff < 0;
         int abs_c = sign ? -coeff : coeff;
         int q_val = (abs_c * inv_q[i] + 32768) >> 16;
-        q_block[ZIGZAG[i]] = (int16_t)(sign ? -q_val : q_val);
+        int zz = ZIGZAG[i];
+        q_block[zz] = (int16_t)(sign ? -q_val : q_val);
+        if (q_val != 0 && zz > last_nz) last_nz = zz;
     }
-    
+
     int diff = q_block[0] - *last_dc;
     *last_dc = q_block[0];
     int cat, bits;
@@ -177,7 +181,7 @@ static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q
     if (cat > 0) bw_put_bits(bw, (uint32_t)bits, cat);
 
     int r = 0;
-    for (int k = 1; k < 64; k++) {
+    for (int k = 1; k <= last_nz; k++) {
         int val = q_block[k];
         if (val == 0) { r++; } else {
             while (r > 15) { bw_put_bits(bw, ac_codes[0xF0], ac_sizes[0xF0]); r -= 16; }
@@ -187,7 +191,7 @@ static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q
             r = 0;
         }
     }
-    if (r > 0) bw_put_bits(bw, ac_codes[0x00], ac_sizes[0x00]);
+    if (last_nz < 63) bw_put_bits(bw, ac_codes[0x00], ac_sizes[0x00]);
 }
 
 static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma, uint16_t* inv_q_luma, uint16_t* inv_q_chroma) {
@@ -203,9 +207,16 @@ static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma
     }
 }
 
-static void write_headers(FILE* fp, int width, int height, uint8_t* q_luma, uint8_t* q_chroma) {
-    static const uint8_t APP0_HDR[] = { 0xFF,0xD8, 0xFF,0xE0, 0,16, 'J','F','I','F',0, 1,1, 0, 0,1, 0,1, 0,0 };
-    fwrite(APP0_HDR, 1, sizeof(APP0_HDR), fp);
+static void write_headers(FILE* fp, int width, int height, uint8_t* q_luma, uint8_t* q_chroma,
+                          const uint8_t* exif_app1, size_t exif_len) {
+    if (exif_app1 != NULL && exif_len >= 4 && exif_app1[0] == 0xFF && exif_app1[1] == 0xE1) {
+        static const uint8_t SOI_HDR[] = { 0xFF, 0xD8 };
+        fwrite(SOI_HDR, 1, sizeof(SOI_HDR), fp);
+        fwrite(exif_app1, 1, exif_len, fp);
+    } else {
+        static const uint8_t APP0_HDR[] = { 0xFF,0xD8, 0xFF,0xE0, 0,16, 'J','F','I','F',0, 1,1, 0, 0,1, 0,1, 0,0 };
+        fwrite(APP0_HDR, 1, sizeof(APP0_HDR), fp);
+    }
     fputc(0xFF, fp); fputc(0xDB, fp); fputc(0x00, fp); fputc(0x84, fp); fputc(0x00, fp);
     for (int i = 0; i < 64; i++) fputc(q_luma[ZIGZAG[i]], fp);
     fputc(0x01, fp);
@@ -243,10 +254,11 @@ int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int w
     build_huff_table(&DHT_MARKER_DATA[209], &DHT_MARKER_DATA[225], dc_chroma_c, dc_chroma_s);
     build_huff_table(&DHT_MARKER_DATA[238], &DHT_MARKER_DATA[254], ac_chroma_c, ac_chroma_s);
 
-    write_headers(fp, width, height, q_luma, q_chroma);
+    write_headers(fp, width, height, q_luma, q_chroma, NULL, 0);
 
-    BitWriter bw = { fp, 0, 0 };
-    bw.opos = 0;
+    BitWriter* bw = (BitWriter*)calloc(1, sizeof(BitWriter));
+    if (!bw) { fclose(fp); return 0; }
+    bw->fp = fp;
     int last_dc[3] = { 0, 0, 0 };
     int16_t y_block[4][64], cb_block[64], cr_block[64];
 
@@ -280,12 +292,13 @@ int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int w
                     }
                 }
             }
-            for (int i = 0; i < 4; i++) encode_block_fast(&bw, y_block[i], inv_q_luma, dc_luma_c, dc_luma_s, ac_luma_c, ac_luma_s, &last_dc[0]);
-            encode_block_fast(&bw, cb_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[1]);
-            encode_block_fast(&bw, cr_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[2]);
+            for (int i = 0; i < 4; i++) encode_block_fast(bw, y_block[i], inv_q_luma, dc_luma_c, dc_luma_s, ac_luma_c, ac_luma_s, &last_dc[0]);
+            encode_block_fast(bw, cb_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[1]);
+            encode_block_fast(bw, cr_block, inv_q_chroma, dc_chroma_c, dc_chroma_s, ac_chroma_c, ac_chroma_s, &last_dc[2]);
         }
     }
-    bw_flush(&bw);
+    bw_flush(bw);
+    free(bw);
     fputc(0xFF, fp); fputc(0xD9, fp);
     fclose(fp);
     return 1;
@@ -313,7 +326,8 @@ struct JpegStreamState {
     int last_dc[3];
 };
 
-JpegStreamState* native_jpeg_stream_open(const char* filename, int width, int height, int quality) {
+JpegStreamState* native_jpeg_stream_open_with_exif(const char* filename, int width, int height, int quality,
+                                                   const uint8_t* exif_app1, size_t exif_len) {
     if (!filename || width <= 0 || height <= 0) return NULL;
     FILE* fp = fopen(filename, "wb");
     if (!fp) return NULL;
@@ -336,7 +350,7 @@ JpegStreamState* native_jpeg_stream_open(const char* filename, int width, int he
     build_huff_table(&DHT_MARKER_DATA[209], &DHT_MARKER_DATA[225], state->dc_chroma_c, state->dc_chroma_s);
     build_huff_table(&DHT_MARKER_DATA[238], &DHT_MARKER_DATA[254], state->ac_chroma_c, state->ac_chroma_s);
 
-    write_headers(fp, width, height, state->q_luma, state->q_chroma);
+    write_headers(fp, width, height, state->q_luma, state->q_chroma, exif_app1, exif_len);
 
     state->bw.fp = fp;
     state->bw.buf = 0;
@@ -347,6 +361,10 @@ JpegStreamState* native_jpeg_stream_open(const char* filename, int width, int he
     state->last_dc[2] = 0;
 
     return state;
+}
+
+JpegStreamState* native_jpeg_stream_open(const char* filename, int width, int height, int quality) {
+    return native_jpeg_stream_open_with_exif(filename, width, height, quality, NULL, 0);
 }
 
 int native_jpeg_stream_write_strip_rgb565(JpegStreamState* state, const uint16_t* strip_pixels, int strip_w, int strip_h, int row_offset) {

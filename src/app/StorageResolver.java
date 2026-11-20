@@ -42,16 +42,60 @@ public final class StorageResolver {
     private static int sFileSequence = 1;
     private static volatile boolean sSequenceInitialized = false;
     private static volatile File sCachedWorkingDir = null;
+    private static volatile List<File> sCachedCandidateDirs = null;
+    private static volatile long sCachedCandidateDirsTime = 0;
+    private static final long CANDIDATE_CACHE_TTL_MS = 30000L;
 
     private StorageResolver() {}
 
+    public static void invalidateDirectoryCache() {
+        sCachedCandidateDirs = null;
+        sCachedCandidateDirsTime = 0;
+    }
+
+    /**
+     * Pre-warms DCIM candidate directories and DCF sequence counter off the Main UI thread
+     * so shutter press has zero FAT32 directory enumeration latency.
+     */
+    public static void prewarmDirectoryAndSequence() {
+        getCandidateDcimDirs();
+        synchronized (StorageResolver.class) {
+            if (!sSequenceInitialized) {
+                int initial = allocateNextSequenceNumber();
+                // Roll back by 1 so the first actual capture receives `initial`
+                sFileSequence = initial;
+            }
+        }
+    }
+
+    private static String canonicalKey(File f) {
+        try {
+            return f.getCanonicalPath();
+        } catch (Throwable t) {
+            return f.getAbsolutePath();
+        }
+    }
+
     /**
      * Resolves candidate DCIM directories in priority order.
+     * Short-circuits on cached canonical directories to avoid repeated /proc/mounts parsing,
+     * Avindex reflection, and scanning symlink/bind-mount aliases of the same SD card.
      */
     public static List<File> getCandidateDcimDirs() {
+        long now = System.currentTimeMillis();
+        List<File> cached = sCachedCandidateDirs;
+        if (cached != null && !cached.isEmpty() && (now - sCachedCandidateDirsTime) < CANDIDATE_CACHE_TTL_MS) {
+            File first = cached.get(0);
+            if (first != null && first.exists() && first.isDirectory()) {
+                return cached;
+            }
+        }
+
         List<File> list = new ArrayList<File>();
-        if (sCachedWorkingDir != null && sCachedWorkingDir.exists()) {
+        Set<String> seenCanonical = new HashSet<String>();
+        if (sCachedWorkingDir != null && sCachedWorkingDir.exists() && sCachedWorkingDir.isDirectory()) {
             list.add(sCachedWorkingDir);
+            seenCanonical.add(canonicalKey(sCachedWorkingDir));
         }
         Set<String> roots = new LinkedHashSet<String>();
 
@@ -117,10 +161,12 @@ public final class StorageResolver {
             if (reader != null) try { reader.close(); } catch (Throwable ignored) {}
         }
 
-        // For each root, prioritize existing camera DCIM/*MSDCF folders
+        // Deduplicate aliased root mount points via canonical path before enumerating DCIM
+        Set<String> seenRootCanonical = new HashSet<String>();
         for (String r : roots) {
             File rootFile = new File(r);
             if (!rootFile.exists()) continue;
+            if (!seenRootCanonical.add(canonicalKey(rootFile))) continue;
 
             File dcim = new File(rootFile, "DCIM");
             if (dcim.exists() && dcim.isDirectory()) {
@@ -128,16 +174,22 @@ public final class StorageResolver {
                 if (children != null) {
                     for (File c : children) {
                         if (c.isDirectory() && c.getName().toUpperCase(Locale.US).endsWith("MSDCF")) {
-                            if (!list.contains(c)) list.add(c);
+                            if (seenCanonical.add(canonicalKey(c))) {
+                                list.add(c);
+                            }
                         }
                     }
                 }
             }
             File std100 = new File(rootFile, "DCIM/100MSDCF");
-            if (!list.contains(std100)) list.add(std100);
-            if (!list.contains(dcim)) list.add(dcim);
+            if (seenCanonical.add(canonicalKey(std100))) list.add(std100);
+            if (seenCanonical.add(canonicalKey(dcim))) list.add(dcim);
         }
 
+        if (!list.isEmpty()) {
+            sCachedCandidateDirs = java.util.Collections.unmodifiableList(list);
+            sCachedCandidateDirsTime = now;
+        }
         return list;
     }
 
@@ -156,10 +208,11 @@ public final class StorageResolver {
         int maxSeq = 0;
         for (File dir : candidates) {
             if (dir.exists() && dir.isDirectory()) {
-                File[] files = dir.listFiles();
-                if (files != null) {
-                    for (File f : files) {
-                        String name = f.getName().toUpperCase(Locale.US);
+                String[] names = dir.list();
+                if (names != null) {
+                    for (String rawName : names) {
+                        if (rawName == null) continue;
+                        String name = rawName.toUpperCase(Locale.US);
                         if (name.endsWith(".JPG") || name.endsWith(".JPEG")) {
                             if (name.startsWith("FUJI_") && name.length() >= 9) {
                                 try {
@@ -1057,18 +1110,95 @@ public final class StorageResolver {
     }
 
     /**
-     * Snapshots all existing photo file absolute paths across all candidate DCIM directories.
+     * Extracts the raw EXIF APP1 segment (0xFF 0xE1 lenHi lenLo "Exif\0\0" ...) from a JPEG header
+     * in ~1ms (reads only the first few KB). Passing these bytes to native_jpeg_stream_open_with_exif()
+     * embeds camera EXIF inline during single-pass encoding, completely eliminating the 15-25MB
+     * ExifInterface.saveAttributes() full-file rewrite on FAT32 SD cards.
+     */
+    public static byte[] extractExifApp1Segment(String jpegPath) {
+        if (jpegPath == null) return null;
+        java.io.BufferedInputStream in = null;
+        try {
+            in = new java.io.BufferedInputStream(new java.io.FileInputStream(jpegPath), 8192);
+            int b0 = in.read();
+            int b1 = in.read();
+            if (b0 != 0xFF || b1 != 0xD8) return null; // Not JPEG SOI
+
+            for (int seg = 0; seg < 16; seg++) {
+                int prefix = in.read();
+                while (prefix == 0xFF) {
+                    prefix = in.read();
+                }
+                if (prefix < 0) break;
+                int marker = prefix;
+                // Stop at Start-Of-Scan (0xDA) or EOI (0xD9)
+                if (marker == 0xDA || marker == 0xD9) break;
+                // Standalone markers without length
+                if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+
+                int lenHi = in.read();
+                int lenLo = in.read();
+                if (lenHi < 0 || lenLo < 0) break;
+                int segLen = (lenHi << 8) | lenLo;
+                if (segLen < 2) break;
+                int payloadLen = segLen - 2;
+
+                if (marker == 0xE1 && payloadLen >= 6 && segLen <= 65535) {
+                    byte[] app1 = new byte[2 + segLen];
+                    app1[0] = (byte) 0xFF;
+                    app1[1] = (byte) 0xE1;
+                    app1[2] = (byte) lenHi;
+                    app1[3] = (byte) lenLo;
+                    int offset = 4;
+                    int remaining = payloadLen;
+                    while (remaining > 0) {
+                        int n = in.read(app1, offset, remaining);
+                        if (n <= 0) return null;
+                        offset += n;
+                        remaining -= n;
+                    }
+                    // Verify "Exif\0\0" header
+                    if (app1[4] == 'E' && app1[5] == 'x' && app1[6] == 'i'
+                        && app1[7] == 'f' && app1[8] == 0 && app1[9] == 0) {
+                        return app1;
+                    }
+                } else {
+                    long toSkip = payloadLen;
+                    while (toSkip > 0) {
+                        long skipped = in.skip(toSkip);
+                        if (skipped <= 0) {
+                            if (in.read() < 0) return null;
+                            skipped = 1;
+                        }
+                        toSkip -= skipped;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.d(TAG, "extractExifApp1Segment skipped: " + t.getMessage());
+        } finally {
+            if (in != null) {
+                try { in.close(); } catch (Throwable ignored) {}
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Snapshots all existing photo file paths across cached canonical DCIM directories
+     * using dir.list() (zero per-file stat() syscalls on FAT32).
      */
     public static Set<String> snapshotExistingPhotos() {
         Set<String> set = new HashSet<String>();
         List<File> candidates = getCandidateDcimDirs();
         for (File dir : candidates) {
             if (!dir.exists() || !dir.isDirectory()) continue;
-            File[] files = dir.listFiles();
-            if (files == null) continue;
-            for (File f : files) {
-                if (f.isFile() && f.length() > 0) {
-                    set.add(f.getAbsolutePath());
+            String dirPath = dir.getAbsolutePath();
+            String[] names = dir.list();
+            if (names == null) continue;
+            for (String name : names) {
+                if (name != null && name.length() > 4) {
+                    set.add(dirPath + File.separator + name);
                 }
             }
         }
@@ -1076,25 +1206,30 @@ public final class StorageResolver {
     }
 
     /**
-     * Polls DCIM directories for any new camera photo whose absolute path is NOT in preExistingFiles.
+     * Polls cached canonical DCIM directories for any new camera photo whose path is NOT in preExistingFiles.
+     * Uses dir.list() first so pre-existing files are skipped with ZERO FAT32 stat() syscalls.
      */
     public static File waitForNewCameraPhoto(final Set<String> preExistingFiles, long timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
+        List<File> candidates = getCandidateDcimDirs();
         while (System.currentTimeMillis() < deadline) {
-            List<File> candidates = getCandidateDcimDirs();
             File newest = null;
             long newestTime = 0;
             for (File dir : candidates) {
                 if (!dir.exists() || !dir.isDirectory()) continue;
-                File[] files = dir.listFiles();
-                if (files == null) continue;
-                for (File f : files) {
-                    if (f.isFile() && f.length() > 50000) {
-                        String name = f.getName().toUpperCase(Locale.US);
-                        if ((name.endsWith(".JPG") || name.endsWith(".JPEG")) && !name.startsWith("FUJI_")) {
-                            if (preExistingFiles != null && preExistingFiles.contains(f.getAbsolutePath())) {
-                                continue;
-                            }
+                String dirPath = dir.getAbsolutePath();
+                String[] names = dir.list();
+                if (names == null) continue;
+                for (String rawName : names) {
+                    if (rawName == null) continue;
+                    String name = rawName.toUpperCase(Locale.US);
+                    if ((name.endsWith(".JPG") || name.endsWith(".JPEG")) && !name.startsWith("FUJI_")) {
+                        String fullPath = dirPath + File.separator + rawName;
+                        if (preExistingFiles != null && preExistingFiles.contains(fullPath)) {
+                            continue;
+                        }
+                        File f = new File(dir, rawName);
+                        if (f.isFile() && f.length() > 50000) {
                             long mod = f.lastModified();
                             if (newest == null || mod >= newestTime) {
                                 newestTime = mod;

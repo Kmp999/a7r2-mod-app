@@ -44,14 +44,19 @@ public class SonyPmcaAdapter implements CameraAdapter {
         this.storeImageListener = listener;
     }
 
-    // Local cached hardware states for Zero-GC HUD updates
-    private String cachedShutter = "1/125";
-    private String cachedAperture = "F2.8";
-    private String cachedIso = "ISO 400";
-    private String cachedEv = "+0.0";
-    private boolean aelLocked = false;
+    // Local cached hardware states for Zero-GC, Zero-IPC HUD updates
+    private volatile String cachedShutter = "1/125";
+    private volatile String cachedAperture = "F2.8";
+    private volatile String cachedIso = "ISO 400";
+    private volatile String cachedEv = "+0.0";
+    private volatile boolean aelLocked = false;
     private int afModeIndex = 0; // 0: AF-S, 1: AF-C, 2: MF
     private static final String[] AF_MODES = {"AF-S", "AF-C", "MF"};
+
+    // Cached reflection lookups (eliminates per-call Class.forName + getMethod overhead)
+    private static volatile Class<?> sCachedModifierIface = null;
+    private static volatile boolean sModifierIfaceLookedUp = false;
+    private static final java.util.HashMap<String, Method> sModifierMethodCache = new java.util.HashMap<String, Method>();
 
     public SonyPmcaAdapter() {
         // Opened lazily; never during onCreate.
@@ -126,33 +131,60 @@ public class SonyPmcaAdapter implements CameraAdapter {
     private static Method findAccessibleMethod(Object target, String name, Class<?>... paramTypes) throws NoSuchMethodException {
         if (target == null) throw new NoSuchMethodException("Target is null for method " + name);
 
+        StringBuilder keySb = new StringBuilder(64);
+        keySb.append(target.getClass().getName()).append('#').append(name);
+        if (paramTypes != null) {
+            for (Class<?> pt : paramTypes) {
+                keySb.append(':').append(pt.getName());
+            }
+        }
+        String cacheKey = keySb.toString();
+        synchronized (sModifierMethodCache) {
+            Method cached = sModifierMethodCache.get(cacheKey);
+            if (cached != null) return cached;
+        }
+
+        if (!sModifierIfaceLookedUp) {
+            try {
+                sCachedModifierIface = Class.forName("com.sony.scalar.hardware.CameraEx$ParametersModifier");
+            } catch (Throwable ignored) {}
+            sModifierIfaceLookedUp = true;
+        }
+
         // 1. Try public interface first
+        Method resolved = null;
         try {
-            Class<?> iface = Class.forName("com.sony.scalar.hardware.CameraEx$ParametersModifier");
-            if (iface.isInstance(target)) {
-                Method m = iface.getMethod(name, paramTypes);
-                m.setAccessible(true);
-                return m;
+            Class<?> iface = sCachedModifierIface;
+            if (iface != null && iface.isInstance(target)) {
+                resolved = iface.getMethod(name, paramTypes);
+                resolved.setAccessible(true);
             }
         } catch (Throwable ignored) {}
 
         // 2. Fallback to implementation class hierarchy
-        Class<?> clazz = target.getClass();
-        while (clazz != null) {
-            try {
-                Method m = clazz.getDeclaredMethod(name, paramTypes);
-                m.setAccessible(true);
-                return m;
-            } catch (NoSuchMethodException e) {
+        if (resolved == null) {
+            Class<?> clazz = target.getClass();
+            while (clazz != null && resolved == null) {
                 try {
-                    Method m = clazz.getMethod(name, paramTypes);
-                    m.setAccessible(true);
-                    return m;
-                } catch (NoSuchMethodException ignored) {}
+                    resolved = clazz.getDeclaredMethod(name, paramTypes);
+                    resolved.setAccessible(true);
+                } catch (NoSuchMethodException e) {
+                    try {
+                        resolved = clazz.getMethod(name, paramTypes);
+                        resolved.setAccessible(true);
+                    } catch (NoSuchMethodException ignored) {}
+                }
+                clazz = clazz.getSuperclass();
             }
-            clazz = clazz.getSuperclass();
         }
-        throw new NoSuchMethodException(name);
+
+        if (resolved == null) {
+            throw new NoSuchMethodException(name);
+        }
+        synchronized (sModifierMethodCache) {
+            sModifierMethodCache.put(cacheKey, resolved);
+        }
+        return resolved;
     }
 
     private void initReflectionCache(Class<?> cls) {
@@ -180,7 +212,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 new java.lang.reflect.InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, Method method, Object[] args) {
-                        Log.i(TAG, "ShutterSpeedChangeListener triggered by BIONZ X");
+                        triggerAsyncTelemetryRefresh();
                         return null;
                     }
                 }
@@ -196,7 +228,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 new java.lang.reflect.InvocationHandler() {
                     @Override
                     public Object invoke(Object proxy, Method method, Object[] args) {
-                        Log.i(TAG, "ApertureChangeListener triggered by BIONZ X");
+                        triggerAsyncTelemetryRefresh();
                         return null;
                     }
                 }
@@ -305,8 +337,13 @@ public class SonyPmcaAdapter implements CameraAdapter {
     // ------------------------------------------------------------------------
 
     private Runnable hardwarePoller;
+    private Runnable onHardwareChangeCallback;
+    private android.os.HandlerThread pollerThread;
     private android.os.Handler pollerHandler;
-    private boolean isPolling = false;
+    private final android.os.Handler mainUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private volatile boolean isPolling = false;
+    private volatile boolean pollingPaused = false;
+    private static final long HARDWARE_POLL_INTERVAL_MS = 500L; // 2Hz background poll (down from 10Hz UI-thread storm)
 
     private byte[] previewBufferA;
     private byte[] previewBufferB;
@@ -351,55 +388,165 @@ public class SonyPmcaAdapter implements CameraAdapter {
         }
     }
 
-    public void startHardwarePoller(final Runnable onHardwareChange) {
-        if (isPolling) return;
-        if (pollerHandler == null) {
-            pollerHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private synchronized void ensureBackgroundHandler() {
+        if (pollerThread == null || !pollerThread.isAlive()) {
+            pollerThread = new android.os.HandlerThread(
+                "FujiLite-HwPoller", android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            pollerThread.start();
+            pollerHandler = new android.os.Handler(pollerThread.getLooper());
         }
+    }
+
+    /**
+     * Dispatches a hardware parameter update (e.g. setParameters) off the Main UI thread
+     * so Sony BIONZ X ISP reconfiguration never freezes UI input or live view.
+     */
+    public void postHardwareTask(Runnable task) {
+        if (task == null) return;
+        try {
+            ensureBackgroundHandler();
+            if (pollerHandler != null) {
+                pollerHandler.post(task);
+                return;
+            }
+        } catch (Throwable ignored) {}
+        task.run();
+    }
+
+    public void setPollingPaused(boolean paused) {
+        this.pollingPaused = paused;
+    }
+
+    private final Runnable immediateRefreshRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (pollingPaused) return;
+            if (refreshExposureTelemetry() && onHardwareChangeCallback != null) {
+                mainUiHandler.post(onHardwareChangeCallback);
+            }
+        }
+    };
+
+    public void triggerAsyncTelemetryRefresh() {
+        if (pollerHandler != null) {
+            pollerHandler.removeCallbacks(immediateRefreshRunnable);
+            pollerHandler.postDelayed(immediateRefreshRunnable, 60);
+        }
+    }
+
+    /**
+     * Refreshes Shutter Speed, Aperture, ISO, and EV from a SINGLE Camera.getParameters()
+     * Binder IPC snapshot on the background thread (replaces 3-6 separate UI-thread IPCs per tick).
+     */
+    public boolean refreshExposureTelemetry() {
+        Camera cam = normalCamera;
+        Object camEx = cameraEx;
+        if (cam == null) return false;
+
+        String prevS = cachedShutter;
+        String prevA = cachedAperture;
+        String prevI = cachedIso;
+        String prevE = cachedEv;
+
+        try {
+            Camera.Parameters params = cam.getParameters();
+            if (params == null) return false;
+
+            try {
+                int evIdx = params.getExposureCompensation();
+                float step = params.getExposureCompensationStep();
+                if (step > 0f) {
+                    float evVal = evIdx * step;
+                    cachedEv = (evVal >= 0 ? "+" : "") + String.format(java.util.Locale.US, "%.1f", evVal);
+                }
+            } catch (Throwable ignored) {}
+
+            Object modifier = (camEx != null) ? createModifier(params) : null;
+            if (modifier != null) {
+                // 1. Shutter Speed
+                try {
+                    Method m = findAccessibleMethod(modifier, "getShutterSpeed");
+                    Object cur = m.invoke(modifier);
+                    if (cur != null) {
+                        Class<?> pairCls = cur.getClass();
+                        int first = 0;
+                        int second = 0;
+                        try {
+                            first = ((Integer) pairCls.getField("first").get(cur)).intValue();
+                            second = ((Integer) pairCls.getField("second").get(cur)).intValue();
+                        } catch (Throwable t) {
+                            try {
+                                first = ((Integer) pairCls.getMethod("getFirst").invoke(cur)).intValue();
+                                second = ((Integer) pairCls.getMethod("getSecond").invoke(cur)).intValue();
+                            } catch (Throwable ignored) {}
+                        }
+                        if (first != 0 || second != 0) {
+                            cachedShutter = formatShutterSpeed(first, second);
+                        }
+                    }
+                } catch (Throwable ignored) {}
+
+                // 2. Aperture
+                try {
+                    Method m = findAccessibleMethod(modifier, "getAperture");
+                    Object cur = m.invoke(modifier);
+                    if (cur instanceof Integer) {
+                        int val = ((Integer) cur).intValue();
+                        cachedAperture = (val <= 0) ? "F--" : String.format(java.util.Locale.US, "F%.1f", val / 100.0f);
+                    }
+                } catch (Throwable ignored) {}
+
+                // 3. ISO Sensitivity (previously dead because getISOSensitivityMethod was never initialized)
+                try {
+                    Method m = findAccessibleMethod(modifier, "getISOSensitivity");
+                    Object cur = m.invoke(modifier);
+                    if (cur instanceof Integer) {
+                        int iso = ((Integer) cur).intValue();
+                        cachedIso = (iso == 0) ? "ISO AUTO" : "ISO " + iso;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {
+            return false;
+        }
+
+        return !cachedShutter.equals(prevS)
+            || !cachedAperture.equals(prevA)
+            || !cachedIso.equals(prevI)
+            || !cachedEv.equals(prevE);
+    }
+
+    public void startHardwarePoller(final Runnable onHardwareChange) {
+        this.onHardwareChangeCallback = onHardwareChange;
+        if (isPolling) return;
+        ensureBackgroundHandler();
 
         isPolling = true;
         hardwarePoller = new Runnable() {
-            private String lastShutter = "";
-            private String lastAperture = "";
-            private String lastIso = "";
-            private String lastEv = "";
-
             @Override
             public void run() {
                 if (!isPolling) return;
 
-                // Ignore hardware poller overwrites for 800ms after user manually turns the dial
-                if (System.currentTimeMillis() - lastManualIsoChangeTime < 800) {
-                    pollerHandler.postDelayed(this, 100);
-                    return;
-                }
-
-                String s = getShutterSpeed();
-                String a = getAperture();
-                String i = getIso();
-                String e = getEv();
-
-                if (!s.equals(lastShutter) || !a.equals(lastAperture) || !i.equals(lastIso) || !e.equals(lastEv)) {
-                    lastShutter = s;
-                    lastAperture = a;
-                    lastIso = i;
-                    lastEv = e;
-                    if (onHardwareChange != null) {
-                        onHardwareChange.run();
+                if (!pollingPaused && (System.currentTimeMillis() - lastManualIsoChangeTime >= 800)) {
+                    if (refreshExposureTelemetry() && onHardwareChangeCallback != null) {
+                        mainUiHandler.post(onHardwareChangeCallback);
                     }
                 }
 
-                pollerHandler.postDelayed(this, 100); // 10Hz polling
+                if (isPolling && pollerHandler != null) {
+                    pollerHandler.postDelayed(this, HARDWARE_POLL_INTERVAL_MS);
+                }
             }
         };
-        pollerHandler.post(hardwarePoller);
-        Log.i(TAG, "10Hz Hardware Exposure Poller started");
+        pollerHandler.postDelayed(hardwarePoller, 250L);
+        Log.i(TAG, "2Hz Background Hardware Exposure Poller started (off UI thread)");
     }
 
     public void stopHardwarePoller() {
         isPolling = false;
-        if (pollerHandler != null && hardwarePoller != null) {
-            pollerHandler.removeCallbacks(hardwarePoller);
+        if (pollerHandler != null) {
+            if (hardwarePoller != null) pollerHandler.removeCallbacks(hardwarePoller);
+            pollerHandler.removeCallbacks(immediateRefreshRunnable);
         }
     }
 
@@ -768,7 +915,24 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 targetIso = ISO_STEPS[currentIsoIndex];
             }
 
-            setHardwareIso(targetIso);
+            // Apply directly on the already-fetched params & modifier (saves 1 full getParameters() Binder IPC per dial click)
+            List<String> supportedModes = params.getSupportedSceneModes();
+            if (supportedModes != null && supportedModes.contains("manual-exposure")) {
+                params.setSceneMode("manual-exposure");
+            }
+            Method setIsoMethod = findAccessibleMethod(modifier, "setISOSensitivity", int.class);
+            setIsoMethod.invoke(modifier, targetIso);
+
+            Camera.Parameters toApply = params;
+            try {
+                Method getParams = findAccessibleMethod(modifier, "getParameters");
+                Object p = getParams.invoke(modifier);
+                if (p instanceof Camera.Parameters) toApply = (Camera.Parameters) p;
+            } catch (Throwable ignored) {}
+
+            normalCamera.setParameters(toApply);
+            lastManualIsoChangeTime = System.currentTimeMillis();
+            cachedIso = (targetIso == 0) ? "ISO AUTO" : "ISO " + targetIso;
         } catch (Throwable t) {
             Log.e(TAG, "stepIso failed", t);
         }
@@ -804,7 +968,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
             try {
                 Method m = cameraEx.getClass().getMethod("adjustShutterSpeed", int.class);
                 m.invoke(cameraEx, step);
-                getShutterSpeed();
+                triggerAsyncTelemetryRefresh();
                 return;
             } catch (Throwable t) {
                 Log.w(TAG, "cameraEx.adjustShutterSpeed failed", t);
@@ -842,31 +1006,8 @@ public class SonyPmcaAdapter implements CameraAdapter {
         cachedShutter = (step > 0) ? "1/250" : "1/60";
     }
 
+    /** Zero-IPC cached getter for UI HUD (populated by background poller / listeners). */
     public String getShutterSpeed() {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null) {
-                Method m = findAccessibleMethod(modifier, "getShutterSpeed");
-                Object cur = m.invoke(modifier);
-                if (cur != null) {
-                    Class<?> pairCls = cur.getClass();
-                    int first = 0;
-                    int second = 0;
-                    try {
-                        first = ((Integer) pairCls.getField("first").get(cur)).intValue();
-                        second = ((Integer) pairCls.getField("second").get(cur)).intValue();
-                    } catch (Throwable t) {
-                        try {
-                            first = ((Integer) pairCls.getMethod("getFirst").invoke(cur)).intValue();
-                            second = ((Integer) pairCls.getMethod("getSecond").invoke(cur)).intValue();
-                        } catch (Throwable ignored) {}
-                    }
-                    if (first != 0 || second != 0) {
-                        cachedShutter = formatShutterSpeed(first, second);
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
         return cachedShutter;
     }
 
@@ -884,7 +1025,7 @@ public class SonyPmcaAdapter implements CameraAdapter {
             try {
                 Method m = cameraEx.getClass().getMethod("adjustAperture", int.class);
                 m.invoke(cameraEx, step);
-                getAperture();
+                triggerAsyncTelemetryRefresh();
                 return;
             } catch (Throwable t) {
                 Log.w(TAG, "cameraEx.adjustAperture failed", t);
@@ -940,43 +1081,25 @@ public class SonyPmcaAdapter implements CameraAdapter {
         cachedAperture = (step > 0) ? "F4.0" : "F2.0";
     }
 
+    /** Zero-IPC cached getter for UI HUD (populated by background poller / listeners). */
     public String getAperture() {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null) {
-                Method m = findAccessibleMethod(modifier, "getAperture");
-                Object cur = m.invoke(modifier);
-                if (cur instanceof Integer) {
-                    int val = ((Integer) cur).intValue();
-                    cachedAperture = (val <= 0) ? "F--" : String.format(java.util.Locale.US, "F%.1f", val / 100.0f);
-                }
-            }
-        } catch (Throwable ignored) {}
         return cachedAperture;
     }
 
     public void setISOSensitivity(int iso) {
         try {
             Object modifier = getModifier();
-            if (modifier != null && setISOSensitivityMethod != null) {
-                setISOSensitivityMethod.invoke(modifier, iso);
+            if (modifier != null) {
+                Method setIso = findAccessibleMethod(modifier, "setISOSensitivity", int.class);
+                setIso.invoke(modifier, iso);
                 commitModifier(modifier);
                 cachedIso = (iso == 0) ? "ISO AUTO" : "ISO " + iso;
             }
         } catch (Throwable ignored) {}
     }
 
+    /** Zero-IPC cached getter for UI HUD (populated by background poller / listeners). */
     public String getIso() {
-        try {
-            Object modifier = getModifier();
-            if (modifier != null && getISOSensitivityMethod != null) {
-                Object cur = getISOSensitivityMethod.invoke(modifier);
-                if (cur instanceof Integer) {
-                    int iso = ((Integer) cur).intValue();
-                    cachedIso = (iso == 0) ? "ISO AUTO" : "ISO " + iso;
-                }
-            }
-        } catch (Throwable ignored) {}
         return cachedIso;
     }
 
@@ -1051,8 +1174,10 @@ public class SonyPmcaAdapter implements CameraAdapter {
 
     @Override
     public void release() {
+        stopHardwarePoller();
         if (normalCamera != null) {
             try {
+                normalCamera.setPreviewCallbackWithBuffer(null);
                 normalCamera.setPreviewCallback(null);
                 normalCamera.release();
             } catch (Throwable t) {
@@ -1062,6 +1187,17 @@ public class SonyPmcaAdapter implements CameraAdapter {
         }
         releaseCameraEx();
         activePath = "none";
+    }
+
+    public synchronized void shutdownPollerThread() {
+        stopHardwarePoller();
+        if (pollerThread != null) {
+            try {
+                pollerThread.quit();
+            } catch (Throwable ignored) {}
+            pollerThread = null;
+            pollerHandler = null;
+        }
     }
 
     @Override

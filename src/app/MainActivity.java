@@ -30,6 +30,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private FujiQMenuView qMenuView;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
+    private final java.util.concurrent.ExecutorService previewExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor(new java.util.concurrent.ThreadFactory() {
+            @Override
+            public Thread newThread(final Runnable r) {
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                        } catch (Throwable ignored) {}
+                        r.run();
+                    }
+                }, "FujiLite-LiveLUT");
+                t.setPriority(Thread.NORM_PRIORITY - 1);
+                return t;
+            }
+        });
+    private final java.util.concurrent.atomic.AtomicBoolean previewFrameBusy =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile long lastPreviewProcessTime = 0;
+    private static final long MIN_PREVIEW_INTERVAL_MS = 100L; // Cap software live-view LUT at <=10 FPS
+    private volatile int cachedPreviewWidth = 0;
+    private volatile int cachedPreviewHeight = 0;
+    private volatile boolean surfaceReady = false;
 
     private AppState appState;
     private UIController uiController;
@@ -172,22 +196,51 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @Override
             public void onToggleAel() {
                 if (cameraAdapter != null) {
-                    cameraAdapter.setAutoExposureLock(!cameraAdapter.isAutoExposureLock());
+                    final boolean targetLock = !cameraAdapter.isAutoExposureLock();
+                    cameraAdapter.postHardwareTask(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (cameraAdapter != null) {
+                                cameraAdapter.setAutoExposureLock(targetLock);
+                                ui.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (uiController != null) uiController.updateBottomHud();
+                                    }
+                                });
+                            }
+                        }
+                    });
                 }
-                uiController.updateBottomHud();
             }
 
             @Override
             public void onToggleAfMode() {
                 if (cameraAdapter != null) {
-                    cameraAdapter.toggleAfMode();
+                    cameraAdapter.postHardwareTask(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (cameraAdapter != null) {
+                                cameraAdapter.toggleAfMode();
+                                ui.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (uiController != null) uiController.updateBottomHud();
+                                    }
+                                });
+                            }
+                        }
+                    });
                 }
-                uiController.updateBottomHud();
             }
 
             @Override
             public void onToggleLiveViewLut() {
-                uiController.updateStatusAsync("LUT Preview Toggled");
+                boolean enabled = uiController.toggleLiveViewLut();
+                if (!enabled && qMenuView != null) {
+                    qMenuView.clearLiveViewBuffer();
+                }
+                uiController.updateStatusAsync(enabled ? "LUT Preview ON" : "LUT Preview OFF");
             }
 
             @Override
@@ -199,41 +252,64 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         return;
                     }
 
-                    // Attempt 1: Native Sony Scalar Review Intent
-                    try {
-                        java.io.File latest = StorageResolver.getLatestSavedPhoto();
-                        android.content.Intent reviewIntent = new android.content.Intent("com.sony.scalar.intent.action.REVIEW");
-                        if (latest != null) {
+                    // Offload SD card scan + JPEG decode off the Main UI Thread
+                    previewExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            final java.io.File latest = StorageResolver.getLatestSavedPhoto();
+                            if (latest == null || !latest.exists()) {
+                                if (uiController != null) {
+                                    uiController.updateStatusAsync("No photos found in DCIM");
+                                }
+                                return;
+                            }
+
+                            // Attempt 1: Native Sony Scalar Review Intent (dispatched on UI thread)
+                            final android.content.Intent reviewIntent = new android.content.Intent("com.sony.scalar.intent.action.REVIEW");
                             reviewIntent.setDataAndType(android.net.Uri.fromFile(latest), "image/jpeg");
-                        }
-                        startActivity(reviewIntent);
-                        return;
-                    } catch (Throwable t) {
-                        Log.d(TAG, "Native Sony review intent unavailable; using in-app review: " + t.getMessage());
-                    }
 
-                    // Attempt 2: Bulletproof In-App Quick Review
-                    java.io.File latest = StorageResolver.getLatestSavedPhoto();
-                    if (latest != null && latest.exists()) {
-                        Bitmap bmp = StorageResolver.loadPhotoForReview(latest, 640);
-                        if (bmp != null) {
-                            qMenuView.setQuickReviewBitmap(bmp, "REPLAY: " + latest.getName() + "\nPRESS PLAY / SHUTTER TO EXIT");
-                            return;
+                            // Pre-decode display-safe fallback bitmap off the UI thread
+                            final Bitmap bmp = StorageResolver.loadPhotoForReview(latest, 640);
+                            ui.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        startActivity(reviewIntent);
+                                        if (bmp != null && !bmp.isRecycled()) bmp.recycle();
+                                        return;
+                                    } catch (Throwable t) {
+                                        Log.d(TAG, "Native Sony review intent unavailable; using in-app review: " + t.getMessage());
+                                    }
+                                    if (bmp != null && qMenuView != null) {
+                                        qMenuView.setQuickReviewBitmap(bmp, "REPLAY: " + latest.getName() + "\nPRESS PLAY / SHUTTER TO EXIT");
+                                    } else if (uiController != null) {
+                                        uiController.updateStatusAsync("No photos found in DCIM");
+                                    }
+                                }
+                            });
                         }
-                    }
-
-                    if (uiController != null) {
-                        uiController.updateStatusAsync("No photos found in DCIM");
-                    }
+                    });
                 }
             }
 
             @Override
             public void onResetParameter() {
                 if (cameraAdapter != null) {
-                    cameraAdapter.incrementEV(0);
+                    cameraAdapter.postHardwareTask(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (cameraAdapter != null) {
+                                cameraAdapter.incrementEV(0);
+                                ui.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (uiController != null) uiController.updateBottomHud();
+                                    }
+                                });
+                            }
+                        }
+                    });
                 }
-                uiController.updateBottomHud();
             }
 
             @Override
@@ -260,30 +336,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         cameraPreview.getHolder().addCallback(this);
 
-        // Precompute initial 17x17x17 LUT
-        precomputeActiveLut();
+        // Precompute initial 17x17x17 LUT off the UI thread so startup never blocks
+        previewExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                precomputeActiveLut();
+            }
+        });
         uiController.updateBottomHud();
-        
-        // Start 10Hz Hardware Poller for Exposure Dials
-        if (cameraAdapter instanceof SonyPmcaAdapter) {
-            ((SonyPmcaAdapter) cameraAdapter).startHardwarePoller(new Runnable() {
-                @Override
-                public void run() {
-                    uiController.updateBottomHud();
-                }
-            });
-        }
     }
 
     private final Runnable applyHardwareParamsRunnable = new Runnable() {
         @Override
         public void run() {
             if (cameraAdapter != null) {
-                SonyToFujiHardwareMapper.applyRecipeToHardware(
-                    cameraAdapter.getCameraEx(),
-                    cameraAdapter.getNormalCamera(),
-                    appState.getActiveRecipe()
-                );
+                // Execute Camera.setParameters() off the Main UI thread to prevent BIONZ X ISP UI stalls
+                cameraAdapter.postHardwareTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (cameraAdapter != null && appState != null) {
+                            SonyToFujiHardwareMapper.applyRecipeToHardware(
+                                cameraAdapter.getCameraEx(),
+                                cameraAdapter.getNormalCamera(),
+                                appState.getActiveRecipe()
+                            );
+                        }
+                    }
+                });
             }
         }
     };
@@ -294,11 +373,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             qMenuView.showCarouselBanner(r.filmSim.label);
         }
 
-        // 1. Stage 1: Pre-compute 17x17x17 LUT (~2ms)
-        precomputeActiveLut();
+        // 1. Stage 1: Pre-compute 17x17x17 LUT off the Main UI thread (zero asset/SD I/O on UI thread)
+        previewExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                precomputeActiveLut();
+            }
+        });
         uiController.updateBottomHud();
 
-        // 2. Stage 2: Hardware mapping to Sony ISP (Debounced during Q-Menu interaction to prevent driver stalls)
+        // 2. Stage 2: Hardware mapping to Sony ISP (Debounced during Q-Menu interaction and executed off UI thread)
         ui.removeCallbacks(applyHardwareParamsRunnable);
         if (qMenuView != null && qMenuView.isQMenuOpen()) {
             ui.postDelayed(applyHardwareParamsRunnable, 300);
@@ -310,21 +394,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void precomputeActiveLut() {
         FujiRecipe r = appState.getActiveRecipe();
         byte[] baseLut = LutManager.getLutTable(this, r.filmSim.lutFile);
+        byte[] curve = r.generateToneCurve('R');
+        short[] ccm = r.computeCcmQ8();
         if (baseLut != null) {
-            ColorEngine.precomputeLut17WithBaseSafe(
-                baseLut,
-                r.computeCcmQ8(),
-                r.generateToneCurve('R'),
-                r.generateToneCurve('G'),
-                r.generateToneCurve('B')
-            );
+            ColorEngine.precomputeLut17WithBaseSafe(baseLut, ccm, curve, curve, curve);
         } else {
-            ColorEngine.precomputeLut17Safe(
-                r.computeCcmQ8(),
-                r.generateToneCurve('R'),
-                r.generateToneCurve('G'),
-                r.generateToneCurve('B')
-            );
+            ColorEngine.precomputeLut17Safe(ccm, curve, curve, curve);
         }
     }
 
@@ -438,49 +513,106 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private final android.hardware.Camera.PreviewCallback realtimePreviewCallback = new android.hardware.Camera.PreviewCallback() {
         @Override
-        public void onPreviewFrame(byte[] data, android.hardware.Camera camera) {
-            if (qMenuView != null && uiController != null && uiController.isLiveViewLutEnabled()) {
-                android.hardware.Camera.Size size = camera.getParameters().getPreviewSize();
-                if (size != null) {
-                    qMenuView.processLiveViewFrame(data, size.width, size.height, appState.getActiveRecipe().grainEffect.ordinal());
+        public void onPreviewFrame(final byte[] data, android.hardware.Camera camera) {
+            if (data == null) return;
+            final int w = cachedPreviewWidth;
+            final int h = cachedPreviewHeight;
+            long now = System.currentTimeMillis();
+
+            // Zero Binder IPC on preview frames; throttle <= 10 FPS & drop frames if busy/capturing/in menu
+            boolean shouldProcess = (w > 0 && h > 0)
+                && qMenuView != null
+                && uiController != null
+                && uiController.isLiveViewLutEnabled()
+                && !qMenuView.isQMenuOpen()
+                && !qMenuView.isReviewing()
+                && (appState == null || !appState.isProcessing())
+                && (now - lastPreviewProcessTime >= MIN_PREVIEW_INTERVAL_MS)
+                && previewFrameBusy.compareAndSet(false, true);
+
+            if (!shouldProcess) {
+                if (cameraAdapter instanceof SonyPmcaAdapter) {
+                    ((SonyPmcaAdapter) cameraAdapter).addCallbackBuffer(data);
                 }
+                return;
             }
-            if (cameraAdapter instanceof SonyPmcaAdapter) {
-                ((SonyPmcaAdapter) cameraAdapter).addCallbackBuffer(data);
+
+            lastPreviewProcessTime = now;
+            final int grainLevel = (appState != null) ? appState.getActiveRecipe().grainEffect.ordinal() : 0;
+
+            // Offload 3D LUT grading + Bitmap pixel copy completely off the Main UI Thread
+            try {
+                previewExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            if (qMenuView != null && !qMenuView.isQMenuOpen() && !qMenuView.isReviewing()) {
+                                qMenuView.processLiveViewFrame(data, w, h, grainLevel);
+                            }
+                        } finally {
+                            previewFrameBusy.set(false);
+                            if (cameraAdapter instanceof SonyPmcaAdapter) {
+                                ((SonyPmcaAdapter) cameraAdapter).addCallbackBuffer(data);
+                            }
+                        }
+                    }
+                });
+            } catch (Throwable t) {
+                previewFrameBusy.set(false);
+                if (cameraAdapter instanceof SonyPmcaAdapter) {
+                    ((SonyPmcaAdapter) cameraAdapter).addCallbackBuffer(data);
+                }
             }
         }
     };
 
+    private void attachRealtimePreviewCallback() {
+        if (cameraAdapter instanceof SonyPmcaAdapter) {
+            try {
+                android.hardware.Camera normalCam = cameraAdapter.getNormalCamera();
+                if (normalCam != null) {
+                    android.hardware.Camera.Size previewSize = normalCam.getParameters().getPreviewSize();
+                    if (previewSize != null) {
+                        cachedPreviewWidth = previewSize.width;
+                        cachedPreviewHeight = previewSize.height;
+                        ((SonyPmcaAdapter) cameraAdapter).setRealtimePreviewCallback(
+                            realtimePreviewCallback, previewSize.width, previewSize.height);
+                    }
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to initialize realtime preview callback", t);
+            }
+        }
+    }
+
+    private void startPollerIfReady() {
+        if (cameraAdapter instanceof SonyPmcaAdapter) {
+            ((SonyPmcaAdapter) cameraAdapter).startHardwarePoller(new Runnable() {
+                @Override
+                public void run() {
+                    if (uiController != null) uiController.updateBottomHud();
+                }
+            });
+        }
+    }
+
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         try {
+            surfaceReady = true;
             if (cameraAdapter == null) return;
             cameraAdapter.startPreview(holder);
 
-            SonyToFujiHardwareMapper.applyRecipeToHardware(
-                cameraAdapter.getCameraEx(),
-                cameraAdapter.getNormalCamera(),
-                appState.getActiveRecipe()
-            );
+            // Apply initial recipe parameters off the Main UI Thread
+            applyHardwareParamsRunnable.run();
 
             if (uiController != null) {
                 uiController.updateBottomHud();
             }
 
-            // Register Zero-GC Real-time Preview Callback
-            if (cameraAdapter instanceof SonyPmcaAdapter) {
-                try {
-                    android.hardware.Camera normalCam = cameraAdapter.getNormalCamera();
-                    if (normalCam != null) {
-                        android.hardware.Camera.Size previewSize = normalCam.getParameters().getPreviewSize();
-                        if (previewSize != null) {
-                            ((SonyPmcaAdapter) cameraAdapter).setRealtimePreviewCallback(realtimePreviewCallback, previewSize.width, previewSize.height);
-                        }
-                    }
-                } catch (Throwable t) {
-                    Log.e(TAG, "Failed to initialize realtime preview callback", t);
-                }
-            }
+            // Cache preview dimensions ONCE here (eliminates 30Hz camera.getParameters() IPC in onPreviewFrame)
+            attachRealtimePreviewCallback();
+            startPollerIfReady();
         } catch (Throwable t) {
             Log.e(TAG, "surfaceCreated failed", t);
         }
@@ -492,6 +624,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        surfaceReady = false;
+        cachedPreviewWidth = 0;
+        cachedPreviewHeight = 0;
         if (cameraAdapter != null) {
             cameraAdapter.release();
         }
@@ -501,8 +636,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onResume() {
         super.onResume();
         try {
-            if (cameraAdapter != null && cameraPreview != null) {
+            // Only restart preview when surface is already created (avoids cold-start double open & restores preview after Review Intent)
+            if (surfaceReady && cameraAdapter != null && cameraPreview != null) {
                 cameraAdapter.startPreview(cameraPreview.getHolder());
+                applyHardwareParamsRunnable.run();
+                attachRealtimePreviewCallback();
+                startPollerIfReady();
             }
         } catch (Throwable t) {
             Log.e(TAG, "onResume startPreview failed", t);
@@ -512,7 +651,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onPause() {
         super.onPause();
+        ui.removeCallbacks(applyHardwareParamsRunnable);
         if (cameraAdapter != null) {
+            cameraAdapter.stopHardwarePoller();
             cameraAdapter.release();
         }
     }
@@ -520,10 +661,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        ui.removeCallbacks(applyHardwareParamsRunnable);
+        previewExecutor.shutdownNow();
         if (captureController != null) {
             captureController.shutdown();
         }
         if (cameraAdapter != null) {
+            cameraAdapter.shutdownPollerThread();
             cameraAdapter.release();
             cameraAdapter = null;
         }

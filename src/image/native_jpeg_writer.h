@@ -37,6 +37,13 @@ int native_write_jpeg_rgb565(const char* filename, const uint16_t* rgb565, int w
 JpegStreamState* native_jpeg_stream_open(const char* filename, int width, int height, int quality);
 
 /**
+ * Opens a streaming JPEG writer session and embeds a raw EXIF APP1 segment inline in the header,
+ * eliminating the expensive post-write full-file ExifInterface.saveAttributes() rewrite on FAT32.
+ */
+JpegStreamState* native_jpeg_stream_open_with_exif(const char* filename, int width, int height, int quality,
+                                                   const uint8_t* exif_app1, size_t exif_len);
+
+/**
  * Encodes a strip of RGB565 rows into the active JPEG stream.
  *
  * @param state        Active stream session

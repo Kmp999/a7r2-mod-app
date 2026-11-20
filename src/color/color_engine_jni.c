@@ -1,5 +1,7 @@
 #include <jni.h>
 #include <android/log.h>
+#include <pthread.h>
+#include <stdlib.h>
 #include "color_engine.h"
 #include "lut_cube_17.h"
 #include "native_jpeg_writer.h"
@@ -9,6 +11,141 @@
 
 static ColorEngineContext g_ctx;
 static Lut17Context g_lut17;
+static pthread_rwlock_t g_lut_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+// Reusable native NV21 scratch buffer to eliminate GetPrimitiveArrayCritical Dalvik GC locks
+static uint8_t* g_nv21_scratch = NULL;
+static size_t g_nv21_scratch_cap = 0;
+static pthread_mutex_t g_nv21_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Serializes dispatch to the persistent dual-core strip worker
+static pthread_mutex_t g_strip_call_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Persistent dual-core strip grading worker (splits 64-row strips across both Cortex-A9 cores)
+typedef struct {
+    int is_argb;
+    void* pixels;
+    int width;
+    int height;
+    int row_offset;
+    int grain_strength;
+    int clarity_strength;
+    int has_job;
+    int done;
+    int started;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_start;
+    pthread_cond_t cond_done;
+} StripWorkerState;
+
+static StripWorkerState g_strip_worker = {
+    0, NULL, 0, 0, 0, 0, 0, 0, 0, 0,
+    (pthread_t)0,
+    PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
+    PTHREAD_COND_INITIALIZER
+};
+
+static void* strip_worker_loop(void* arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_strip_worker.mutex);
+        while (!g_strip_worker.has_job) {
+            pthread_cond_wait(&g_strip_worker.cond_start, &g_strip_worker.mutex);
+        }
+        int is_argb = g_strip_worker.is_argb;
+        void* pixels = g_strip_worker.pixels;
+        int w = g_strip_worker.width;
+        int h = g_strip_worker.height;
+        int row_off = g_strip_worker.row_offset;
+        int grain = g_strip_worker.grain_strength;
+        int clarity = g_strip_worker.clarity_strength;
+        g_strip_worker.has_job = 0;
+        pthread_mutex_unlock(&g_strip_worker.mutex);
+
+        if (is_argb) {
+            lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, w, h, row_off, grain, clarity);
+        } else {
+            lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, w, h, row_off, grain, clarity);
+        }
+
+        pthread_mutex_lock(&g_strip_worker.mutex);
+        g_strip_worker.done = 1;
+        pthread_cond_signal(&g_strip_worker.cond_done);
+        pthread_mutex_unlock(&g_strip_worker.mutex);
+    }
+    return NULL;
+}
+
+static void grade_strip_parallel(int is_argb, void* pixels, int width, int height,
+                                 int row_offset, int grain_strength, int clarity_strength) {
+    // Initialize static grain LUT before launching parallel readers (prevents race on first call)
+    init_static_grain_table();
+    pthread_rwlock_rdlock(&g_lut_rwlock);
+
+    if (height < 16) {
+        if (is_argb) {
+            lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
+        } else {
+            lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
+        }
+        pthread_rwlock_unlock(&g_lut_rwlock);
+        return;
+    }
+
+    int half = height >> 1;
+    int bottom_h = height - half;
+    void* bottom_ptr = is_argb
+        ? (void*)(((uint32_t*)pixels) + (size_t)half * width)
+        : (void*)(((uint16_t*)pixels) + (size_t)half * width);
+
+    pthread_mutex_lock(&g_strip_call_mutex);
+    pthread_mutex_lock(&g_strip_worker.mutex);
+    if (!g_strip_worker.started) {
+        if (pthread_create(&g_strip_worker.thread, NULL, strip_worker_loop, NULL) == 0) {
+            g_strip_worker.started = 1;
+        }
+    }
+    if (g_strip_worker.started) {
+        g_strip_worker.is_argb = is_argb;
+        g_strip_worker.pixels = bottom_ptr;
+        g_strip_worker.width = width;
+        g_strip_worker.height = bottom_h;
+        g_strip_worker.row_offset = row_offset + half;
+        g_strip_worker.grain_strength = grain_strength;
+        g_strip_worker.clarity_strength = clarity_strength;
+        g_strip_worker.done = 0;
+        g_strip_worker.has_job = 1;
+        pthread_cond_signal(&g_strip_worker.cond_start);
+        pthread_mutex_unlock(&g_strip_worker.mutex);
+
+        // Core 0 processes top half while Core 1 processes bottom half
+        if (is_argb) {
+            lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, half, row_offset, grain_strength, clarity_strength);
+        } else {
+            lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, half, row_offset, grain_strength, clarity_strength);
+        }
+
+        pthread_mutex_lock(&g_strip_worker.mutex);
+        while (!g_strip_worker.done) {
+            pthread_cond_wait(&g_strip_worker.cond_done, &g_strip_worker.mutex);
+        }
+        pthread_mutex_unlock(&g_strip_worker.mutex);
+        pthread_mutex_unlock(&g_strip_call_mutex);
+        pthread_rwlock_unlock(&g_lut_rwlock);
+        return;
+    }
+    pthread_mutex_unlock(&g_strip_worker.mutex);
+    pthread_mutex_unlock(&g_strip_call_mutex);
+
+    if (is_argb) {
+        lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
+    } else {
+        lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
+    }
+    pthread_rwlock_unlock(&g_lut_rwlock);
+}
 
 // 4x4 Bayer Ordered Dithering Matrix for RGB_565 banding reduction
 static const int8_t BAYER_4X4[4][4] = {
@@ -100,7 +237,9 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_precomputeLut17(JNIEnv
     (*env)->GetByteArrayRegion(env, toneCurveG, 0, 256, (jbyte*)g_curve);
     (*env)->GetByteArrayRegion(env, toneCurveB, 0, 256, (jbyte*)b_curve);
 
+    pthread_rwlock_wrlock(&g_lut_rwlock);
     lut17_precompute(&g_lut17, ccm, r_curve, g_curve, b_curve);
+    pthread_rwlock_unlock(&g_lut_rwlock);
     LOGI("17x17x17 3D LUT precomputed successfully");
 }
 
@@ -141,7 +280,9 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_precomputeLut17WithBas
         }
     }
 
+    pthread_rwlock_wrlock(&g_lut_rwlock);
     lut17_precompute_with_base(&g_lut17, base_ptr, ccm, r_curve, g_curve, b_curve);
+    pthread_rwlock_unlock(&g_lut_rwlock);
 
     if (base_ptr != NULL) {
         (*env)->ReleaseByteArrayElements(env, baseLutArray, (jbyte*)base_ptr, JNI_ABORT);
@@ -154,7 +295,9 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_loadLut17Table(JNIEnv 
     jsize len = (*env)->GetArrayLength(env, tableArray);
     if (len < (jsize)sizeof(g_lut17.table)) return;
 
+    pthread_rwlock_wrlock(&g_lut_rwlock);
     (*env)->GetByteArrayRegion(env, tableArray, 0, sizeof(g_lut17.table), (jbyte*)g_lut17.table);
+    pthread_rwlock_unlock(&g_lut_rwlock);
     LOGI("17x17x17 3D LUT direct table loaded (%zu bytes)", sizeof(g_lut17.table));
 }
 
@@ -165,14 +308,17 @@ JNIEXPORT void JNICALL Java_com_fujilite_a7r2_ColorEngine_applyLut17RGB565(JNIEn
         return;
     }
 
+    pthread_rwlock_rdlock(&g_lut_rwlock);
     jshort* buf_ptr = (*env)->GetPrimitiveArrayCritical(env, rgb565Array, 0);
     if (buf_ptr == NULL) {
+        pthread_rwlock_unlock(&g_lut_rwlock);
         LOGE("Failed to get critical array pointer for applyLut17RGB565");
         return;
     }
 
     lut17_process_rgb565(&g_lut17, (uint16_t*)buf_ptr, pixelCount);
     (*env)->ReleasePrimitiveArrayCritical(env, rgb565Array, buf_ptr, 0);
+    pthread_rwlock_unlock(&g_lut_rwlock);
 }
 
 /**
@@ -194,6 +340,7 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_applyLut17DirectRG
         return JNI_FALSE;
     }
 
+    pthread_rwlock_rdlock(&g_lut_rwlock);
     int x, y;
     for (y = 0; y < height; y++) {
         const int8_t* bayerRow = BAYER_4X4[y & 3];
@@ -204,12 +351,11 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_applyLut17DirectRG
             int idx = rowOffset + x;
             uint16_t px = buffer[idx];
 
-            // Extract 5-6-5 bits expanded to 8-bit
-            uint8_t r = (uint8_t)(((px >> 11) & 0x1F) * 255 / 31);
-            uint8_t g = (uint8_t)(((px >> 5) & 0x3F) * 255 / 63);
-            uint8_t b = (uint8_t)((px & 0x1F) * 255 / 31);
+            // Extract 5-6-5 bits expanded to 8-bit without integer divisions
+            uint8_t r, g, b;
+            unpack_rgb565_fast(px, &r, &g, &b);
 
-            // 17x17x17 3D LUT Trilinear Interpolation
+            // 17x17x17 3D LUT Interpolation
             uint8_t or_val, og_val, ob_val;
             lut17_interpolate_pixel(&g_lut17, r, g, b, &or_val, &og_val, &ob_val);
 
@@ -228,15 +374,14 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_applyLut17DirectRG
         }
     }
 
+    pthread_rwlock_unlock(&g_lut_rwlock);
     return JNI_TRUE;
 }
 
 /**
  * Fused Real-time Live View Kernel (NV21 to LUT RGB_565).
- * Processes NV21 preview frames, applies 17x17x17 3D LUT, and writes directly
- * to a pre-allocated RGB_565 DirectByteBuffer for Zero-GC rendering on Canvas.
- * Target: < 18ms per frame at 640x480.
- * Supports splitScreenMode: 0 = Full LUT, 1 = Split-Screen 50/50, 2 = Bypass.
+ * Uses GetByteArrayRegion into a reusable native scratch buffer (ZERO GetPrimitiveArrayCritical
+ * Dalvik GC lock!), processes 2 pixels per chroma fetch, and hoists mode branches out of inner loop.
  */
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradePreviewNV21(JNIEnv *env, jclass clazz,
                                                                                      jbyteArray nv21Array,
@@ -250,20 +395,40 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradePreview
 
     init_grain_lut();
 
-    jbyte* yuv = (*env)->GetPrimitiveArrayCritical(env, nv21Array, 0);
-    if (yuv == NULL) return JNI_FALSE;
-
     uint16_t* out_rgb = (uint16_t*)(*env)->GetDirectBufferAddress(env, rgb565Direct);
     if (out_rgb == NULL) {
-        (*env)->ReleasePrimitiveArrayCritical(env, nv21Array, yuv, 0);
         return JNI_FALSE;
     }
 
-    int frameSize = width * height;
-    const uint8_t* yPlane = (const uint8_t*)yuv;
-    const uint8_t* uvPlane = (const uint8_t*)(yuv + frameSize);
+    size_t frameSize = (size_t)width * (size_t)height;
+    size_t uvBytes = frameSize >> 1;
+    size_t nv21Bytes = frameSize + uvBytes;
+    if ((size_t)(*env)->GetArrayLength(env, nv21Array) < nv21Bytes) {
+        return JNI_FALSE;
+    }
+    if ((*env)->GetDirectBufferCapacity(env, rgb565Direct) < (jlong)(frameSize * 2)) {
+        return JNI_FALSE;
+    }
+
+    pthread_mutex_lock(&g_nv21_mutex);
+    if (g_nv21_scratch_cap < nv21Bytes) {
+        uint8_t* grown = (uint8_t*)realloc(g_nv21_scratch, nv21Bytes);
+        if (grown == NULL) {
+            pthread_mutex_unlock(&g_nv21_mutex);
+            return JNI_FALSE;
+        }
+        g_nv21_scratch = grown;
+        g_nv21_scratch_cap = nv21Bytes;
+    }
+
+    // Copy NV21 into native scratch without locking Dalvik GC (unlike GetPrimitiveArrayCritical)
+    (*env)->GetByteArrayRegion(env, nv21Array, 0, (jsize)nv21Bytes, (jbyte*)g_nv21_scratch);
+
+    const uint8_t* yPlane = g_nv21_scratch;
+    const uint8_t* uvPlane = g_nv21_scratch + frameSize;
     int midX = width >> 1;
 
+    pthread_rwlock_rdlock(&g_lut_rwlock);
     int x, y;
     for (y = 0; y < height; y++) {
         int uvOffset = (y >> 1) * width;
@@ -271,62 +436,66 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradePreview
         const int8_t* grainRow = g_grainLut[y & 63];
         int yOffset = y * width;
 
-        for (x = 0; x < width; x++) {
-            int yIndex = yOffset + x;
+        // Process 2 pixels horizontally per chroma pair (halves UV loads & chroma multiplies)
+        for (x = 0; x < width; x += 2) {
+            size_t uvIndex = (size_t)(uvOffset + x);
+            int V = (uvIndex < uvBytes) ? ((int)uvPlane[uvIndex] - 128) : 0;
+            int U = (uvIndex + 1 < uvBytes) ? ((int)uvPlane[uvIndex + 1] - 128) : 0;
+            int r_uv = 409 * V + 128;
+            int g_uv = -100 * U - 208 * V + 128;
+            int b_uv = 516 * U + 128;
 
-            // Split screen center divider line (Amber Gold #FFAA00 = 0xFDE0 in RGB_565)
-            if (splitScreenMode == 1 && (x == midX || x == midX - 1)) {
-                out_rgb[yIndex] = 0xFDE0;
-                continue;
-            }
+            int lim = (x + 1 < width) ? 2 : 1;
+            for (int k = 0; k < lim; k++) {
+                int cx = x + k;
+                int yIndex = yOffset + cx;
 
-            int uvIndex = uvOffset + (x & ~1);
-            int Y = yPlane[yIndex] - 16;
-            if (Y < 0) Y = 0;
-            int V = uvPlane[uvIndex] - 128;
-            int U = uvPlane[uvIndex + 1] - 128;
-
-            // Integer BT.601 YUV to RGB conversion
-            int r0 = (298 * Y + 409 * V + 128) >> 8;
-            int g0 = (298 * Y - 100 * U - 208 * V + 128) >> 8;
-            int b0 = (298 * Y + 516 * U + 128) >> 8;
-
-            uint8_t r = (uint8_t)(r0 < 0 ? 0 : (r0 > 255 ? 255 : r0));
-            uint8_t g = (uint8_t)(g0 < 0 ? 0 : (g0 > 255 ? 255 : g0));
-            uint8_t b = (uint8_t)(b0 < 0 ? 0 : (b0 > 255 ? 255 : b0));
-
-            // Determine whether to apply 3D LUT
-            // splitScreenMode: 0 = Full LUT, 1 = Split (right half gets LUT), 2 = Bypass (no LUT)
-            int applyLut = (splitScreenMode == 0) || (splitScreenMode == 1 && x > midX);
-
-            int dither = bayerRow[x & 3];
-            int dr, dg, db;
-
-            if (applyLut) {
-                uint8_t or_val, og_val, ob_val;
-                lut17_interpolate_pixel(&g_lut17, r, g, b, &or_val, &og_val, &ob_val);
-                if (grainLevel > 0) {
-                    dither += (grainRow[x & 63] * grainLevel);
+                if (splitScreenMode == 1 && (cx == midX || cx == midX - 1)) {
+                    out_rgb[yIndex] = 0xFDE0;
+                    continue;
                 }
-                dr = or_val + dither;
-                dg = og_val + (dither >> 1);
-                db = ob_val + dither;
-            } else {
-                dr = r + dither;
-                dg = g + (dither >> 1);
-                db = b + dither;
+
+                int Y = (int)yPlane[yIndex] - 16;
+                if (Y < 0) Y = 0;
+                int y298 = 298 * Y;
+
+                int r0 = (y298 + r_uv) >> 8;
+                int g0 = (y298 + g_uv) >> 8;
+                int b0 = (y298 + b_uv) >> 8;
+
+                uint8_t r = (uint8_t)(r0 < 0 ? 0 : (r0 > 255 ? 255 : r0));
+                uint8_t g = (uint8_t)(g0 < 0 ? 0 : (g0 > 255 ? 255 : g0));
+                uint8_t b = (uint8_t)(b0 < 0 ? 0 : (b0 > 255 ? 255 : b0));
+
+                int dither = bayerRow[cx & 3];
+                int dr, dg, db;
+
+                if (splitScreenMode == 0 || (splitScreenMode == 1 && cx > midX)) {
+                    uint8_t or_val, og_val, ob_val;
+                    lut17_interpolate_pixel(&g_lut17, r, g, b, &or_val, &og_val, &ob_val);
+                    if (grainLevel > 0) {
+                        dither += (grainRow[cx & 63] * grainLevel);
+                    }
+                    dr = or_val + dither;
+                    dg = og_val + (dither >> 1);
+                    db = ob_val + dither;
+                } else {
+                    dr = r + dither;
+                    dg = g + (dither >> 1);
+                    db = b + dither;
+                }
+
+                if (dr < 0) dr = 0; else if (dr > 255) dr = 255;
+                if (dg < 0) dg = 0; else if (dg > 255) dg = 255;
+                if (db < 0) db = 0; else if (db > 255) db = 255;
+
+                out_rgb[yIndex] = (uint16_t)(((dr >> 3) << 11) | ((dg >> 2) << 5) | (db >> 3));
             }
-
-            if (dr < 0) dr = 0; else if (dr > 255) dr = 255;
-            if (dg < 0) dg = 0; else if (dg > 255) dg = 255;
-            if (db < 0) db = 0; else if (db > 255) db = 255;
-
-            // Pack RGB_565
-            out_rgb[yIndex] = (uint16_t)(((dr >> 3) << 11) | ((dg >> 2) << 5) | (db >> 3));
         }
     }
 
-    (*env)->ReleasePrimitiveArrayCritical(env, nv21Array, yuv, 0);
+    pthread_rwlock_unlock(&g_lut_rwlock);
+    pthread_mutex_unlock(&g_nv21_mutex);
     return JNI_TRUE;
 }
 
@@ -351,8 +520,10 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
     if (cap >= (jlong)width * height * 4) {
         uint32_t* pixels = (uint32_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
         if (pixels == NULL) return JNI_FALSE;
+        pthread_rwlock_rdlock(&g_lut_rwlock);
         lut17_process_argb8888_advanced_offset(&g_lut17, pixels, (int)width, (int)height, 0,
                                                (int)grainStrength, (int)clarityStrength);
+        pthread_rwlock_unlock(&g_lut_rwlock);
         return JNI_TRUE;
     } else {
         uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
@@ -361,8 +532,10 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
             return JNI_FALSE;
         }
 
+        pthread_rwlock_rdlock(&g_lut_rwlock);
         lut17_process_rgb565_advanced(&g_lut17, pixels, (int)width, (int)height,
                                       (int)grainStrength, (int)clarityStrength);
+        pthread_rwlock_unlock(&g_lut_rwlock);
         return JNI_TRUE;
     }
 }
@@ -382,8 +555,10 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
     if (cap >= (jlong)width * height * 4) {
         uint32_t* pixels = (uint32_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
         if (pixels == NULL) return JNI_FALSE;
+        pthread_rwlock_rdlock(&g_lut_rwlock);
         lut17_process_argb8888_advanced_offset(&g_lut17, pixels, (int)width, (int)height, (int)rowOffset,
                                                (int)grainStrength, (int)clarityStrength);
+        pthread_rwlock_unlock(&g_lut_rwlock);
         return JNI_TRUE;
     } else {
         uint16_t* pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
@@ -392,8 +567,10 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLutAndG
             return JNI_FALSE;
         }
 
+        pthread_rwlock_rdlock(&g_lut_rwlock);
         lut17_process_rgb565_advanced_offset(&g_lut17, pixels, (int)width, (int)height, (int)rowOffset,
                                              (int)grainStrength, (int)clarityStrength);
+        pthread_rwlock_unlock(&g_lut_rwlock);
         return JNI_TRUE;
     }
 }
@@ -422,6 +599,49 @@ JNIEXPORT jlong JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeOpenJpegStream(
         return 0;
     }
 
+    return (jlong)(intptr_t)state;
+}
+
+/**
+ * Opens a streaming JPEG writer session embedding raw EXIF APP1 bytes inline in the header
+ * (eliminates post-write full-file ExifInterface rewrite on FAT32 SD cards).
+ */
+JNIEXPORT jlong JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeOpenJpegStreamWithExif(
+    JNIEnv *env, jclass clazz, jstring outputPath, jint width, jint height, jint quality, jbyteArray exifApp1) {
+    if (outputPath == NULL || width <= 0 || height <= 0) {
+        LOGE("nativeOpenJpegStreamWithExif: Invalid parameters");
+        return 0;
+    }
+
+    const char* path = (*env)->GetStringUTFChars(env, outputPath, NULL);
+    if (path == NULL) {
+        return 0;
+    }
+
+    uint8_t* exif_ptr = NULL;
+    size_t exif_len = 0;
+    if (exifApp1 != NULL) {
+        jsize len = (*env)->GetArrayLength(env, exifApp1);
+        if (len >= 4) {
+            exif_ptr = (uint8_t*)(*env)->GetByteArrayElements(env, exifApp1, NULL);
+            if (exif_ptr != NULL) {
+                exif_len = (size_t)len;
+            }
+        }
+    }
+
+    JpegStreamState* state = native_jpeg_stream_open_with_exif(
+        path, (int)width, (int)height, (int)quality, exif_ptr, exif_len);
+
+    if (exif_ptr != NULL) {
+        (*env)->ReleaseByteArrayElements(env, exifApp1, (jbyte*)exif_ptr, JNI_ABORT);
+    }
+    (*env)->ReleaseStringUTFChars(env, outputPath, path);
+
+    if (state == NULL) {
+        LOGE("nativeOpenJpegStreamWithExif: open failed");
+        return 0;
+    }
     return (jlong)(intptr_t)state;
 }
 
@@ -474,9 +694,9 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWrit
         uint32_t* argb_pixels = (uint32_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
         if (argb_pixels == NULL) return JNI_FALSE;
 
-        // 1. Grade ARGB_8888 strip with 8-bit precision (Zero posterization)
-        lut17_process_argb8888_advanced_offset(&g_lut17, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
-                                               (int)grainStrength, (int)clarityStrength);
+        // 1. Grade ARGB_8888 strip across both Cortex-A9 cores with 8-bit precision
+        grade_strip_parallel(1, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
+                             (int)grainStrength, (int)clarityStrength);
 
         // 2. Encode ARGB_8888 strip directly to JPEG stream
         ok = native_jpeg_stream_write_strip_argb8888(state, argb_pixels, (int)stripW, (int)stripH, (int)rowOffset);
@@ -484,9 +704,9 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWrit
         uint16_t* rgb_pixels = (uint16_t*)(*env)->GetDirectBufferAddress(env, directBuffer);
         if (rgb_pixels == NULL) return JNI_FALSE;
 
-        // 1. Grade RGB_565 strip in native memory with exact row-offset boundary continuity
-        lut17_process_rgb565_advanced_offset(&g_lut17, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
-                                             (int)grainStrength, (int)clarityStrength);
+        // 1. Grade RGB_565 strip across both Cortex-A9 cores with exact row-offset boundary continuity
+        grade_strip_parallel(0, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset,
+                             (int)grainStrength, (int)clarityStrength);
 
         // 2. Encode RGB_565 strip directly to JPEG stream
         ok = native_jpeg_stream_write_strip_rgb565(state, rgb_pixels, (int)stripW, (int)stripH, (int)rowOffset);

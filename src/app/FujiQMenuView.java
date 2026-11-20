@@ -71,9 +71,18 @@ public class FujiQMenuView extends View {
         postInvalidate();
     }
 
-    // Zero-GC Live View Canvas Buffer
+    // Double-buffered Zero-GC Live View Canvas Buffers (background thread writes back buffer, UI draws front)
+    private final Object liveViewSwapLock = new Object();
     private Bitmap liveViewBitmap = null;
+    private Bitmap liveViewBackBitmap = null;
     private java.nio.ByteBuffer liveViewDirectBuffer = null;
+
+    // Cached formatted strings (Zero-GC during onDraw)
+    private String hudEvDisplay = "+0.0 EV";
+    private String cachedGradingBadge = "";
+    private int cachedGradingCount = 0;
+    private String cachedLastKeyName = null;
+    private String cachedDebugKeyDisplay = "[NONE]";
 
     // Pre-allocated graphic objects (Zero GC during onDraw)
     private final Paint bgPaint = new Paint();
@@ -154,22 +163,41 @@ public class FujiQMenuView extends View {
     }
 
     public void processLiveViewFrame(byte[] nv21, int width, int height, int grainStrength) {
-        if (liveViewBitmap == null || liveViewBitmap.getWidth() != width || liveViewBitmap.getHeight() != height) {
-            liveViewBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
-            liveViewDirectBuffer = java.nio.ByteBuffer.allocateDirect(width * height * 2);
+        final Bitmap backBmp;
+        final java.nio.ByteBuffer directBuf;
+        synchronized (liveViewSwapLock) {
+            if (liveViewBackBitmap == null || liveViewDirectBuffer == null
+                || liveViewBackBitmap.getWidth() != width || liveViewBackBitmap.getHeight() != height) {
+                liveViewBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
+                liveViewBackBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
+                liveViewDirectBuffer = java.nio.ByteBuffer.allocateDirect(width * height * 2);
+            }
+            backBmp = liveViewBackBitmap;
+            directBuf = liveViewDirectBuffer;
         }
 
-        boolean success = ColorEngine.gradePreviewNV21Safe(nv21, liveViewDirectBuffer, width, height, splitScreenMode, grainStrength);
+        // Run JNI 3D LUT + pixel upload into the BACK buffer completely off the UI thread (zero lock contention)
+        boolean success = ColorEngine.gradePreviewNV21Safe(nv21, directBuf, width, height, splitScreenMode, grainStrength);
         if (success) {
-            liveViewDirectBuffer.rewind();
-            liveViewBitmap.copyPixelsFromBuffer(liveViewDirectBuffer);
+            directBuf.rewind();
+            backBmp.copyPixelsFromBuffer(directBuf);
+            synchronized (liveViewSwapLock) {
+                if (liveViewBackBitmap == backBmp) {
+                    Bitmap tmp = liveViewBitmap;
+                    liveViewBitmap = liveViewBackBitmap;
+                    liveViewBackBitmap = tmp;
+                }
+            }
             postInvalidate();
         }
     }
 
     public void clearLiveViewBuffer() {
-        liveViewBitmap = null;
-        liveViewDirectBuffer = null;
+        synchronized (liveViewSwapLock) {
+            liveViewBitmap = null;
+            liveViewBackBitmap = null;
+            liveViewDirectBuffer = null;
+        }
         postInvalidate();
     }
 
@@ -235,6 +263,7 @@ public class FujiQMenuView extends View {
         this.hudAperture = aperture;
         this.hudIso = iso;
         this.hudEv = ev;
+        this.hudEvDisplay = ev + " EV";
         this.hudAel = ael;
         this.hudAf = afMode;
         postInvalidate();
@@ -287,6 +316,12 @@ public class FujiQMenuView extends View {
         hudGradingBadgePaint.setTextSize(13f);
         hudGradingBadgePaint.setColor(COLOR_AMBER_GOLD);
         hudGradingBadgePaint.setTextAlign(Paint.Align.RIGHT);
+
+        bannerPaint.setColor(0xDD000000);
+        bannerTextPaint.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+        bannerTextPaint.setTextSize(18f);
+        bannerTextPaint.setColor(COLOR_AMBER_GOLD);
+        bannerTextPaint.setTextAlign(Paint.Align.CENTER);
 
         // 16 Fujifilm Q-Menu items
         itemTitles[0]  = "BASE FILM";
@@ -430,9 +465,11 @@ public class FujiQMenuView extends View {
             // ----------------------------------------------------------------
             // Mode 3: Live View Viewfinder (Real-Time LUT Canvas Display)
             // ----------------------------------------------------------------
-            if (liveViewBitmap != null) {
-                dstRect.set(0, 0, w, h);
-                canvas.drawBitmap(liveViewBitmap, null, dstRect, null);
+            synchronized (liveViewSwapLock) {
+                if (liveViewBitmap != null && !liveViewBitmap.isRecycled()) {
+                    dstRect.set(0, 0, w, h);
+                    canvas.drawBitmap(liveViewBitmap, null, dstRect, null);
+                }
             }
 
             // Top Bar
@@ -447,12 +484,21 @@ public class FujiQMenuView extends View {
             }
 
             if (SonyKeyCodes.sDebugKeyLoggingEnabled) {
-                canvas.drawText("[" + SonyKeyCodes.sLastKeyName + "]", w - 16, 20, debugPaint);
+                String lastKey = SonyKeyCodes.sLastKeyName;
+                if (lastKey != cachedLastKeyName) {
+                    cachedLastKeyName = lastKey;
+                    cachedDebugKeyDisplay = "[" + lastKey + "]";
+                }
+                canvas.drawText(cachedDebugKeyDisplay, w - 16, 20, debugPaint);
             }
 
-            // Live HUD Queue Counter
+            // Live HUD Queue Counter (cached string, Zero-GC in onDraw)
             if (pendingGradingCount > 0) {
-                canvas.drawText("[GRADING: " + pendingGradingCount + "]", w - 16, 38, hudGradingBadgePaint);
+                if (pendingGradingCount != cachedGradingCount) {
+                    cachedGradingCount = pendingGradingCount;
+                    cachedGradingBadge = "[GRADING: " + pendingGradingCount + "]";
+                }
+                canvas.drawText(cachedGradingBadge, w - 16, 38, hudGradingBadgePaint);
             }
         }
 
@@ -463,14 +509,7 @@ public class FujiQMenuView extends View {
             float bannerTop = (h / 2f) - 22f;
             float bannerBottom = (h / 2f) + 22f;
 
-            bannerPaint.setColor(0xDD000000);
             canvas.drawRect(0, bannerTop, w, bannerBottom, bannerPaint);
-
-            bannerTextPaint.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
-            bannerTextPaint.setTextSize(18f);
-            bannerTextPaint.setColor(COLOR_AMBER_GOLD);
-            bannerTextPaint.setTextAlign(Paint.Align.CENTER);
-            
             canvas.drawText("[ " + carouselBanner + " ]", w / 2f, bannerTop + 28f, bannerTextPaint);
         }
 
@@ -511,8 +550,8 @@ public class FujiQMenuView extends View {
 
         // 4. EV (Segment 4)
         hudPaint.setColor((isHighlighted && highlightedSegment == 4) ? COLOR_AMBER_GOLD : 0xFFFFFFFF);
-        canvas.drawText(hudEv + " EV", xPos, h - 9, hudPaint);
-        xPos += hudPaint.measureText(hudEv + " EV") + 10f;
+        canvas.drawText(hudEvDisplay, xPos, h - 9, hudPaint);
+        xPos += hudPaint.measureText(hudEvDisplay) + 10f;
 
         hudPaint.setColor(COLOR_TEXT_LABEL);
         canvas.drawText("|", xPos, h - 9, hudPaint);

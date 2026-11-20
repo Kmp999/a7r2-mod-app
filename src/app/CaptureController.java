@@ -69,26 +69,48 @@ public class CaptureController {
         this.watchdogHandler = new Handler(Looper.getMainLooper());
         this.processingExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
             @Override
-            public Thread newThread(Runnable r) {
-                Thread t = new Thread(r, "FujiLite-Grading");
-                t.setPriority(Thread.NORM_PRIORITY + 1); // High priority for grading
+            public Thread newThread(final Runnable r) {
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                        } catch (Throwable ignored) {}
+                        r.run();
+                    }
+                }, "FujiLite-Grading");
+                t.setPriority(Thread.NORM_PRIORITY - 1); // Lower than UI thread so dials/shutter never starve
                 return t;
             }
         });
         this.ioExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
             @Override
-            public Thread newThread(Runnable r) {
-                Thread t = new Thread(r, "FujiLite-SD-IO");
-                t.setPriority(Thread.NORM_PRIORITY);
+            public Thread newThread(final Runnable r) {
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                        } catch (Throwable ignored) {}
+                        r.run();
+                    }
+                }, "FujiLite-SD-IO");
+                t.setPriority(Thread.NORM_PRIORITY - 1);
                 return t;
             }
         });
 
-        // Enhancement 3: Startup sweep for leftover .tmp files from previous hard power-offs
+        // Startup sweep + pre-warm DCIM cache, sequence counter & known photo snapshot OFF the UI thread
         this.ioExecutor.execute(new Runnable() {
             @Override
             public void run() {
                 StorageResolver.cleanupOrphanedTempFiles();
+                StorageResolver.prewarmDirectoryAndSequence();
+                java.util.Set<String> initialPhotos = StorageResolver.snapshotExistingPhotos();
+                synchronized (knownPhotoPaths) {
+                    knownPhotoPaths.addAll(initialPhotos);
+                    knownPhotoPathsInitialized = true;
+                }
             }
         });
 
@@ -97,12 +119,23 @@ public class CaptureController {
             ((SonyPmcaAdapter) cameraAdapter).setStoreImageListener(new SonyPmcaAdapter.StoreImageListener() {
                 @Override
                 public void onImageStored(String dir, String filename) {
+                    if (dir == null || filename == null) return;
+                    storeImageListenerSeen = true;
                     final File rawFile = new File(dir, filename);
-                    final String absPath = rawFile.getAbsolutePath();
-                    if (processedPhotoPaths.contains(absPath)) {
+                    recordKnownPhoto(rawFile);
+
+                    // If triggerSingleCapture workers are waiting for shots, enqueue FIFO handoff (ZERO duplicate grading!)
+                    synchronized (hardwareStoreLock) {
+                        if (waitingPollerJobs > 0) {
+                            pendingHardwareStoredQueue.addLast(rawFile);
+                            hardwareStoreLock.notifyAll();
+                            return;
+                        }
+                    }
+
+                    if (!claimPhotoForProcessing(rawFile)) {
                         return;
                     }
-                    processedPhotoPaths.add(absPath);
                     final int seqNum = StorageResolver.parseSequenceNumber(filename);
                     if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
                         Log.w(TAG, "Grading queue full on hardware store; skipping background grading.");
@@ -127,7 +160,45 @@ public class CaptureController {
     public static final int MAX_PENDING_JOBS = 8;
     private final java.util.concurrent.atomic.AtomicInteger pendingJobsCount = new java.util.concurrent.atomic.AtomicInteger(0);
     private final java.util.Set<String> processedPhotoPaths = java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    private final java.util.Set<String> knownPhotoPaths = new java.util.HashSet<String>();
+    private volatile boolean knownPhotoPathsInitialized = false;
+    private final Object hardwareStoreLock = new Object();
+    private final java.util.LinkedList<File> pendingHardwareStoredQueue = new java.util.LinkedList<File>();
+    private int waitingPollerJobs = 0;
+    private volatile boolean storeImageListenerSeen = false;
     private volatile boolean isShuttingDown = false;
+
+    private static String dedupKeyForFile(File f) {
+        if (f == null) return "";
+        File parent = f.getParentFile();
+        String folder = (parent != null) ? parent.getName().toUpperCase(Locale.US) : "";
+        return folder + "/" + f.getName().toUpperCase(Locale.US);
+    }
+
+    private boolean claimPhotoForProcessing(File f) {
+        if (f == null) return false;
+        String key = dedupKeyForFile(f);
+        synchronized (processedPhotoPaths) {
+            if (processedPhotoPaths.contains(key)) {
+                return false;
+            }
+            processedPhotoPaths.add(key);
+            return true;
+        }
+    }
+
+    private void recordKnownPhoto(File f) {
+        if (f == null) return;
+        synchronized (knownPhotoPaths) {
+            knownPhotoPaths.add(f.getAbsolutePath());
+        }
+    }
+
+    private java.util.Set<String> copyKnownPhotoPathsNonBlocking() {
+        synchronized (knownPhotoPaths) {
+            return new java.util.HashSet<String>(knownPhotoPaths);
+        }
+    }
 
     public int getPendingJobsCount() {
         return pendingJobsCount.get();
@@ -165,6 +236,9 @@ public class CaptureController {
                 setState(CameraState.IDLE_PREVIEW);
                 isCapturing.set(false);
                 appState.setProcessing(false);
+                if (cameraAdapter instanceof SonyPmcaAdapter) {
+                    ((SonyPmcaAdapter) cameraAdapter).setPollingPaused(false);
+                }
                 restorePreviewWithWatchdog(3);
                 uiController.updateStatusAsync("Ready");
             }
@@ -183,6 +257,7 @@ public class CaptureController {
      *  4. Dispatches 3D LUT grading + Native Edge-Directed Upscaling to 10.6 MP (3984 x 2656) on processingExecutor.
      */
     public boolean triggerSingleCapture() {
+        if (isShuttingDown) return false;
         long now = System.currentTimeMillis();
         if (now - lastCaptureTime > MIN_SHOT_INTERVAL_MS) {
             isCapturing.set(false);
@@ -210,8 +285,18 @@ public class CaptureController {
 
         try {
             if (cameraAdapter instanceof SonyPmcaAdapter) {
-                // Snapshot all existing photos on the SD card BEFORE tripping the shutter!
-                final java.util.Set<String> preExistingFiles = StorageResolver.snapshotExistingPhotos();
+                final SonyPmcaAdapter sonyAdapter = (SonyPmcaAdapter) cameraAdapter;
+                // Pause background exposure polling so Binder IPC never collides with shutter release
+                sonyAdapter.setPollingPaused(true);
+
+                // Zero-I/O in-memory photo snapshot (pre-warmed off UI thread) -> 0ms shutter lag!
+                final boolean hadInitialSnapshot = knownPhotoPathsInitialized;
+                final java.util.Set<String> preExistingFiles = copyKnownPhotoPathsNonBlocking();
+                boolean countedWaitingJob = false;
+                synchronized (hardwareStoreLock) {
+                    waitingPollerJobs++;
+                    countedWaitingJob = true;
+                }
 
                 // SONY HARDWARE CAPTURE: Trip BIONZ X with (shutter, null, null) to bypass 1.7MP HAL proxy!
                 // BIONZ X writes the full 42.4MP (7952 x 5304) DSC0xxxx.JPG directly to the SD card.
@@ -231,20 +316,27 @@ public class CaptureController {
                                     } catch (Throwable t) {
                                         Log.w(TAG, "Delayed preview restore failed", t);
                                     } finally {
+                                        sonyAdapter.setPollingPaused(false);
                                         isCapturing.set(false);
                                     }
                                 }
                             }, 250);
                         } catch (Throwable t) {
                             Log.e(TAG, "onShutter preview restore error", t);
+                            sonyAdapter.setPollingPaused(false);
                             isCapturing.set(false);
                         }
                     }
                 };
-                ((SonyPmcaAdapter) cameraAdapter).takeHardwarePicture(shutterCb);
+                sonyAdapter.takeHardwarePicture(shutterCb);
 
                 final int seqNum = StorageResolver.allocateNextSequenceNumber();
                 if (pendingJobsCount.get() >= MAX_PENDING_JOBS) {
+                    if (countedWaitingJob) {
+                        synchronized (hardwareStoreLock) {
+                            if (waitingPollerJobs > 0) waitingPollerJobs--;
+                        }
+                    }
                     Log.w(TAG, "Grading queue full (" + pendingJobsCount.get() + " >= " + MAX_PENDING_JOBS + "). Saving master DSC0xxxx.JPG only; skipping background strip grading.");
                     if (uiController != null) {
                         uiController.updateStatusAsync("SD BUSY: " + pendingJobsCount.get() + " queued");
@@ -258,13 +350,43 @@ public class CaptureController {
                     public void run() {
                         boolean jobStarted = false;
                         try {
-                            // Watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
-                            File newPhoto = StorageResolver.waitForNewCameraPhoto(preExistingFiles, 7000);
+                            File newPhoto = null;
+                            // 1. Check FIFO instant handoff from StoreImageCompleteListener (zero SD polling!)
+                            synchronized (hardwareStoreLock) {
+                                if (!pendingHardwareStoredQueue.isEmpty()) {
+                                    newPhoto = pendingHardwareStoredQueue.pollFirst();
+                                } else if (storeImageListenerSeen && !isShuttingDown) {
+                                    try {
+                                        hardwareStoreLock.wait(2000);
+                                    } catch (InterruptedException ignored) {}
+                                    if (!pendingHardwareStoredQueue.isEmpty()) {
+                                        newPhoto = pendingHardwareStoredQueue.pollFirst();
+                                    }
+                                }
+                                if (waitingPollerJobs > 0) waitingPollerJobs--;
+                            }
+
+                            // 2. Fallback: watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
+                            if (newPhoto == null) {
+                                if (hadInitialSnapshot) {
+                                    newPhoto = StorageResolver.waitForNewCameraPhoto(preExistingFiles, 7000);
+                                } else {
+                                    // Cold-start guard: filter by capture timestamp when startup snapshot wasn't ready
+                                    newPhoto = StorageResolver.waitForNewCameraPhoto(captureStartTime, 7000);
+                                }
+                            }
                             if (newPhoto == null) {
                                 newPhoto = StorageResolver.getLatestCameraPhoto();
                             }
                             if (newPhoto == null) {
                                 newPhoto = StorageResolver.getLatestSavedPhoto();
+                            }
+                            if (newPhoto != null) {
+                                recordKnownPhoto(newPhoto);
+                                if (!claimPhotoForProcessing(newPhoto)) {
+                                    Log.d(TAG, "Skipping already-graded photo: " + newPhoto.getName());
+                                    return;
+                                }
                             }
                             String photoPath = (newPhoto != null) ? newPhoto.getAbsolutePath() : null;
                             int actualSeq = (photoPath != null) ? StorageResolver.parseSequenceNumber(photoPath) : seqNum;
@@ -275,7 +397,8 @@ public class CaptureController {
                                 processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
                             } else {
                                 File master = StorageResolver.findRawMasterFile(seqNum);
-                                if (master != null) {
+                                if (master != null && claimPhotoForProcessing(master)) {
+                                    recordKnownPhoto(master);
                                     jobStarted = true;
                                     processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
                                 } else {
@@ -286,9 +409,12 @@ public class CaptureController {
                         } finally {
                             if (!jobStarted) {
                                 int rem = pendingJobsCount.decrementAndGet();
-                                if (rem < 0) pendingJobsCount.set(0);
+                                if (rem < 0) {
+                                    pendingJobsCount.set(0);
+                                    rem = 0;
+                                }
                                 updateQueueHud();
-                                appState.setProcessing(false);
+                                appState.setProcessing(rem > 0);
                             }
                         }
                     }
@@ -354,6 +480,12 @@ public class CaptureController {
         } catch (Throwable t) {
             watchdogHandler.removeCallbacks(captureWatchdogRunnable);
             Log.e(TAG, "takePicture failed", t);
+            if (cameraAdapter instanceof SonyPmcaAdapter) {
+                ((SonyPmcaAdapter) cameraAdapter).setPollingPaused(false);
+            }
+            synchronized (hardwareStoreLock) {
+                if (waitingPollerJobs > 0) waitingPollerJobs--;
+            }
             restorePreviewWithWatchdog(3);
             isCapturing.set(false);
             setState(CameraState.IDLE_PREVIEW);
@@ -476,7 +608,7 @@ public class CaptureController {
             // Step 1: Mode Selection (FAST_10MP vs MASTER_42MP)
             final AppState.OutputResolutionMode resMode = (appState != null)
                 ? appState.getOutputResolutionMode()
-                : AppState.OutputResolutionMode.MASTER_42MP;
+                : AppState.OutputResolutionMode.FAST_10MP;
 
             int targetSample = (srcW >= 7000) ? 2 : 1;
             int srcStripH = 128;
@@ -529,6 +661,7 @@ public class CaptureController {
 
             // 5. Check Pure Native C Zero-JNI-Copy Fast-Path
             boolean streamSuccess = false;
+            boolean inlineExifWritten = false;
             if (ColorEngine.isNativeAvailable() && ColorEngine.nativeProcessImageStreamFastSafe(rawJpegPath, tmpFile.getAbsolutePath(), grainStrength, clarityStrength)) {
                 streamSuccess = true;
                 if (decoder != null) {
@@ -536,8 +669,16 @@ public class CaptureController {
                     decoder = null;
                 }
             } else {
-                // Fallback: Java BitmapRegionDecoder strip-streaming loop
-                long streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), dstW, dstH, 95);
+                // Extract raw EXIF APP1 header (~1ms) to embed inline during single-pass JPEG encode
+                // (eliminates 15-25MB ExifInterface.saveAttributes() full-file rewrite on FAT32!)
+                byte[] inlineExifApp1 = StorageResolver.extractExifApp1Segment(rawJpegPath);
+                long streamHandle;
+                if (inlineExifApp1 != null && inlineExifApp1.length >= 4) {
+                    streamHandle = ColorEngine.openJpegStreamWithExifSafe(tmpFile.getAbsolutePath(), dstW, dstH, 92, inlineExifApp1);
+                    inlineExifWritten = (streamHandle != 0);
+                } else {
+                    streamHandle = ColorEngine.openJpegStreamSafe(tmpFile.getAbsolutePath(), dstW, dstH, 92);
+                }
                 if (streamHandle == 0) {
                     Log.w(TAG, "Native stream unavailable, falling back to downsampled bitmap grading (10.6MP)");
                     BitmapFactory.Options fallbackOpts = new BitmapFactory.Options();
@@ -653,6 +794,8 @@ public class CaptureController {
                             } catch (OutOfMemoryError oom) {
                                 Log.w(TAG, "OOM decoding strip in ARGB_8888, falling back to RGB_565", oom);
                                 opts.inPreferredConfig = Bitmap.Config.RGB_565;
+                                // Resize direct buffer so native JNI accurately detects RGB_565 (2 bytes/px)
+                                stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2);
                                 stripBmp = decoder.decodeRegion(rect, opts);
                             }
                             if (stripBmp == null) {
@@ -713,15 +856,23 @@ public class CaptureController {
                 }
                 gradedSavedPath = targetOutputFile.getAbsolutePath();
 
-                // 8. Copy original camera EXIF metadata from DSC0xxxx.JPG to fuji_xxxx.jpg with dynamic dims & DR mode stamp
-                if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
-                    StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
-                } else {
-                    StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
+                // 8. Copy original camera EXIF metadata ONLY if inline single-pass APP1 wasn't already embedded
+                if (!inlineExifWritten) {
+                    if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
+                        StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
+                    } else {
+                        StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
+                    }
                 }
 
-                // 9. Register with Sony AvindexStore
-                StorageResolver.registerWithAvindex(context, gradedSavedPath);
+                // 9. Register with Sony AvindexStore asynchronously off the grading worker
+                final String avindexPath = gradedSavedPath;
+                ioExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        StorageResolver.registerWithAvindex(context, avindexPath);
+                    }
+                });
             } else {
                 if (tmpFile.exists()) {
                     tmpFile.delete();
@@ -737,14 +888,19 @@ public class CaptureController {
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
-            // 10. Load display-safe review bitmap (<= 960x640) for UI display
+            // 10. Load display-safe review bitmap (<= 960x640) for UI display (single delivery; prevents recycled-bitmap hazard)
             Bitmap reviewBmp = null;
             if (targetOutputFile.exists()) {
                 reviewBmp = StorageResolver.loadPhotoForReview(targetOutputFile, 960);
             }
             if (reviewBmp != null) {
-                if (uiController != null) uiController.showQuickReview(reviewBmp);
-                deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, gradedSavedPath);
+                if (resultListener != null) {
+                    deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, gradedSavedPath);
+                } else if (uiController != null) {
+                    uiController.showQuickReview(reviewBmp);
+                } else if (!reviewBmp.isRecycled()) {
+                    reviewBmp.recycle();
+                }
             }
 
         } catch (Throwable t) {
@@ -753,11 +909,13 @@ public class CaptureController {
                 uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             }
         } finally {
-            appState.setProcessing(false);
             int remaining = pendingJobsCount.decrementAndGet();
-            if (remaining < 0) pendingJobsCount.set(0);
+            if (remaining < 0) {
+                pendingJobsCount.set(0);
+                remaining = 0;
+            }
+            appState.setProcessing(remaining > 0);
             updateQueueHud();
-            System.gc();
         }
     }
 
@@ -880,6 +1038,11 @@ public class CaptureController {
 
     public void shutdown() {
         isShuttingDown = true;
+        synchronized (hardwareStoreLock) {
+            waitingPollerJobs = 0;
+            pendingHardwareStoredQueue.clear();
+            hardwareStoreLock.notifyAll();
+        }
         watchdogHandler.removeCallbacks(captureWatchdogRunnable);
         processingExecutor.shutdown();
         ioExecutor.shutdown();

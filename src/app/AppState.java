@@ -36,7 +36,9 @@ public class AppState {
 
     private FujiRecipe activeRecipe = new FujiRecipe();
     private Mode currentMode = Mode.JPEG_PROXY;
-    private OutputResolutionMode outputResolutionMode = OutputResolutionMode.MASTER_42MP;
+    // Default to FAST_10MP (4x fewer pixels than 42.4MP) for responsive A7R II turnaround;
+    // MASTER_42MP remains selectable via Q-Menu Item 15 (OUT RES).
+    private OutputResolutionMode outputResolutionMode = OutputResolutionMode.FAST_10MP;
     private boolean isProcessing = false;
     private long lastProcessingTimeMs = 0;
     private String lastErrorMessage = "";

@@ -72,9 +72,14 @@ public class UIController {
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
 
-    private boolean liveViewLutEnabled = true;
+    private volatile boolean liveViewLutEnabled = true;
 
     public boolean isLiveViewLutEnabled() {
+        return liveViewLutEnabled;
+    }
+
+    public boolean toggleLiveViewLut() {
+        liveViewLutEnabled = !liveViewLutEnabled;
         return liveViewLutEnabled;
     }
 
@@ -308,57 +313,99 @@ public class UIController {
             }
 
             case FRONT_DIAL_CW:
-                if (cameraAdapter != null) cameraAdapter.adjustAperture(1);
+                dispatchDialTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (cameraAdapter != null) cameraAdapter.adjustAperture(1);
+                    }
+                });
                 if (qMenuView != null) qMenuView.highlightSegment(2); // Highlight Aperture
-                updateBottomHud();
                 return true;
             case FRONT_DIAL_CCW:
-                if (cameraAdapter != null) cameraAdapter.adjustAperture(-1);
+                dispatchDialTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (cameraAdapter != null) cameraAdapter.adjustAperture(-1);
+                    }
+                });
                 if (qMenuView != null) qMenuView.highlightSegment(2);
-                updateBottomHud();
                 return true;
 
             case REAR_DIAL_CW:
-                if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(1);
+                dispatchDialTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(1);
+                    }
+                });
                 if (qMenuView != null) qMenuView.highlightSegment(1); // Highlight Shutter Speed
-                updateBottomHud();
                 return true;
             case REAR_DIAL_CCW:
-                if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(-1);
+                dispatchDialTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (cameraAdapter != null) cameraAdapter.adjustShutterSpeed(-1);
+                    }
+                });
                 if (qMenuView != null) qMenuView.highlightSegment(1);
-                updateBottomHud();
                 return true;
 
             case WHEEL_CW:
                 if (wheelControlsIso) {
-                    if (cameraAdapter != null) cameraAdapter.stepIso(1);
+                    dispatchDialTask(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (cameraAdapter != null) cameraAdapter.stepIso(1);
+                        }
+                    });
                     if (qMenuView != null) qMenuView.highlightSegment(3); // Highlight ISO
                 } else {
-                    if (cameraAdapter != null) cameraAdapter.incrementEV(1);
+                    dispatchDialTask(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (cameraAdapter != null) cameraAdapter.incrementEV(1);
+                        }
+                    });
                     if (qMenuView != null) qMenuView.highlightSegment(4); // Highlight EV
                 }
-                updateBottomHud();
                 return true;
             case WHEEL_CCW:
                 if (wheelControlsIso) {
-                    if (cameraAdapter != null) cameraAdapter.stepIso(-1);
+                    dispatchDialTask(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (cameraAdapter != null) cameraAdapter.stepIso(-1);
+                        }
+                    });
                     if (qMenuView != null) qMenuView.highlightSegment(3); // Highlight ISO
                 } else {
-                    if (cameraAdapter != null) cameraAdapter.incrementEV(-1);
+                    dispatchDialTask(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (cameraAdapter != null) cameraAdapter.incrementEV(-1);
+                        }
+                    });
                     if (qMenuView != null) qMenuView.highlightSegment(4); // Highlight EV
                 }
-                updateBottomHud();
                 return true;
 
             case DPAD_RIGHT:
-                if (cameraAdapter != null) cameraAdapter.stepIso(1);
+                dispatchDialTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (cameraAdapter != null) cameraAdapter.stepIso(1);
+                    }
+                });
                 if (qMenuView != null) qMenuView.highlightSegment(3); // Highlight ISO
-                updateBottomHud();
                 return true;
             case DPAD_LEFT:
-                if (cameraAdapter != null) cameraAdapter.stepIso(-1);
+                dispatchDialTask(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (cameraAdapter != null) cameraAdapter.stepIso(-1);
+                    }
+                });
                 if (qMenuView != null) qMenuView.highlightSegment(3);
-                updateBottomHud();
                 return true;
 
             case DPAD_UP:
@@ -408,6 +455,25 @@ public class UIController {
         }
 
         return false;
+    }
+
+    private void dispatchDialTask(final Runnable hwAction) {
+        if (cameraAdapter != null) {
+            cameraAdapter.postHardwareTask(new Runnable() {
+                @Override
+                public void run() {
+                    hwAction.run();
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            updateBottomHud();
+                        }
+                    });
+                }
+            });
+        } else {
+            updateBottomHud();
+        }
     }
 
     public void showQuickReview(final android.graphics.Bitmap bmp) {

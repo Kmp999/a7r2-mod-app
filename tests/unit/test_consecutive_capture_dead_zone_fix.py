@@ -67,9 +67,10 @@ class TestConsecutiveCaptureDeadZoneFix(unittest.TestCase):
         self.assertIn("qMenuView.clearQuickReview();\n            if (cameraAdapter != null) cameraAdapter.resumePreview();", content)
 
     def test_app_state_default_master_42mp(self):
-        """AppState must default to MASTER_42MP for highest possible resolution."""
+        """AppState defaults to FAST_10MP for sub-2s A7R II turnaround while preserving MASTER_42MP opt-in."""
         content = self.app_state_file.read_text(encoding="utf-8")
-        self.assertIn("outputResolutionMode = OutputResolutionMode.MASTER_42MP", content)
+        self.assertIn("outputResolutionMode = OutputResolutionMode.FAST_10MP", content)
+        self.assertIn("MASTER_42MP", content)
 
     def test_storage_resolver_consecutive_photo_filtering(self):
         """StorageResolver.waitForNewCameraPhoto skips pre-existing photos and verifies JPEG completion."""

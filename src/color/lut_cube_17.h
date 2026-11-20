@@ -152,9 +152,10 @@ static inline int16x8_t apply_clarity_neon8(int16x8_t luma, int16x8_t prev_luma,
 #endif
 
 /**
- * Fast branchless fixed-point bit-shift Trilinear Interpolation for a single RGB pixel.
+ * Fast tetrahedral fixed-point bit-shift 3D LUT Interpolation for a single RGB pixel.
  * Branchless white-point fix: Remaps 0..255 to 0..256 so that 255 reaches node 16 cleanly.
- * Zero integer divisions (256/16 = 16 -> bitshift >> 4, fraction & 0x0F).
+ * Uses only 4 vertex fetches + 9 multiplies (vs 8 fetches + 40 multiplies for trilinear),
+ * cutting L1 cache traffic in half and multiply count by >4x on ARM Cortex-A9.
  */
 static inline void lut17_interpolate_pixel(const Lut17Context* __restrict lut,
                                            uint8_t r, uint8_t g, uint8_t b,
@@ -170,45 +171,50 @@ static inline void lut17_interpolate_pixel(const Lut17Context* __restrict lut,
     int g0 = g256 >> 4;
     int b0 = b256 >> 4;
 
-    int r_frac = r256 & 0x0F;
-    int g_frac = g256 & 0x0F;
-    int b_frac = b256 & 0x0F;
+    int rf = r256 & 0x0F;
+    int gf = g256 & 0x0F;
+    int bf = b256 & 0x0F;
 
-    int r1 = (r0 < 16) ? r0 + 1 : 16;
-    int g1 = (g0 < 16) ? g0 + 1 : 16;
-    int b1 = (b0 < 16) ? b0 + 1 : 16;
+    const uint8_t* c0 = &lut->table[LUT17_OFFSET(r0, g0, b0)];
+    int dr = (r0 < 16) ? 3 : 0;
+    int dg = (g0 < 16) ? 51 : 0;
+    int db = (b0 < 16) ? 867 : 0;
 
-    int inv_r = 16 - r_frac;
-    int inv_g = 16 - g_frac;
-    int inv_b = 16 - b_frac;
+    const uint8_t* c1;
+    const uint8_t* c2;
+    const uint8_t* c3;
+    int f1, f2, f3;
 
-    int w000 = inv_r * inv_g * inv_b;
-    int w100 = r_frac * inv_g * inv_b;
-    int w010 = inv_r * g_frac * inv_b;
-    int w110 = r_frac * g_frac * inv_b;
-    int w001 = inv_r * inv_g * b_frac;
-    int w101 = r_frac * inv_g * b_frac;
-    int w011 = inv_r * g_frac * b_frac;
-    int w111 = r_frac * g_frac * b_frac;
+    if (rf >= gf) {
+        if (gf >= bf) {
+            c1 = c0 + dr; c2 = c1 + dg; c3 = c2 + db;
+            f1 = rf; f2 = gf; f3 = bf;
+        } else if (rf >= bf) {
+            c1 = c0 + dr; c2 = c1 + db; c3 = c2 + dg;
+            f1 = rf; f2 = bf; f3 = gf;
+        } else {
+            c1 = c0 + db; c2 = c1 + dr; c3 = c2 + dg;
+            f1 = bf; f2 = rf; f3 = gf;
+        }
+    } else {
+        if (bf > gf) {
+            c1 = c0 + db; c2 = c1 + dg; c3 = c2 + dr;
+            f1 = bf; f2 = gf; f3 = rf;
+        } else if (bf > rf) {
+            c1 = c0 + dg; c2 = c1 + db; c3 = c2 + dr;
+            f1 = gf; f2 = bf; f3 = rf;
+        } else {
+            c1 = c0 + dg; c2 = c1 + dr; c3 = c2 + db;
+            f1 = gf; f2 = rf; f3 = bf;
+        }
+    }
 
-    const uint8_t* p000 = &lut->table[LUT17_OFFSET(r0, g0, b0)];
-    const uint8_t* p100 = &lut->table[LUT17_OFFSET(r1, g0, b0)];
-    const uint8_t* p010 = &lut->table[LUT17_OFFSET(r0, g1, b0)];
-    const uint8_t* p110 = &lut->table[LUT17_OFFSET(r1, g1, b0)];
-    const uint8_t* p001 = &lut->table[LUT17_OFFSET(r0, g0, b1)];
-    const uint8_t* p101 = &lut->table[LUT17_OFFSET(r1, g0, b1)];
-    const uint8_t* p011 = &lut->table[LUT17_OFFSET(r0, g1, b1)];
-    const uint8_t* p111 = &lut->table[LUT17_OFFSET(r1, g1, b1)];
-
-    // Q12 interpolation: divide by 4096 (>> 12)
-    *out_r = (uint8_t)((p000[0]*w000 + p100[0]*w100 + p010[0]*w010 + p110[0]*w110 +
-                        p001[0]*w001 + p101[0]*w101 + p011[0]*w011 + p111[0]*w111 + 2048) >> 12);
-
-    *out_g = (uint8_t)((p000[1]*w000 + p100[1]*w100 + p010[1]*w010 + p110[1]*w110 +
-                        p001[1]*w001 + p101[1]*w101 + p011[1]*w011 + p111[1]*w111 + 2048) >> 12);
-
-    *out_b = (uint8_t)((p000[2]*w000 + p100[2]*w100 + p010[2]*w010 + p110[2]*w110 +
-                        p001[2]*w001 + p101[2]*w101 + p011[2]*w011 + p111[2]*w111 + 2048) >> 12);
+    *out_r = (uint8_t)(((int)c0[0] * 16 + ((int)c1[0] - (int)c0[0]) * f1 +
+                        ((int)c2[0] - (int)c1[0]) * f2 + ((int)c3[0] - (int)c2[0]) * f3 + 8) >> 4);
+    *out_g = (uint8_t)(((int)c0[1] * 16 + ((int)c1[1] - (int)c0[1]) * f1 +
+                        ((int)c2[1] - (int)c1[1]) * f2 + ((int)c3[1] - (int)c2[1]) * f3 + 8) >> 4);
+    *out_b = (uint8_t)(((int)c0[2] * 16 + ((int)c1[2] - (int)c0[2]) * f1 +
+                        ((int)c2[2] - (int)c1[2]) * f2 + ((int)c3[2] - (int)c2[2]) * f3 + 8) >> 4);
 }
 
 /**
@@ -258,6 +264,24 @@ static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* __re
     init_static_grain_table();
     int grain_scale = (grain_strength == 2) ? 16 : (grain_strength == 1) ? 8 : 0;
     int idx = 0;
+
+    if (grain_scale == 0 && clarity_strength == 0) {
+        for (int y = 0; y < height; y++) {
+            int global_y = row_offset + y;
+            const int8_t* bayer_row = BAYER_2X2[global_y & 1];
+            for (int x = 0; x < width; x++) {
+                uint8_t r, g, b, or_val, og_val, ob_val;
+                unpack_rgb565_fast(buffer[idx], &r, &g, &b);
+                lut17_interpolate_pixel(lut, r, g, b, &or_val, &og_val, &ob_val);
+                int dither = bayer_row[x & 1];
+                int dr = clamp_u8_fast(or_val + dither);
+                int dg = clamp_u8_fast(og_val + dither - (dither >> 1));
+                int db = clamp_u8_fast(ob_val + dither);
+                buffer[idx++] = (uint16_t)(((dr >> 3) << 11) | ((dg >> 2) << 5) | (db >> 3));
+            }
+        }
+        return;
+    }
 
     for (int y = 0; y < height; y++) {
         // Prefetch next scanline into L1 cache
@@ -337,6 +361,27 @@ static inline void lut17_process_argb8888_advanced_offset(const Lut17Context* __
     init_static_grain_table();
     int grain_scale = (grain_strength == 2) ? 16 : (grain_strength == 1) ? 8 : 0;
     int idx = 0;
+
+    if (grain_scale == 0 && clarity_strength == 0) {
+        for (int y = 0; y < height; y++) {
+            int global_y = row_offset + y;
+            const int8_t* bayer_row = BAYER_2X2[global_y & 1];
+            for (int x = 0; x < width; x++) {
+                uint32_t px = buffer[idx];
+                uint8_t r = (uint8_t)(px & 0xFF);
+                uint8_t g = (uint8_t)((px >> 8) & 0xFF);
+                uint8_t b = (uint8_t)((px >> 16) & 0xFF);
+                uint8_t or_val, og_val, ob_val;
+                lut17_interpolate_pixel(lut, r, g, b, &or_val, &og_val, &ob_val);
+                int dither = bayer_row[x & 1];
+                int dr = clamp_u8_fast(or_val + dither);
+                int dg = clamp_u8_fast(og_val + dither - (dither >> 1));
+                int db = clamp_u8_fast(ob_val + dither);
+                buffer[idx++] = (uint32_t)((0xFFU << 24) | ((uint32_t)db << 16) | ((uint32_t)dg << 8) | (uint32_t)dr);
+            }
+        }
+        return;
+    }
 
     for (int y = 0; y < height; y++) {
         // Prefetch next scanline into L1 cache

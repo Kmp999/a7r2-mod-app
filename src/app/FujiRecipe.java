@@ -368,11 +368,23 @@ public class FujiRecipe {
         return ccm;
     }
 
+    // Cached 256-byte 1D tone curve to avoid 3x-6x redundant Math.pow() loops on Dalvik ARM
+    private int cachedCurveKey = Integer.MIN_VALUE;
+    private byte[] cachedToneCurve = null;
+
     /**
      * Generates a 256-byte 1D Tone Curve lookup table for a specific channel.
      * Incorporates Highlight Tone (-2..+4), Shadow Tone (-2..+4), and Film simulation characteristics.
      */
-    public byte[] generateToneCurve(char channel) {
+    public synchronized byte[] generateToneCurve(char channel) {
+        int key = (filmSim.ordinal() << 16)
+                ^ (dynamicRange.ordinal() << 12)
+                ^ ((highlightTone + 8) << 6)
+                ^ (shadowTone + 8);
+        if (cachedToneCurve != null && cachedCurveKey == key) {
+            return cachedToneCurve;
+        }
+
         byte[] curve = new byte[256];
 
         // Base contrast adjustment: S-curve
@@ -433,6 +445,8 @@ public class FujiRecipe {
             curve[i] = (byte) val;
         }
 
+        cachedToneCurve = curve;
+        cachedCurveKey = key;
         return curve;
     }
 }
