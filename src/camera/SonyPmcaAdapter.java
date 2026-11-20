@@ -298,7 +298,9 @@ public class SonyPmcaAdapter implements CameraAdapter {
                             String mName = method.getName();
                             if ("onShutter".equals(mName)) {
                                 Log.i(TAG, "Hardware CameraEx.ShutterListener.onShutter received");
-                                // Dispatch to active shutter callback (Do NOT call cancelTakePicture here as it aborts exposure!)
+                                // 1. Terminate burst capture immediately so exactly one shot is taken and flushed to SD
+                                cancelTakePicture();
+                                // 2. Dispatch to active shutter callback
                                 Camera.ShutterCallback cb = activeShutterCallback;
                                 if (cb != null) {
                                     activeShutterCallback = null;

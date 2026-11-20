@@ -145,6 +145,9 @@ public class UIController {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
+                if (qMenuView != null && message != null) {
+                    qMenuView.setDebugTelemetry(message);
+                }
                 if (statusView != null) {
                     if (SonyKeyCodes.sDebugKeyLoggingEnabled) {
                         statusView.setText(message + " [" + SonyKeyCodes.sLastKeyName + "]");

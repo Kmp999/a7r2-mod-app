@@ -475,6 +475,9 @@ public class FujiQMenuView extends View {
             // Top Bar
             canvas.drawRect(0, 0, w, 28, barBgPaint);
             canvas.drawText(topStatus, 16, 20, headerPaint);
+            if (debugTelemetry != null && debugTelemetry.length() > 0) {
+                canvas.drawText(debugTelemetry, 16, 40, headerPaint);
+            }
 
             if (splitScreenMode == 1) {
                 canvas.drawText("SONY [ORIGINAL]", (w / 4f) - 30f, 20, debugPaint);

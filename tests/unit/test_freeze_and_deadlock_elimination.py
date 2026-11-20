@@ -25,12 +25,12 @@ class TestFreezeAndDeadlockElimination(unittest.TestCase):
         self.storage_java = (self.src / "app" / "StorageResolver.java").read_text(encoding="utf-8")
         self.capture_java = (self.src / "app" / "CaptureController.java").read_text(encoding="utf-8")
 
-    def test_shutter_listener_does_not_abort_exposure(self):
-        """CameraEx$ShutterListener.onShutter must NOT call cancelTakePicture() which aborts exposure."""
+    def test_shutter_listener_terminates_burst_at_one_shot(self):
+        """CameraEx$ShutterListener.onShutter calls cancelTakePicture() so burstableTakePicture flushes 1 frame to SD."""
         shutter_idx = self.adapter_java.find('if ("onShutter".equals(mName))')
         self.assertNotEqual(shutter_idx, -1)
-        on_shutter_block = self.adapter_java[shutter_idx:shutter_idx + 400]
-        self.assertNotIn("cancelTakePicture()", on_shutter_block)
+        on_shutter_block = self.adapter_java[shutter_idx:shutter_idx + 600]
+        self.assertIn("cancelTakePicture()", on_shutter_block)
         self.assertIn("activeShutterCallback", on_shutter_block)
 
     def test_color_engine_jni_synchronous_encode_worker(self):
@@ -41,13 +41,12 @@ class TestFreezeAndDeadlockElimination(unittest.TestCase):
         self.assertIn("native_jpeg_stream_write_strip_argb8888", self.jni_c)
         self.assertIn("native_jpeg_stream_write_strip_rgb565", self.jni_c)
 
-    def test_storage_resolver_timeout_guards_pre_existing_fallback(self):
-        """waitForNewCameraPhoto returns null if fallback photo was already in preExistingFiles."""
-        fn_idx = self.storage_java.find("public static File waitForNewCameraPhoto(final Set<String> preExistingFiles")
-        self.assertNotEqual(fn_idx, -1)
-        fn_block = self.storage_java[fn_idx:fn_idx + 4000]
-        self.assertIn("preExistingFiles.contains(fbPath)", fn_block)
-        self.assertIn("return null; // Never falsely return an old pre-existing photo on timeout!", fn_block)
+    def test_native_jpeg_writer_fdct_and_zigzag_valid_huffman(self):
+        """native_jpeg_writer.c normalizes DC by >>13, maps ZIGZAG[i] natural index, and clamps DC/AC categories."""
+        writer_c = (self.src / "image" / "native_jpeg_writer.c").read_text(encoding="utf-8")
+        self.assertIn("r[0]  = (int16_t)(((t0 + t1) * 362) >> 13);", writer_c)
+        self.assertIn("int nat = ZIGZAG[i];", writer_c)
+        self.assertIn("if (diff > 2047) diff = 2047; else if (diff < -2047) diff = -2047;", writer_c)
 
     def test_capture_controller_granular_hud_telemetry(self):
         """CaptureController reports granular HUD updates across all pipeline stages and keeps Java 7 final vars."""

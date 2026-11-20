@@ -364,9 +364,9 @@ public class CaptureController {
                             synchronized (hardwareStoreLock) {
                                 if (!pendingHardwareStoredQueue.isEmpty()) {
                                     newPhoto = pendingHardwareStoredQueue.pollFirst();
-                                } else if (!isShuttingDown) {
+                                } else if (storeImageListenerSeen && !isShuttingDown) {
                                     try {
-                                        hardwareStoreLock.wait(1500);
+                                        hardwareStoreLock.wait(2000);
                                     } catch (InterruptedException ignored) {}
                                     if (!pendingHardwareStoredQueue.isEmpty()) {
                                         newPhoto = pendingHardwareStoredQueue.pollFirst();
@@ -386,27 +386,15 @@ public class CaptureController {
                                 }
                             }
                             if (newPhoto == null) {
-                                File master = StorageResolver.findRawMasterFile(seqNum);
-                                if (master != null && !preExistingFiles.contains(master.getAbsolutePath()) && !preExistingFiles.contains(master.getName())) {
-                                    newPhoto = master;
-                                }
+                                newPhoto = StorageResolver.getLatestCameraPhoto();
                             }
                             if (newPhoto == null) {
-                                File latest = StorageResolver.getLatestCameraPhoto();
-                                if (latest != null && !preExistingFiles.contains(latest.getAbsolutePath()) && !preExistingFiles.contains(latest.getName())) {
-                                    newPhoto = latest;
-                                }
-                            }
-                            if (newPhoto == null) {
-                                File saved = StorageResolver.getLatestSavedPhoto();
-                                if (saved != null && !preExistingFiles.contains(saved.getAbsolutePath()) && !preExistingFiles.contains(saved.getName())) {
-                                    newPhoto = saved;
-                                }
+                                newPhoto = StorageResolver.getLatestSavedPhoto();
                             }
                             if (newPhoto != null) {
                                 recordKnownPhoto(newPhoto);
                                 if (!claimPhotoForProcessing(newPhoto)) {
-                                    Log.d(TAG, "Photo already claimed: " + newPhoto.getName());
+                                    Log.d(TAG, "Skipping already-graded photo: " + newPhoto.getName());
                                     return;
                                 }
                             }
@@ -419,8 +407,15 @@ public class CaptureController {
                                 if (uiController != null) uiController.updateStatusAsync("Grading " + newPhoto.getName() + "...");
                                 processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
                             } else {
-                                Log.e(TAG, "No photo found on SD card after hardware capture");
-                                if (uiController != null) uiController.updateStatusAsync("ERR: SD timeout (no photo written)");
+                                File master = StorageResolver.findRawMasterFile(seqNum);
+                                if (master != null && claimPhotoForProcessing(master)) {
+                                    recordKnownPhoto(master);
+                                    jobStarted = true;
+                                    processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
+                                } else {
+                                    Log.e(TAG, "No photo found on SD card after hardware capture");
+                                    if (uiController != null) uiController.updateStatusAsync("ERR: SD timeout (no photo written)");
+                                }
                             }
                         } finally {
                             if (!jobStarted) {
@@ -1007,6 +1002,18 @@ public class CaptureController {
                 ? new File(gradedSavedPath) : targetOutputFile;
             if (reviewFile != null && reviewFile.exists()) {
                 reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 960);
+            }
+            if (reviewBmp == null && rawMasterFile.exists()) {
+                reviewBmp = StorageResolver.loadPhotoForReview(rawMasterFile, 960);
+                if (reviewBmp != null) {
+                    if (!ColorEngine.applyLutAndGrainBitmapSafe(reviewBmp, grainStrength, clarityStrength)) {
+                        reviewBmp = applyRecipeInJava(reviewBmp, recipe);
+                    }
+                    if (gradedSavedPath == null || !new File(gradedSavedPath).exists()) {
+                        gradedSavedPath = StorageResolver.saveGradedJpegToDirectory(
+                            context, reviewBmp, rawMasterFile.getParentFile(), seqNum, presetName, true);
+                    }
+                }
             }
             if (reviewBmp != null) {
                 String tierTag = usedCacheStream ? "C-MS" : (usedDirectTarget ? "C-DIR" : "C");

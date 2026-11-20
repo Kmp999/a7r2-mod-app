@@ -130,46 +130,35 @@ static inline void get_cat_bits(int val, int* cat, int* bits) {
     *bits = (val < 0) ? ((val - 1) & ((1 << c) - 1)) : val;
 }
 
-// Fast 1D FDCT (AAN algorithm)
+// Fast 1D FDCT (AAN / Loeffler Q10 separable butterfly)
 static inline void fdct_1d(int16_t* blk) {
-    for (int i=0; i<8; i++) {
-        int16_t* r = blk + i*8;
+    for (int i = 0; i < 8; i++) {
+        int16_t* r = blk + i * 8;
         int s0 = r[0] + r[7], s1 = r[1] + r[6], s2 = r[2] + r[5], s3 = r[3] + r[4];
         int d0 = r[0] - r[7], d1 = r[1] - r[6], d2 = r[2] - r[5], d3 = r[3] - r[4];
-        
         int t0 = s0 + s3, t1 = s1 + s2, t2 = s1 - s2, t3 = s0 - s3;
-        r[0] = (t0 + t1); r[4] = (t0 - t1);
-        int z1 = (t2 + t3) * 4433; // 4433 = 0.54119610 * 8192
-        r[2] = (t3 * 8192 + z1) >> 13; r[6] = (t3 * 8192 - z1) >> 13;
-        
-        int t4 = d1 + d2, t5 = d0 + d3, t6 = d0 + d2, t7 = d1 + d3;
-        int z5 = (t6 - t7) * 9633; // 1.175875602 * 8192
-        int z2 = t4 * 2446; // 0.298631336
-        int z3 = t6 * 16819; // 2.053119869
-        int z4 = t7 * 24810; // 3.027378108
-        int z11 = t7 * 12282; // 1.5
-        r[1] = (z4 + z5 + t5 * 8192) >> 13;
-        r[3] = (z3 + z5 - t5 * 8192) >> 13;
-        r[5] = (z2 + z5 + t5 * 8192) >> 13;
-        r[7] = (z11 + z5 - t5 * 8192) >> 13;
+        r[0] = (int16_t)(((t0 + t1) * 362) >> 7);
+        r[4] = (int16_t)(((t0 - t1) * 362) >> 7);
+        r[2] = (int16_t)((t3 * 473 + t2 * 196) >> 7);
+        r[6] = (int16_t)((t3 * 196 - t2 * 473) >> 7);
+        r[1] = (int16_t)((d0 * 502 + d1 * 426 + d2 * 284 + d3 * 100) >> 7);
+        r[3] = (int16_t)((d0 * 426 - d1 * 100 - d2 * 502 - d3 * 284) >> 7);
+        r[5] = (int16_t)((d0 * 284 - d1 * 502 + d2 * 100 + d3 * 426) >> 7);
+        r[7] = (int16_t)((d0 * 100 - d1 * 284 + d2 * 426 - d3 * 502) >> 7);
     }
-    for (int i=0; i<8; i++) {
+    for (int i = 0; i < 8; i++) {
         int16_t* r = blk + i;
         int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
         int d0 = r[0] - r[56], d1 = r[8] - r[48], d2 = r[16] - r[40], d3 = r[24] - r[32];
-        
         int t0 = s0 + s3, t1 = s1 + s2, t2 = s1 - s2, t3 = s0 - s3;
-        r[0] = (t0 + t1); r[32] = (t0 - t1);
-        int z1 = (t2 + t3) * 4433;
-        r[16] = (t3 * 8192 + z1) >> 16; r[48] = (t3 * 8192 - z1) >> 16; // Shift 16 incorporates AAN scaling
-        
-        int t4 = d1 + d2, t5 = d0 + d3, t6 = d0 + d2, t7 = d1 + d3;
-        int z5 = (t6 - t7) * 9633;
-        int z2 = t4 * 2446, z3 = t6 * 16819, z4 = t7 * 24810, z11 = t7 * 12282;
-        r[8] = (z4 + z5 + t5 * 8192) >> 16;
-        r[24] = (z3 + z5 - t5 * 8192) >> 16;
-        r[40] = (z2 + z5 + t5 * 8192) >> 16;
-        r[56] = (z11 + z5 - t5 * 8192) >> 16;
+        r[0]  = (int16_t)(((t0 + t1) * 362) >> 13);
+        r[32] = (int16_t)(((t0 - t1) * 362) >> 13);
+        r[16] = (int16_t)((t3 * 473 + t2 * 196) >> 13);
+        r[48] = (int16_t)((t3 * 196 - t2 * 473) >> 13);
+        r[8]  = (int16_t)((d0 * 502 + d1 * 426 + d2 * 284 + d3 * 100) >> 13);
+        r[24] = (int16_t)((d0 * 426 - d1 * 100 - d2 * 502 - d3 * 284) >> 13);
+        r[40] = (int16_t)((d0 * 284 - d1 * 502 + d2 * 100 + d3 * 426) >> 13);
+        r[56] = (int16_t)((d0 * 100 - d1 * 284 + d2 * 426 - d3 * 502) >> 13);
     }
 }
 
@@ -180,17 +169,19 @@ static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q
     int16_t q_block[64];
     int last_nz = 0;
     for (int i = 0; i < 64; i++) {
-        int coeff = blk[i];
+        int nat = ZIGZAG[i];
+        int coeff = blk[nat];
         int sign = coeff < 0;
         int abs_c = sign ? -coeff : coeff;
-        int q_val = (abs_c * inv_q[i] + 32768) >> 16;
-        int zz = ZIGZAG[i];
-        q_block[zz] = (int16_t)(sign ? -q_val : q_val);
-        if (q_val != 0 && zz > last_nz) last_nz = zz;
+        int q_val = (abs_c * inv_q[nat] + 32768) >> 16;
+        if (i > 0 && q_val > 1023) q_val = 1023;
+        q_block[i] = (int16_t)(sign ? -q_val : q_val);
+        if (q_val != 0) last_nz = i;
     }
 
     int diff = q_block[0] - *last_dc;
     *last_dc = q_block[0];
+    if (diff > 2047) diff = 2047; else if (diff < -2047) diff = -2047;
     int cat, bits;
     get_cat_bits(diff, &cat, &bits);
     bw_put_bits(bw, dc_codes[cat], dc_sizes[cat]);
