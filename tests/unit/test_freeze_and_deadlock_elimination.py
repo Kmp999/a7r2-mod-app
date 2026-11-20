@@ -50,10 +50,11 @@ class TestFreezeAndDeadlockElimination(unittest.TestCase):
         self.assertIn("return null; // Never falsely return an old pre-existing photo on timeout!", fn_block)
 
     def test_capture_controller_granular_hud_telemetry(self):
-        """CaptureController reports granular HUD updates across all pipeline stages."""
+        """CaptureController reports granular HUD updates across all pipeline stages and keeps Java 7 final vars."""
         self.assertIn('uiController.updateStatusAsync("Waiting for SD photo...");', self.capture_java)
         self.assertIn("Grading strip", self.capture_java)
         self.assertIn('uiController.updateStatusAsync("ERR: SD timeout (no photo written)");', self.capture_java)
+        self.assertIn("final File rawFile = resolvedFile;", self.capture_java)
 
 
 if __name__ == "__main__":

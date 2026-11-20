@@ -120,11 +120,12 @@ public class CaptureController {
                 @Override
                 public void onImageStored(String dir, String filename) {
                     if (filename == null) return;
-                    File rawFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
-                    if (rawFile == null || !rawFile.exists()) {
+                    File resolvedFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
+                    if (resolvedFile == null || !resolvedFile.exists()) {
                         try { Thread.sleep(50); } catch (InterruptedException ignored) {}
-                        rawFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
+                        resolvedFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
                     }
+                    final File rawFile = resolvedFile;
                     if (rawFile == null || !rawFile.exists()) {
                         Log.w(TAG, "StoreImageCompleteListener unresolved path: " + dir + "/" + filename);
                         return;
