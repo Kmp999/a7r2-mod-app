@@ -15,11 +15,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
-      - name: Install Android Build Tools, Platform and NDK
+      - name: Install Android Build Tools, Platform and Legacy NDK r14b (Sony PMCA ABI/API-9 Compatible)
         run: |
           SDKMANAGER=$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager
           yes | $SDKMANAGER --licenses || true
-          $SDKMANAGER "platforms;android-15" "build-tools;28.0.3" "ndk;21.4.7075529"
+          $SDKMANAGER "platforms;android-15" "build-tools;28.0.3"
+          if [ ! -e /usr/lib/x86_64-linux-gnu/libncurses.so.5 ] && [ -e /usr/lib/x86_64-linux-gnu/libncursesw.so.6 ]; then
+            sudo ln -sf /usr/lib/x86_64-linux-gnu/libncursesw.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
+          fi
+          if [ ! -e /usr/lib/x86_64-linux-gnu/libtinfo.so.5 ] && [ -e /usr/lib/x86_64-linux-gnu/libtinfo.so.6 ]; then
+            sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+          fi
+          curl -fSL https://dl.google.com/android/repository/android-ndk-r14b-linux-x86_64.zip -o /tmp/ndk-r14b.zip
+          unzip -q /tmp/ndk-r14b.zip -d $HOME
+          rm -f /tmp/ndk-r14b.zip
 
       - name: Set up Java 8 (Dalvik Target Compatible)
         uses: actions/setup-java@v5
@@ -27,15 +36,20 @@ jobs:
           distribution: 'temurin'
           java-version: '8'
 
-      - name: Compile Native C Engine (libcolor_engine_jni.so)
+      - name: Compile Native C Engine (libcolor_engine_jni.so for armeabi & armeabi-v7a)
         run: |
-          $ANDROID_HOME/ndk/21.4.7075529/ndk-build NDK_PROJECT_PATH=.
+          $HOME/android-ndk-r14b/ndk-build NDK_PROJECT_PATH=.
+          echo "=== Verifying ELF dynamic dependencies & symbols ==="
+          readelf -d libs/armeabi/libcolor_engine_jni.so
+          readelf -d libs/armeabi-v7a/libcolor_engine_jni.so
+          nm -D -u libs/armeabi-v7a/libcolor_engine_jni.so
 
       - name: Prepare APK Build Directories
         run: |
           mkdir -p bin/classes
           mkdir -p bin/res
           mkdir -p res
+          mkdir -p libs/armeabi
           mkdir -p libs/armeabi-v7a
 
       - name: Process Resources and Generate R.java
@@ -75,8 +89,10 @@ jobs:
           cd bin
           $AAPT add unaligned.apk classes.dex
           cd ..
-          mkdir -p lib/armeabi-v7a
+          mkdir -p lib/armeabi lib/armeabi-v7a
+          cp libs/armeabi/libcolor_engine_jni.so lib/armeabi/
           cp libs/armeabi-v7a/libcolor_engine_jni.so lib/armeabi-v7a/
+          $AAPT add bin/unaligned.apk lib/armeabi/libcolor_engine_jni.so
           $AAPT add bin/unaligned.apk lib/armeabi-v7a/libcolor_engine_jni.so
 
       - name: Sign APK (Strict v1 JAR Signing for Sony PMCA)

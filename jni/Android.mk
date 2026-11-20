@@ -30,7 +30,9 @@ LOCAL_SRC_FILES := \
 
 LOCAL_LDLIBS    := -llog -lm
 
-# Optimization flags for ARMv7-A (Sony A7R II BIONZ X Cortex-A CPU)
-LOCAL_CFLAGS    := -O3 -ffast-math -ftree-vectorize -funroll-loops -mfloat-abi=softfp -mfpu=neon -march=armv7-a
+# Compatible with Sony A7R II (ILCE-7RM2) BIONZ X CXD90014 ARM Cortex-A5 (Android 2.3.7/4.1.2).
+# Avoids forced NEON (prevents SIGILL on non-NEON cores) and emits classic DT_HASH for legacy dlopen.
+LOCAL_CFLAGS    := -std=gnu99 -O3 -funroll-loops -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
+LOCAL_LDFLAGS   := -Wl,--hash-style=both
 
 include $(BUILD_SHARED_LIBRARY)

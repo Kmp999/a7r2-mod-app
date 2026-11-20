@@ -136,15 +136,48 @@ class TestA7R2LockingPointsFix(unittest.TestCase):
         self.assertIn("Thread.NORM_PRIORITY - 1", self.capture_java)
         self.assertNotIn("Thread.NORM_PRIORITY + 1", self.capture_java)
         self.assertIn("stripDirect = java.nio.ByteBuffer.allocateDirect(dstW * 64 * 2);", self.capture_java)
-        self.assertIn("pthread_rwlock_t g_lut_rwlock", self.jni_c)
+        self.assertIn("pthread_mutex_t g_lut_mutex", self.jni_c)
+        self.assertNotIn("pthread_rwlock", self.jni_c)
         self.assertIn("g_strip_call_mutex", self.jni_c)
+        self.assertIn("encode_worker_submit", self.jni_c)
         self.assertIn("calloc(1, sizeof(BitWriter))", self.writer_c)
+        self.assertIn("init_ycbcr_tables", self.writer_c)
         self.assertIn("surfaceReady", self.main_java)
         ui_java = (self.src / "app" / "UIController.java").read_text(encoding="utf-8")
         self.assertIn("dispatchDialTask", ui_java)
         # Ensure normal finally block doesn't invoke System.gc()
         fin_idx = self.capture_java.index("int remaining = pendingJobsCount.decrementAndGet();")
         self.assertNotIn("System.gc()", self.capture_java[fin_idx:fin_idx + 200])
+
+    def test_7_a7r2_native_abi_compat_3tier_stream_and_no_45mp_crush(self):
+        """Fix 7: Legacy API-9 dual-ABI NDK build, 3-tier stream open, 18MP strip fix, no 4.5MP fallback crush."""
+        app_mk = (REPO_ROOT / "jni" / "Application.mk").read_text(encoding="utf-8")
+        android_mk = (REPO_ROOT / "jni" / "Android.mk").read_text(encoding="utf-8")
+        workflow = (REPO_ROOT / ".github" / "workflows" / "build-apk.yml").read_text(encoding="utf-8")
+
+        # Dual ABI (armeabi + armeabi-v7a) targeting android-9 with DT_HASH & no forced NEON SIGILL
+        self.assertIn("armeabi armeabi-v7a", app_mk)
+        self.assertIn("android-9", app_mk)
+        self.assertIn("-Wl,--hash-style=both", android_mk)
+        self.assertNotIn("-mfpu=neon", android_mk)
+        self.assertIn("lib/armeabi/libcolor_engine_jni.so", workflow)
+        self.assertIn("lib/armeabi-v7a/libcolor_engine_jni.so", workflow)
+
+        # 18MP BufferOverflowException fix: srcStripH = 64 whenever targetSample == 1
+        self.assertIn("if (targetSample == 1 || resMode == AppState.OutputResolutionMode.MASTER_42MP)", self.capture_java)
+
+        # 3-Tier native stream open + MediaStore raw byte stream
+        self.assertIn("openNativeStreamTier", self.capture_java)
+        self.assertIn("saveJpegFileViaMediaStore", self.capture_java)
+        self.assertIn("saveJpegFileViaMediaStore", self.storage_java)
+        self.assertIn("resolveStoredPhotoFile", self.capture_java)
+
+        # Fallback never crushes 18MP (5168x3448) down to 4.5MP (2584x1724) and skips double EXIF/Avindex
+        self.assertIn("fallbackOpts.inSampleSize = (srcW >= 7000) ? 2 : 1;", self.capture_java)
+        self.assertNotIn("fallbackOpts.inSampleSize = (srcW > 4000) ? 2 : 1;", self.capture_java)
+        self.assertIn("skipPostProcess", self.storage_java)
+        self.assertIn("nativeApplyLut17IntStrip", self.jni_c)
+        self.assertIn("getSupportedImageSizes", self.adapter_java)
 
     def test_6_native_tetrahedral_dual_core_and_clz_optimizations(self):
         """Fix 6: Tetrahedral LUT math accuracy, dual-core pthread grading, CLZ & trailing-zero AC skip."""

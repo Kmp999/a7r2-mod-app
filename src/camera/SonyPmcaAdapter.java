@@ -789,10 +789,24 @@ public class SonyPmcaAdapter implements CameraAdapter {
                 Object mod = getModifier();
                 if (mod != null) {
                     try {
+                        String chosenSize = "large";
+                        try {
+                            Method getSizes = findAccessibleMethod(mod, "getSupportedImageSizes");
+                            @SuppressWarnings("unchecked")
+                            List<String> supSizes = (List<String>) getSizes.invoke(mod);
+                            if (supSizes != null && !supSizes.isEmpty()) {
+                                for (String sz : supSizes) {
+                                    if ("L".equalsIgnoreCase(sz) || "large".equalsIgnoreCase(sz)) {
+                                        chosenSize = sz;
+                                        break;
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {}
                         Method m = findAccessibleMethod(mod, "setImageSize", String.class);
-                        // On Sony A7R II Full Frame, "large" = 42.4 MP (7952x5304)
-                        m.invoke(mod, "large");
-                        Log.i(TAG, "CameraEx modifier.setImageSize('large') applied (42.4MP target)");
+                        // On Sony A7R II Full Frame, "L" / "large" = 42.4 MP (7952x5304)
+                        m.invoke(mod, chosenSize);
+                        Log.i(TAG, "CameraEx modifier.setImageSize('" + chosenSize + "') applied (42.4MP target)");
                     } catch (Throwable ignored) {}
 
                     try {

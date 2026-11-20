@@ -48,6 +48,22 @@ static const int16_t DCT_M[8][8] = {
     { 196,-473, 473,-196,-196, 473,-473, 196}, { 100,-284, 426,-502, 502,-426, 284,-100}
 };
 
+// Precomputed L1-cache RGB->YCbCr lookup tables (9KB total; eliminates 10 multiplies per 2x2 block)
+static int32_t g_yr[256], g_yg[256], g_yb[256];
+static int32_t g_cbr[256], g_cbg[256], g_cbb[256];
+static int32_t g_crr[256], g_crg[256], g_crb[256];
+static int g_ycbcr_ready = 0;
+
+static void init_ycbcr_tables(void) {
+    if (g_ycbcr_ready) return;
+    for (int i = 0; i < 256; i++) {
+        g_yr[i]  =  19595 * i; g_yg[i]  =  38470 * i; g_yb[i]  =   7471 * i + 32768;
+        g_cbr[i] = -11059 * i; g_cbg[i] = -21709 * i; g_cbb[i] =  32768 * i + 32768;
+        g_crr[i] =  32768 * i; g_crg[i] = -27439 * i; g_crb[i] =  -5329 * i + 32768;
+    }
+    g_ycbcr_ready = 1;
+}
+
 // Buffered BitWriter (32KB write buffer tuned for FAT32 clusters; heap-allocated to avoid JNI stack overflow)
 typedef struct {
     FILE* fp;
@@ -342,6 +358,7 @@ JpegStreamState* native_jpeg_stream_open_with_exif(const char* filename, int wid
     state->width = width;
     state->height = height;
     state->quality = quality;
+    init_ycbcr_tables();
 
     compute_quant_tables(quality, state->q_luma, state->q_chroma, state->inv_q_luma, state->inv_q_chroma);
 
@@ -439,63 +456,84 @@ int native_write_jpeg_strip(JpegStreamState* state, const uint16_t* strip_pixels
 int native_jpeg_stream_write_strip_argb8888(JpegStreamState* state, const uint32_t* strip_pixels, int strip_w, int strip_h, int row_offset) {
     if (!state || !state->fp || !strip_pixels || strip_w <= 0 || strip_h <= 0) return 0;
     if (strip_w != state->width) return 0;
+    init_ycbcr_tables();
 
     int16_t y_block[4][64], cb_block[64], cr_block[64];
 
     for (int my = 0; my < strip_h; my += 16) {
         int global_mcu_y = row_offset + my;
         if (global_mcu_y >= state->height) break;
+        int full_y = (my + 16 <= strip_h) && (global_mcu_y + 16 <= state->height);
 
         for (int mx = 0; mx < state->width; mx += 16) {
-            for (int by = 0; by < 16; by++) {
-                int local_y = my + by;
-                if (local_y >= strip_h) local_y = strip_h - 1;
-                int global_y = row_offset + local_y;
-                if (global_y >= state->height) {
-                    local_y = (state->height - 1) - row_offset;
-                    if (local_y < 0) local_y = 0;
-                    if (local_y >= strip_h) local_y = strip_h - 1;
+            if (full_y && mx + 16 <= state->width) {
+                // Interior MCU fast-path: zero bounds branches, zero multiplies via L1 YCbCr tables
+                for (int by = 0; by < 16; by++) {
+                    const uint32_t* row = &strip_pixels[(my + by) * strip_w + mx];
+                    int b_idx = (by >= 8) ? 2 : 0;
+                    int sub_y8 = (by & 7) * 8;
+                    int16_t* yl = &y_block[b_idx][sub_y8];
+                    int16_t* yr = &y_block[b_idx + 1][sub_y8];
+                    if ((by & 1) == 0) {
+                        int c_row = (by >> 1) * 8;
+                        for (int bx = 0; bx < 16; bx += 2) {
+                            uint32_t p0 = row[bx], p1 = row[bx + 1];
+                            int r0 = p0 & 0xFF, g0 = (p0 >> 8) & 0xFF, b0 = (p0 >> 16) & 0xFF;
+                            int r1 = p1 & 0xFF, g1 = (p1 >> 8) & 0xFF, b1 = (p1 >> 16) & 0xFF;
+                            int16_t* dst = (bx < 8) ? yl : yr;
+                            int sx = bx & 7;
+                            dst[sx]     = (int16_t)(((g_yr[r0] + g_yg[g0] + g_yb[b0]) >> 16) - 128);
+                            dst[sx + 1] = (int16_t)(((g_yr[r1] + g_yg[g1] + g_yb[b1]) >> 16) - 128);
+                            int c_idx = c_row + (bx >> 1);
+                            cb_block[c_idx] = (int16_t)((g_cbr[r0] + g_cbg[g0] + g_cbb[b0]) >> 16);
+                            cr_block[c_idx] = (int16_t)((g_crr[r0] + g_crg[g0] + g_crb[b0]) >> 16);
+                        }
+                    } else {
+                        for (int bx = 0; bx < 8; bx++) {
+                            uint32_t p0 = row[bx], p1 = row[bx + 8];
+                            yl[bx] = (int16_t)(((g_yr[p0 & 0xFF] + g_yg[(p0 >> 8) & 0xFF] + g_yb[(p0 >> 16) & 0xFF]) >> 16) - 128);
+                            yr[bx] = (int16_t)(((g_yr[p1 & 0xFF] + g_yg[(p1 >> 8) & 0xFF] + g_yb[(p1 >> 16) & 0xFF]) >> 16) - 128);
+                        }
+                    }
                 }
-
-                const uint32_t* row = &strip_pixels[local_y * strip_w];
-                int b_idx = ((by >= 8) ? 2 : 0), sub_y = by & 7;
-
-                for (int bx = 0; bx < 16; bx++) {
-                    int px_idx = mx + bx;
-                    if (px_idx >= state->width) px_idx = state->width - 1;
-                    uint32_t px = row[px_idx];
-
-                    int r = (int)(px & 0xFF);
-                    int g = (int)((px >> 8) & 0xFF);
-                    int b = (int)((px >> 16) & 0xFF);
-
-                    int y_val = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
-                    int blk = b_idx + ((bx >= 8) ? 1 : 0), sub_x = bx & 7;
-                    y_block[blk][sub_y * 8 + sub_x] = (int16_t)(y_val - 128);
-
-                    if ((by & 1) == 0 && (bx & 1) == 0) {
-                        int cb_val = (-11059 * r - 21709 * g + 32768 * b + 32768) >> 16;
-                        int cr_val = (32768 * r - 27439 * g - 5329 * b + 32768) >> 16;
-                        int c_idx = (by >> 1) * 8 + (bx >> 1);
-                        cb_block[c_idx] = (int16_t)cb_val;
-                        cr_block[c_idx] = (int16_t)cr_val;
+            } else {
+                for (int by = 0; by < 16; by++) {
+                    int local_y = my + by;
+                    if (local_y >= strip_h) local_y = strip_h - 1;
+                    int global_y = row_offset + local_y;
+                    if (global_y >= state->height) {
+                        local_y = (state->height - 1) - row_offset;
+                        if (local_y < 0) local_y = 0;
+                        if (local_y >= strip_h) local_y = strip_h - 1;
+                    }
+                    const uint32_t* row = &strip_pixels[local_y * strip_w];
+                    int b_idx = ((by >= 8) ? 2 : 0), sub_y = by & 7;
+                    for (int bx = 0; bx < 16; bx++) {
+                        int px_idx = mx + bx;
+                        if (px_idx >= state->width) px_idx = state->width - 1;
+                        uint32_t px = row[px_idx];
+                        int r = px & 0xFF, g = (px >> 8) & 0xFF, b = (px >> 16) & 0xFF;
+                        int blk = b_idx + ((bx >= 8) ? 1 : 0);
+                        y_block[blk][sub_y * 8 + (bx & 7)] = (int16_t)(((g_yr[r] + g_yg[g] + g_yb[b]) >> 16) - 128);
+                        if ((by & 1) == 0 && (bx & 1) == 0) {
+                            int c_idx = (by >> 1) * 8 + (bx >> 1);
+                            cb_block[c_idx] = (int16_t)((g_cbr[r] + g_cbg[g] + g_cbb[b]) >> 16);
+                            cr_block[c_idx] = (int16_t)((g_crr[r] + g_crg[g] + g_crb[b]) >> 16);
+                        }
                     }
                 }
             }
             for (int i = 0; i < 4; i++) {
                 encode_block_fast(&state->bw, y_block[i], state->inv_q_luma,
                                   state->dc_luma_c, state->dc_luma_s,
-                                  state->ac_luma_c, state->ac_luma_s,
-                                  &state->last_dc[0]);
+                                  state->ac_luma_c, state->ac_luma_s, &state->last_dc[0]);
             }
             encode_block_fast(&state->bw, cb_block, state->inv_q_chroma,
                               state->dc_chroma_c, state->dc_chroma_s,
-                              state->ac_chroma_c, state->ac_chroma_s,
-                              &state->last_dc[1]);
+                              state->ac_chroma_c, state->ac_chroma_s, &state->last_dc[1]);
             encode_block_fast(&state->bw, cr_block, state->inv_q_chroma,
                               state->dc_chroma_c, state->dc_chroma_s,
-                              state->ac_chroma_c, state->ac_chroma_s,
-                              &state->last_dc[2]);
+                              state->ac_chroma_c, state->ac_chroma_s, &state->last_dc[2]);
         }
     }
     return 1;

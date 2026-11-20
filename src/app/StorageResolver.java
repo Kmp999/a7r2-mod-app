@@ -473,10 +473,44 @@ public final class StorageResolver {
     }
 
     /**
+     * Resolves a file reported by Sony CameraEx.StoreImageCompleteListener.
+     * Sony Scalar often passes a relative folder name (e.g. "100MSDCF" or "/DCIM/100MSDCF")
+     * instead of an absolute mount path.
+     */
+    public static File resolveStoredPhotoFile(String dir, String filename) {
+        if (filename == null || filename.length() == 0) return null;
+        if (dir != null && dir.length() > 0) {
+            File direct = new File(dir, filename);
+            if (direct.exists() && direct.isFile()) {
+                return direct;
+            }
+        }
+        String normDir = (dir != null) ? new File(dir).getName().toUpperCase(Locale.US) : "";
+        List<File> candidates = getCandidateDcimDirs();
+        for (File cand : candidates) {
+            if (cand == null || !cand.exists() || !cand.isDirectory()) continue;
+            if (normDir.length() > 0 && cand.getName().toUpperCase(Locale.US).equals(normDir)) {
+                File f = new File(cand, filename);
+                if (f.exists() && f.isFile()) return f;
+            }
+        }
+        for (File cand : candidates) {
+            if (cand == null || !cand.exists() || !cand.isDirectory()) continue;
+            File f = new File(cand, filename);
+            if (f.exists() && f.isFile()) return f;
+        }
+        return (dir != null && dir.length() > 0) ? new File(dir, filename) : null;
+    }
+
+    /**
      * Saves a color-graded JPEG bitmap directly to a specific target directory (e.g. where DSC0xxxx.JPG resides),
      * avoiding any accidental redirection to internal partitions like /mnt/wv_cache.
      */
     public static String saveGradedJpegToDirectory(Context context, Bitmap bitmap, File targetDir, int sequenceNum, String recipeName) {
+        return saveGradedJpegToDirectory(context, bitmap, targetDir, sequenceNum, recipeName, false);
+    }
+
+    public static String saveGradedJpegToDirectory(Context context, Bitmap bitmap, File targetDir, int sequenceNum, String recipeName, boolean skipPostProcess) {
         List<File> dirsToTry = new ArrayList<File>();
         if (targetDir != null && !targetDir.getAbsolutePath().contains("wv_cache")) {
             if (!targetDir.exists()) targetDir.mkdirs();
@@ -489,14 +523,14 @@ public final class StorageResolver {
                 dirsToTry.add(d);
             }
         }
-        return saveJpegToDirList(context, bitmap, dirsToTry, "fuji_", sequenceNum, recipeName);
+        return saveJpegToDirList(context, bitmap, dirsToTry, "fuji_", sequenceNum, recipeName, skipPostProcess);
     }
 
     private static String saveJpegInternal(Context context, Bitmap bitmap, String prefix, int sequenceNum, String recipeName) {
-        return saveJpegToDirList(context, bitmap, getCandidateDcimDirs(), prefix, sequenceNum, recipeName);
+        return saveJpegToDirList(context, bitmap, getCandidateDcimDirs(), prefix, sequenceNum, recipeName, false);
     }
 
-    private static String saveJpegToDirList(Context context, Bitmap bitmap, List<File> candidates, String prefix, int sequenceNum, String recipeName) {
+    private static String saveJpegToDirList(Context context, Bitmap bitmap, List<File> candidates, String prefix, int sequenceNum, String recipeName, boolean skipPostProcess) {
         if (bitmap == null) {
             sLastDiagnostic = "FAIL: Bitmap is null";
             return null;
@@ -573,21 +607,23 @@ public final class StorageResolver {
                     Log.i(TAG, "Successfully saved graded photo: " + sLastDiagnostic);
 
                     // Post-processing: EXIF & Avindex isolated so errors never invalidate the saved image!
-                    try {
-                        File master = findRawMasterFile(sequenceNum);
-                        if (master != null && master.exists()) {
-                            copyExifMetadata(master.getAbsolutePath(), savedPath, recipeName);
-                        } else {
-                            writeExifMetadata(savedPath, recipeName);
+                    if (!skipPostProcess) {
+                        try {
+                            File master = findRawMasterFile(sequenceNum);
+                            if (master != null && master.exists()) {
+                                copyExifMetadata(master.getAbsolutePath(), savedPath, recipeName);
+                            } else {
+                                writeExifMetadata(savedPath, recipeName);
+                            }
+                        } catch (Throwable exifErr) {
+                            Log.w(TAG, "EXIF preservation non-fatal error: " + exifErr.getMessage());
                         }
-                    } catch (Throwable exifErr) {
-                        Log.w(TAG, "EXIF preservation non-fatal error: " + exifErr.getMessage());
-                    }
 
-                    try {
-                        registerWithAvindex(context, savedPath);
-                    } catch (Throwable avErr) {
-                        Log.w(TAG, "Avindex registration non-fatal error: " + avErr.getMessage());
+                        try {
+                            registerWithAvindex(context, savedPath);
+                        } catch (Throwable avErr) {
+                            Log.w(TAG, "Avindex registration non-fatal error: " + avErr.getMessage());
+                        }
                     }
 
                     return savedPath;
@@ -665,6 +701,61 @@ public final class StorageResolver {
             Log.w(TAG, "saveViaMediaStore failed: " + t.getMessage(), t);
         }
         return null;
+    }
+
+    /**
+     * Streams an already-encoded JPEG file (e.g. written by native C into app cache when SD POSIX write
+     * returns EACCES) directly into MediaStore in 64KB chunks with zero Bitmap decode/re-encode.
+     */
+    public static String saveJpegFileViaMediaStore(Context context, File srcJpegFile, String filename, String recipeName) {
+        if (context == null || srcJpegFile == null || !srcJpegFile.exists() || srcJpegFile.length() == 0) return null;
+        java.io.FileInputStream in = null;
+        java.io.OutputStream out = null;
+        try {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Images.Media.TITLE, filename);
+            cv.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+            cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+            cv.put(MediaStore.Images.Media.DESCRIPTION, "Fuji Recipe: " + (recipeName != null ? recipeName : "Default"));
+
+            Uri uri = context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+            if (uri == null) return null;
+
+            out = context.getContentResolver().openOutputStream(uri);
+            if (out == null) return null;
+            in = new java.io.FileInputStream(srcJpegFile);
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+            out.close();
+            out = null;
+            in.close();
+            in = null;
+
+            Cursor c = context.getContentResolver().query(uri, new String[]{MediaStore.Images.Media.DATA}, null, null, null);
+            String savedPath = null;
+            if (c != null) {
+                if (c.moveToFirst()) {
+                    savedPath = c.getString(0);
+                }
+                c.close();
+            }
+            if (savedPath != null && new File(savedPath).exists()) {
+                sLastDiagnostic = "OK (Native-MediaStore): " + savedPath + " (" + (new File(savedPath).length() / 1024) + "KB)";
+                Log.i(TAG, "Streamed native JPEG via MediaStore: " + sLastDiagnostic);
+                return savedPath;
+            }
+            return uri.toString();
+        } catch (Throwable t) {
+            Log.w(TAG, "saveJpegFileViaMediaStore failed: " + t.getMessage(), t);
+            return null;
+        } finally {
+            if (in != null) try { in.close(); } catch (Throwable ignored) {}
+            if (out != null) try { out.close(); } catch (Throwable ignored) {}
+        }
     }
 
     /**
@@ -1241,15 +1332,23 @@ public final class StorageResolver {
             }
             if (newest != null) {
                 long initialSize = newest.length();
-                try { Thread.sleep(50); } catch (InterruptedException ignored) {}
-                long currentSize = newest.length();
-                if (currentSize == initialSize && isJpegComplete(newest)) {
-                    Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (currentSize/1024) + " KB)");
-                    return newest;
+                if (initialSize > 200000 && isJpegComplete(newest)) {
+                    try { Thread.sleep(20); } catch (InterruptedException ignored) {}
+                    if (newest.length() == initialSize) {
+                        Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (initialSize/1024) + " KB)");
+                        return newest;
+                    }
+                } else {
+                    try { Thread.sleep(30); } catch (InterruptedException ignored) {}
+                    long currentSize = newest.length();
+                    if (currentSize == initialSize && isJpegComplete(newest)) {
+                        Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (currentSize/1024) + " KB)");
+                        return newest;
+                    }
                 }
             }
             try {
-                Thread.sleep(100);
+                Thread.sleep(40);
             } catch (InterruptedException ignored) {
                 break;
             }
