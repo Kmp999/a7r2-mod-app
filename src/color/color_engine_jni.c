@@ -1009,15 +1009,6 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLut17In
 }
 
 /**
- * Pure C Zero-JNI-Copy Fast-Path Strip Streaming entrypoint (auto scale: 1/2 for >=7000px, 1:1 otherwise).
- */
-JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImageStreamFast(
-    JNIEnv *env, jclass clazz, jstring inputPath, jstring outputPath, jint grainStrength, jint clarityStrength) {
-    return Java_com_fujilite_a7r2_ColorEngine_nativeProcessImageStreamFastScaled(
-        env, clazz, inputPath, outputPath, 0, grainStrength, clarityStrength);
-}
-
-/**
  * Pure C Zero-JNI-Copy 4-Core Single-Pass Baseline JPEG-to-JPEG Transcoder.
  * Copies the 14.7KB active 17^3 3D LUT under g_lut_mutex so Live View preview is never blocked.
  */
@@ -1051,6 +1042,15 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImage
     (*env)->ReleaseStringUTFChars(env, inputPath, in_p);
     (*env)->ReleaseStringUTFChars(env, outputPath, out_p);
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Pure C Zero-JNI-Copy Fast-Path Strip Streaming entrypoint (auto scale: 1/2 for >=7000px, 1:1 otherwise).
+ */
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImageStreamFast(
+    JNIEnv *env, jclass clazz, jstring inputPath, jstring outputPath, jint grainStrength, jint clarityStrength) {
+    return Java_com_fujilite_a7r2_ColorEngine_nativeProcessImageStreamFastScaled(
+        env, clazz, inputPath, outputPath, 0, grainStrength, clarityStrength);
 }
 
 
