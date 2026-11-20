@@ -120,7 +120,11 @@ public class CaptureController {
                 @Override
                 public void onImageStored(String dir, String filename) {
                     if (filename == null) return;
-                    final File rawFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
+                    File rawFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
+                    if (rawFile == null || !rawFile.exists()) {
+                        try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+                        rawFile = StorageResolver.resolveStoredPhotoFile(dir, filename);
+                    }
                     if (rawFile == null || !rawFile.exists()) {
                         Log.w(TAG, "StoreImageCompleteListener unresolved path: " + dir + "/" + filename);
                         return;
@@ -359,9 +363,9 @@ public class CaptureController {
                             synchronized (hardwareStoreLock) {
                                 if (!pendingHardwareStoredQueue.isEmpty()) {
                                     newPhoto = pendingHardwareStoredQueue.pollFirst();
-                                } else if (storeImageListenerSeen && !isShuttingDown) {
+                                } else if (!isShuttingDown) {
                                     try {
-                                        hardwareStoreLock.wait(2000);
+                                        hardwareStoreLock.wait(1500);
                                     } catch (InterruptedException ignored) {}
                                     if (!pendingHardwareStoredQueue.isEmpty()) {
                                         newPhoto = pendingHardwareStoredQueue.pollFirst();
@@ -372,6 +376,7 @@ public class CaptureController {
 
                             // 2. Fallback: watch for newly saved 42.4MP master DSC0xxxx.JPG on SD card
                             if (newPhoto == null) {
+                                if (uiController != null) uiController.updateStatusAsync("Waiting for SD photo...");
                                 if (hadInitialSnapshot) {
                                     newPhoto = StorageResolver.waitForNewCameraPhoto(preExistingFiles, 7000);
                                 } else {
@@ -380,15 +385,27 @@ public class CaptureController {
                                 }
                             }
                             if (newPhoto == null) {
-                                newPhoto = StorageResolver.getLatestCameraPhoto();
+                                File master = StorageResolver.findRawMasterFile(seqNum);
+                                if (master != null && !preExistingFiles.contains(master.getAbsolutePath()) && !preExistingFiles.contains(master.getName())) {
+                                    newPhoto = master;
+                                }
                             }
                             if (newPhoto == null) {
-                                newPhoto = StorageResolver.getLatestSavedPhoto();
+                                File latest = StorageResolver.getLatestCameraPhoto();
+                                if (latest != null && !preExistingFiles.contains(latest.getAbsolutePath()) && !preExistingFiles.contains(latest.getName())) {
+                                    newPhoto = latest;
+                                }
+                            }
+                            if (newPhoto == null) {
+                                File saved = StorageResolver.getLatestSavedPhoto();
+                                if (saved != null && !preExistingFiles.contains(saved.getAbsolutePath()) && !preExistingFiles.contains(saved.getName())) {
+                                    newPhoto = saved;
+                                }
                             }
                             if (newPhoto != null) {
                                 recordKnownPhoto(newPhoto);
                                 if (!claimPhotoForProcessing(newPhoto)) {
-                                    Log.d(TAG, "Skipping already-graded photo: " + newPhoto.getName());
+                                    Log.d(TAG, "Photo already claimed: " + newPhoto.getName());
                                     return;
                                 }
                             }
@@ -398,17 +415,11 @@ public class CaptureController {
 
                             if (photoPath != null) {
                                 jobStarted = true;
+                                if (uiController != null) uiController.updateStatusAsync("Grading " + newPhoto.getName() + "...");
                                 processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
                             } else {
-                                File master = StorageResolver.findRawMasterFile(seqNum);
-                                if (master != null && claimPhotoForProcessing(master)) {
-                                    recordKnownPhoto(master);
-                                    jobStarted = true;
-                                    processStripStreamingCapture(master.getAbsolutePath(), null, seqNum, captureStartTime);
-                                } else {
-                                    Log.e(TAG, "No photo found on SD card after hardware capture");
-                                    if (uiController != null) uiController.updateStatusAsync("ERR: No photo found");
-                                }
+                                Log.e(TAG, "No photo found on SD card after hardware capture");
+                                if (uiController != null) uiController.updateStatusAsync("ERR: SD timeout (no photo written)");
                             }
                         } finally {
                             if (!jobStarted) {
@@ -836,6 +847,12 @@ public class CaptureController {
                             Log.w(TAG, "Aborting strip streaming: camera shutdown in progress");
                             streamSuccess = false;
                             break;
+                        }
+
+                        if (stripIdx % 10 == 0 || stripIdx == numStrips - 1) {
+                            if (uiController != null) {
+                                uiController.updateStatusAsync(String.format(Locale.US, "Grading strip %d/%d...", (stripIdx + 1), numStrips));
+                            }
                         }
 
                         int srcY = stripIdx * srcStripH;

@@ -1290,6 +1290,8 @@ public final class StorageResolver {
             for (String name : names) {
                 if (name != null && name.length() > 4) {
                     set.add(dirPath + File.separator + name);
+                    set.add(name);
+                    set.add(name.toUpperCase(Locale.US));
                 }
             }
         }
@@ -1316,7 +1318,7 @@ public final class StorageResolver {
                     String name = rawName.toUpperCase(Locale.US);
                     if ((name.endsWith(".JPG") || name.endsWith(".JPEG")) && !name.startsWith("FUJI_")) {
                         String fullPath = dirPath + File.separator + rawName;
-                        if (preExistingFiles != null && preExistingFiles.contains(fullPath)) {
+                        if (preExistingFiles != null && (preExistingFiles.contains(fullPath) || preExistingFiles.contains(rawName) || preExistingFiles.contains(name))) {
                             continue;
                         }
                         File f = new File(dir, rawName);
@@ -1354,7 +1356,14 @@ public final class StorageResolver {
             }
         }
         File fallback = getLatestCameraPhoto();
-        return (fallback != null) ? fallback : getLatestSavedPhoto();
+        if (fallback != null && preExistingFiles != null) {
+            String fbPath = fallback.getAbsolutePath();
+            String fbName = fallback.getName();
+            if (preExistingFiles.contains(fbPath) || preExistingFiles.contains(fbName) || preExistingFiles.contains(fbName.toUpperCase(Locale.US))) {
+                return null; // Never falsely return an old pre-existing photo on timeout!
+            }
+        }
+        return fallback;
     }
 
     /**

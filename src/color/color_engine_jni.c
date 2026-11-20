@@ -25,255 +25,37 @@ static int32_t* g_int_scratch = NULL;
 static size_t g_int_scratch_cap = 0;
 static pthread_mutex_t g_int_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Serializes dispatch to the persistent dual-core strip worker
+// Serializes dispatch to strip operations
 static pthread_mutex_t g_strip_call_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Pipelined async JPEG strip encoder worker (overlaps strip N JPEG encode on Core 1
-// with strip N+1 BitmapRegionDecoder decode + grading on Core 0/2)
-typedef struct {
-    JpegStreamState* state;
-    int is_argb;
-    uint8_t* buf;
-    size_t buf_cap;
-    int width;
-    int height;
-    int row_offset;
-    int has_job;
-    int busy;
-    int last_ok;
-    int started;
-    pthread_t thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_start;
-    pthread_cond_t cond_done;
-} EncodeWorkerState;
-
-static EncodeWorkerState g_encode_worker = {
-    NULL, 0, NULL, 0, 0, 0, 0, 0, 0, 1, 0,
-    (pthread_t)0,
-    PTHREAD_MUTEX_INITIALIZER,
-    PTHREAD_COND_INITIALIZER,
-    PTHREAD_COND_INITIALIZER
-};
-
-static void* encode_worker_loop(void* arg) {
-    (void)arg;
-    for (;;) {
-        pthread_mutex_lock(&g_encode_worker.mutex);
-        while (!g_encode_worker.has_job) {
-            pthread_cond_wait(&g_encode_worker.cond_start, &g_encode_worker.mutex);
-        }
-        JpegStreamState* st = g_encode_worker.state;
-        int is_argb = g_encode_worker.is_argb;
-        uint8_t* buf = g_encode_worker.buf;
-        int w = g_encode_worker.width;
-        int h = g_encode_worker.height;
-        int row_off = g_encode_worker.row_offset;
-        g_encode_worker.has_job = 0;
-        pthread_mutex_unlock(&g_encode_worker.mutex);
-
-        int ok = is_argb
-            ? native_jpeg_stream_write_strip_argb8888(st, (const uint32_t*)buf, w, h, row_off)
-            : native_jpeg_stream_write_strip_rgb565(st, (const uint16_t*)buf, w, h, row_off);
-
-        pthread_mutex_lock(&g_encode_worker.mutex);
-        if (!ok) g_encode_worker.last_ok = 0;
-        g_encode_worker.busy = 0;
-        pthread_cond_signal(&g_encode_worker.cond_done);
-        pthread_mutex_unlock(&g_encode_worker.mutex);
-    }
-    return NULL;
-}
-
-static int encode_worker_wait(void) {
-    pthread_mutex_lock(&g_encode_worker.mutex);
-    while (g_encode_worker.busy) {
-        pthread_cond_wait(&g_encode_worker.cond_done, &g_encode_worker.mutex);
-    }
-    int ok = g_encode_worker.last_ok;
-    pthread_mutex_unlock(&g_encode_worker.mutex);
-    return ok;
-}
-
-static void encode_worker_reset_for_open(void) {
-    pthread_mutex_lock(&g_encode_worker.mutex);
-    while (g_encode_worker.busy) {
-        pthread_cond_wait(&g_encode_worker.cond_done, &g_encode_worker.mutex);
-    }
-    g_encode_worker.last_ok = 1;
-    pthread_mutex_unlock(&g_encode_worker.mutex);
-}
-
+// Direct synchronous strip encoder (eliminates multi-threaded condition variable deadlocks & memcpy overhead)
 static int encode_worker_submit(JpegStreamState* state, int is_argb, const void* pixels,
                                 int width, int height, int row_offset) {
-    size_t bytes = (size_t)width * (size_t)height * (is_argb ? 4U : 2U);
-    pthread_mutex_lock(&g_encode_worker.mutex);
-    while (g_encode_worker.busy) {
-        pthread_cond_wait(&g_encode_worker.cond_done, &g_encode_worker.mutex);
-    }
-    if (!g_encode_worker.last_ok) {
-        pthread_mutex_unlock(&g_encode_worker.mutex);
-        return 0;
-    }
-    if (g_encode_worker.buf_cap < bytes) {
-        uint8_t* grown = (uint8_t*)realloc(g_encode_worker.buf, bytes);
-        if (grown == NULL) {
-            pthread_mutex_unlock(&g_encode_worker.mutex);
-            return is_argb
-                ? native_jpeg_stream_write_strip_argb8888(state, (const uint32_t*)pixels, width, height, row_offset)
-                : native_jpeg_stream_write_strip_rgb565(state, (const uint16_t*)pixels, width, height, row_offset);
-        }
-        g_encode_worker.buf = grown;
-        g_encode_worker.buf_cap = bytes;
-    }
-    if (!g_encode_worker.started) {
-        if (pthread_create(&g_encode_worker.thread, NULL, encode_worker_loop, NULL) == 0) {
-            g_encode_worker.started = 1;
-        }
-    }
-    if (g_encode_worker.started) {
-        memcpy(g_encode_worker.buf, pixels, bytes);
-        g_encode_worker.state = state;
-        g_encode_worker.is_argb = is_argb;
-        g_encode_worker.width = width;
-        g_encode_worker.height = height;
-        g_encode_worker.row_offset = row_offset;
-        g_encode_worker.busy = 1;
-        g_encode_worker.has_job = 1;
-        pthread_cond_signal(&g_encode_worker.cond_start);
-        pthread_mutex_unlock(&g_encode_worker.mutex);
-        return 1;
-    }
-    pthread_mutex_unlock(&g_encode_worker.mutex);
+    if (!state || !pixels || width <= 0 || height <= 0) return 0;
     return is_argb
         ? native_jpeg_stream_write_strip_argb8888(state, (const uint32_t*)pixels, width, height, row_offset)
         : native_jpeg_stream_write_strip_rgb565(state, (const uint16_t*)pixels, width, height, row_offset);
 }
 
-// Persistent dual-core strip grading worker (splits 64-row strips across both Cortex-A9 cores)
-typedef struct {
-    int is_argb;
-    void* pixels;
-    int width;
-    int height;
-    int row_offset;
-    int grain_strength;
-    int clarity_strength;
-    int has_job;
-    int done;
-    int started;
-    pthread_t thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_start;
-    pthread_cond_t cond_done;
-} StripWorkerState;
+static int encode_worker_wait(void) {
+    return 1;
+}
 
-static StripWorkerState g_strip_worker = {
-    0, NULL, 0, 0, 0, 0, 0, 0, 0, 0,
-    (pthread_t)0,
-    PTHREAD_MUTEX_INITIALIZER,
-    PTHREAD_COND_INITIALIZER,
-    PTHREAD_COND_INITIALIZER
-};
-
-static void* strip_worker_loop(void* arg) {
-    (void)arg;
-    for (;;) {
-        pthread_mutex_lock(&g_strip_worker.mutex);
-        while (!g_strip_worker.has_job) {
-            pthread_cond_wait(&g_strip_worker.cond_start, &g_strip_worker.mutex);
-        }
-        int is_argb = g_strip_worker.is_argb;
-        void* pixels = g_strip_worker.pixels;
-        int w = g_strip_worker.width;
-        int h = g_strip_worker.height;
-        int row_off = g_strip_worker.row_offset;
-        int grain = g_strip_worker.grain_strength;
-        int clarity = g_strip_worker.clarity_strength;
-        g_strip_worker.has_job = 0;
-        pthread_mutex_unlock(&g_strip_worker.mutex);
-
-        if (is_argb) {
-            lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, w, h, row_off, grain, clarity);
-        } else {
-            lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, w, h, row_off, grain, clarity);
-        }
-
-        pthread_mutex_lock(&g_strip_worker.mutex);
-        g_strip_worker.done = 1;
-        pthread_cond_signal(&g_strip_worker.cond_done);
-        pthread_mutex_unlock(&g_strip_worker.mutex);
-    }
-    return NULL;
+static void encode_worker_reset_for_open(void) {
 }
 
 static void grade_strip_parallel(int is_argb, void* pixels, int width, int height,
                                  int row_offset, int grain_strength, int clarity_strength) {
-    // Initialize static grain LUT before launching parallel readers (prevents race on first call)
     init_static_grain_table();
-    pthread_mutex_lock(&g_lut_mutex);
-
-    if (height < 16) {
-        if (is_argb) {
-            lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
-        } else {
-            lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
-        }
-        pthread_mutex_unlock(&g_lut_mutex);
-        return;
-    }
-
-    int half = height >> 1;
-    int bottom_h = height - half;
-    void* bottom_ptr = is_argb
-        ? (void*)(((uint32_t*)pixels) + (size_t)half * width)
-        : (void*)(((uint16_t*)pixels) + (size_t)half * width);
-
     pthread_mutex_lock(&g_strip_call_mutex);
-    pthread_mutex_lock(&g_strip_worker.mutex);
-    if (!g_strip_worker.started) {
-        if (pthread_create(&g_strip_worker.thread, NULL, strip_worker_loop, NULL) == 0) {
-            g_strip_worker.started = 1;
-        }
-    }
-    if (g_strip_worker.started) {
-        g_strip_worker.is_argb = is_argb;
-        g_strip_worker.pixels = bottom_ptr;
-        g_strip_worker.width = width;
-        g_strip_worker.height = bottom_h;
-        g_strip_worker.row_offset = row_offset + half;
-        g_strip_worker.grain_strength = grain_strength;
-        g_strip_worker.clarity_strength = clarity_strength;
-        g_strip_worker.done = 0;
-        g_strip_worker.has_job = 1;
-        pthread_cond_signal(&g_strip_worker.cond_start);
-        pthread_mutex_unlock(&g_strip_worker.mutex);
-
-        // Core 0 processes top half while Core 1 processes bottom half
-        if (is_argb) {
-            lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, half, row_offset, grain_strength, clarity_strength);
-        } else {
-            lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, half, row_offset, grain_strength, clarity_strength);
-        }
-
-        pthread_mutex_lock(&g_strip_worker.mutex);
-        while (!g_strip_worker.done) {
-            pthread_cond_wait(&g_strip_worker.cond_done, &g_strip_worker.mutex);
-        }
-        pthread_mutex_unlock(&g_strip_worker.mutex);
-        pthread_mutex_unlock(&g_strip_call_mutex);
-        pthread_mutex_unlock(&g_lut_mutex);
-        return;
-    }
-    pthread_mutex_unlock(&g_strip_worker.mutex);
-    pthread_mutex_unlock(&g_strip_call_mutex);
-
+    pthread_mutex_lock(&g_lut_mutex);
     if (is_argb) {
         lut17_process_argb8888_advanced_offset(&g_lut17, (uint32_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
     } else {
         lut17_process_rgb565_advanced_offset(&g_lut17, (uint16_t*)pixels, width, height, row_offset, grain_strength, clarity_strength);
     }
     pthread_mutex_unlock(&g_lut_mutex);
+    pthread_mutex_unlock(&g_strip_call_mutex);
 }
 
 // 4x4 Bayer Ordered Dithering Matrix for RGB_565 banding reduction
@@ -854,17 +636,8 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGradeAndWrit
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeCloseJpegStream(
     JNIEnv *env, jclass clazz, jlong handle, jint success) {
     if (handle == 0) return JNI_FALSE;
-    int encode_ok = encode_worker_wait();
-    pthread_mutex_lock(&g_encode_worker.mutex);
-    if (g_encode_worker.buf != NULL) {
-        free(g_encode_worker.buf);
-        g_encode_worker.buf = NULL;
-        g_encode_worker.buf_cap = 0;
-    }
-    pthread_mutex_unlock(&g_encode_worker.mutex);
-
     JpegStreamState* state = (JpegStreamState*)(intptr_t)handle;
-    int ok = native_jpeg_stream_close(state, (success && encode_ok) ? 1 : 0);
+    int ok = native_jpeg_stream_close(state, success ? 1 : 0);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
