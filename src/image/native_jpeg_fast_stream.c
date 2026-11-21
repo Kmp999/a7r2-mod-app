@@ -65,7 +65,16 @@ static void fs_read_sched_info(int* out_bg, int* out_mhz) {
 #ifndef _WIN32
     char path[96];
     char line[192];
-    snprintf(path, sizeof(path), "/proc/self/task/%ld/cgroup", (long)syscall(SYS_gettid));
+#if defined(__ANDROID__)
+    long tid = (long)gettid();
+#elif defined(SYS_gettid)
+    long tid = (long)syscall(SYS_gettid);
+#elif defined(__NR_gettid)
+    long tid = (long)syscall(__NR_gettid);
+#else
+    long tid = (long)getpid();
+#endif
+    snprintf(path, sizeof(path), "/proc/self/task/%ld/cgroup", tid);
     FILE* f = fopen(path, "r");
     if (f) {
         while (fgets(line, sizeof(line), f)) {
@@ -1656,7 +1665,7 @@ static void apply_luma_grain_clarity_mcu(int16_t y_blk[4][64], int global_x0, in
 
 // Emits 2x2 RGB565 DC preview pixels for one 16x16 MCU using already-computed FDCT DC coefficients (0 extra I/O!)
 static inline void emit_mcu_preview_2x2(uint16_t* preview, int pw, int ph, int omx, int out_my,
-                                        const int16_t y_blk[4][64], const int cb_q[4], const int cr_q[4]) {
+                                        int16_t y_blk[4][64], const int cb_q[4], const int cr_q[4]) {
     if (!preview) return;
     int px0 = omx * 2, py0 = out_my * 2;
     for (int b = 0; b < 4; b++) {
