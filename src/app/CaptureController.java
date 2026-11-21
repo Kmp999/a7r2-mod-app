@@ -186,6 +186,8 @@ public class CaptureController {
     private volatile boolean storeImageListenerSeen = false;
     private volatile boolean isShuttingDown = false;
     private volatile String lastPrecomputedLutSig = null;
+    // Remembers which POSIX output tier succeeded (1=.tmp, 2=direct DCIM, 3=cache->MediaStore) to skip EACCES retries
+    private static volatile int sPreferredFastOutputTier = 1;
 
     private void ensureRecipeLutPrecomputed(FujiRecipe recipe) {
         if (recipe == null || !USE_NATIVE_ENGINE || !ColorEngine.isNativeAvailable()) return;
@@ -604,11 +606,9 @@ public class CaptureController {
         // anything else is runnable) and every native pthread inherits that. Run the heavy transcode at default
         // priority (same as the UI thread, never above it) and restore afterwards.
         int prevPrio = Integer.MIN_VALUE;
-        int procNice = 99;
         try {
             prevPrio = android.os.Process.getThreadPriority(android.os.Process.myTid());
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT);
-            procNice = android.os.Process.getThreadPriority(android.os.Process.myTid());
         } catch (Throwable ignored) {}
         try {
             // 1. Resolve master raw JPEG file (Zero Data Destruction: NEVER delete DSC0xxxx.JPG)
@@ -721,44 +721,46 @@ public class CaptureController {
             long brdDecMs = 0;
             long brdJniMs = 0;
 
+            int usedFastTier = 0;
             if (nativeReady) {
                 long tFast0 = System.currentTimeMillis();
                 if (uiController != null) {
                     uiController.updateStatusAsync("Fast 4-Core Grading...");
                 }
-                if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, tmpFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
-                    streamSuccess = true;
-                    usedFastTranscode = true;
-                    inlineExifWritten = true;
-                    lastFastRc = 1;
-                } else {
-                    lastFastRc = ColorEngine.getLastFastRcSafe();
-                    // Only retry Tier 2/3 output targets when Tier 1 failed to open the .tmp output file (rc == -9)
-                    if (lastFastRc == -9) {
-                        if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, targetOutputFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
-                            streamSuccess = true;
-                            usedFastTranscode = true;
-                            usedDirectTarget = true;
-                            inlineExifWritten = true;
-                            lastFastRc = 1;
-                        } else {
-                            lastFastRc = ColorEngine.getLastFastRcSafe();
-                            if (lastFastRc == -9 && context != null && context.getCacheDir() != null) {
-                                cacheStreamFile = new File(context.getCacheDir(), String.format(Locale.US, "fuji_stream_%04d.jpg", seqNum));
-                                if (cacheStreamFile.exists()) cacheStreamFile.delete();
-                                if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, cacheStreamFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
-                                    streamSuccess = true;
-                                    usedFastTranscode = true;
-                                    usedCacheStream = true;
-                                    inlineExifWritten = true;
-                                    lastFastRc = 1;
-                                } else {
-                                    lastFastRc = ColorEngine.getLastFastRcSafe();
-                                    if (cacheStreamFile.exists()) cacheStreamFile.delete();
-                                    cacheStreamFile = null;
-                                }
-                            }
+                int pref = sPreferredFastOutputTier;
+                int[] tierOrder = (pref == 3) ? new int[]{3, 1, 2}
+                    : ((pref == 2) ? new int[]{2, 1, 3} : new int[]{1, 2, 3});
+                for (int ti = 0; ti < tierOrder.length && !streamSuccess; ti++) {
+                    int tier = tierOrder[ti];
+                    String outPath = null;
+                    if (tier == 1) {
+                        outPath = tmpFile.getAbsolutePath();
+                    } else if (tier == 2) {
+                        outPath = targetOutputFile.getAbsolutePath();
+                    } else if (tier == 3 && context != null && context.getCacheDir() != null) {
+                        cacheStreamFile = new File(context.getCacheDir(), String.format(Locale.US, "fuji_stream_%04d.jpg", seqNum));
+                        if (cacheStreamFile.exists()) cacheStreamFile.delete();
+                        outPath = cacheStreamFile.getAbsolutePath();
+                    }
+                    if (outPath == null) continue;
+
+                    if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, outPath, targetSample, grainStrength, clarityStrength)) {
+                        streamSuccess = true;
+                        usedFastTranscode = true;
+                        inlineExifWritten = true;
+                        lastFastRc = 1;
+                        usedFastTier = tier;
+                        if (tier == 2) usedDirectTarget = true;
+                        else if (tier == 3) usedCacheStream = true;
+                        sPreferredFastOutputTier = tier;
+                    } else {
+                        lastFastRc = ColorEngine.getLastFastRcSafe();
+                        if (tier == 3 && cacheStreamFile != null) {
+                            if (cacheStreamFile.exists()) cacheStreamFile.delete();
+                            cacheStreamFile = null;
                         }
+                        // Only retry other output tiers when output file open failed (rc == -9)
+                        if (lastFastRc != -9) break;
                     }
                 }
                 fastTranscodeMs = System.currentTimeMillis() - tFast0;
@@ -1131,9 +1133,9 @@ public class CaptureController {
                     fastStats[5], (fastStats[7] != 0 ? 7 : 5), (fastStats[6] != 0 ? "N" : ""))
                 : null;
             final String profDiag = (fastStats != null && fastStats.length >= 24)
-                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d rd:%d lutb:%d pin:%d b:%d/%d n:%d",
+                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d rd:%d lutb:%d pin:%d t%d b:%d/%d",
                     fastStats[13], fastStats[12], fastStats[14], fastStats[15], fastStats[16], fastStats[17],
-                    fastStats[10], fastStats[22], fastStats[11], fastStats[23], fastStats[18], fastStats[19], procNice)
+                    fastStats[10], fastStats[22], fastStats[11], fastStats[23], usedFastTier, fastStats[18], fastStats[19])
                 : null;
             final String perfTag = usedFastTranscode
                 ? String.format(Locale.US, "C-FAST sd:%d c:%d", sdWaitMs, fastTranscodeMs)

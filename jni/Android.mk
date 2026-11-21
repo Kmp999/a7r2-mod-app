@@ -35,7 +35,7 @@ LOCAL_LDLIBS    := -llog -lm
 # Force full 32-bit ARM mode (prevents 16-bit Thumb-1 register spilling -> 3-5x faster IDCT/FDCT/LUT).
 # Avoids forced NEON (prevents SIGILL on non-NEON cores) and emits classic DT_HASH for legacy dlopen.
 LOCAL_ARM_MODE  := arm
-LOCAL_CFLAGS    := -std=gnu99 -O3 -funroll-loops -fomit-frame-pointer -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
+LOCAL_CFLAGS    := -std=gnu99 -O3 -fomit-frame-pointer -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
 LOCAL_CFLAGS    += -mcpu=cortex-a5 -mtune=cortex-a5
 endif

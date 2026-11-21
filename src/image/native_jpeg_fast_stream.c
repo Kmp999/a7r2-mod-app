@@ -7,12 +7,19 @@
 
 #ifndef _WIN32
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define FS_NOINLINE __attribute__((noinline))
+#else
+#define FS_NOINLINE
 #endif
 
 static inline uint8_t clamp_u8_v7(int v) {
@@ -22,6 +29,28 @@ static inline uint8_t clamp_u8_v7(int v) {
     return (uint8_t)res;
 #else
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+#endif
+}
+
+static inline uint8_t clamp_u8_asr9_v7(int v) {
+#if defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_6__)
+    int res;
+    __asm__("usat %0, #8, %1, asr #9" : "=r"(res) : "r"(v));
+    return (uint8_t)res;
+#else
+    int s = v >> 9;
+    return (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
+#endif
+}
+
+static inline uint8_t clamp_u8_asr10_v7(int v) {
+#if defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_6__)
+    int res;
+    __asm__("usat %0, #8, %1, asr #10" : "=r"(res) : "r"(v));
+    return (uint8_t)res;
+#else
+    int s = v >> 10;
+    return (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
 #endif
 }
 
@@ -604,9 +633,89 @@ static void build_fast_huff(FastHuffTable* t, const uint8_t bits[17], const uint
     t->valid = 1;
 }
 
-// Buffered 64-bit MSB-aligned JPEG entropy reader (direct RAM buffer OR 64KB FILE* stream; 32-bit ARMv7 REV refill!)
+#ifndef _WIN32
+static int sem_wait_eintr(sem_t* s) {
+    for (;;) {
+        if (sem_wait(s) == 0) return 1;
+        if (errno != EINTR) return 0;
+    }
+}
+
+// Asynchronous progressive SD prefetcher: reads input entropy scan via raw 256KB POSIX read()
+// in the background so SD I/O (~2.4s on A7R2) overlaps 100% with the 4-core compute pipeline!
+typedef struct {
+    int fd;
+    uint8_t* buf;
+    size_t total_len;
+    volatile size_t ready_len;
+    volatile int done;
+    volatile int waiters;
+    volatile int cancel;
+    sem_t chunk_sem;
+    pthread_t tid;
+    int active;
+} IoPrefetcher;
+
+static void* io_prefetch_main(void* p) {
+    IoPrefetcher* pf = (IoPrefetcher*)p;
+    size_t off = 0;
+    size_t chunk = 131072U; // 128KB first chunk so Band 0 starts in ~50ms, then 256KB for max SD DMA speed
+    while (off < pf->total_len && !pf->cancel) {
+        size_t want = pf->total_len - off;
+        if (want > chunk) want = chunk;
+        ssize_t got = read(pf->fd, pf->buf + off, want);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (got == 0) break;
+        off += (size_t)got;
+        chunk = 262144U;
+        __sync_synchronize();
+        pf->ready_len = off;
+        if (pf->waiters > 0) sem_post(&pf->chunk_sem);
+    }
+    memset(pf->buf + off, 0, 8);
+    __sync_synchronize();
+    pf->ready_len = off;
+    pf->done = 1;
+    sem_post(&pf->chunk_sem);
+    return NULL;
+}
+
+static int io_prefetch_start(IoPrefetcher* pf, int fd, uint8_t* buf, size_t total_len) {
+    memset(pf, 0, sizeof(IoPrefetcher));
+    pf->fd = fd;
+    pf->buf = buf;
+    pf->total_len = total_len;
+    if (sem_init(&pf->chunk_sem, 0, 0) != 0) return 0;
+    if (pthread_create(&pf->tid, NULL, io_prefetch_main, pf) != 0) {
+        sem_destroy(&pf->chunk_sem);
+        return 0;
+    }
+    pf->active = 1;
+    return 1;
+}
+
+static void io_prefetch_destroy(IoPrefetcher* pf) {
+    if (!pf->active) return;
+    pf->cancel = 1;
+    pthread_join(pf->tid, NULL);
+    if (pf->fd >= 0) {
+        close(pf->fd);
+        pf->fd = -1;
+    }
+    sem_destroy(&pf->chunk_sem);
+    pf->active = 0;
+}
+#endif
+
+// Buffered 64-bit MSB-aligned JPEG entropy reader (async IoPrefetcher RAM buffer OR 64KB FILE* stream!)
 typedef struct {
     FILE* fp;
+#ifndef _WIN32
+    IoPrefetcher* pf;
+#endif
     uint8_t* buf;
     uint8_t stream_buf[65536];
     size_t pos, len;
@@ -615,15 +724,51 @@ typedef struct {
     int marker_hit;
     uint8_t pending_marker;
     int eof;
+    uint64_t io_wait_ms;
 } FastBitReader;
+
+#ifndef _WIN32
+static size_t fbr_sync_prefetch(FastBitReader* br, size_t need_pos) {
+    IoPrefetcher* pf = br->pf;
+    if (!pf) return br->len;
+    size_t r = pf->ready_len;
+    __sync_synchronize();
+    if (r > need_pos || pf->done) {
+        br->len = r;
+        return r;
+    }
+    uint64_t tw0 = fs_now_ms();
+    __sync_fetch_and_add(&pf->waiters, 1);
+    for (;;) {
+        r = pf->ready_len;
+        __sync_synchronize();
+        if (r > need_pos || pf->done) break;
+        sem_wait_eintr(&pf->chunk_sem);
+    }
+    __sync_fetch_and_sub(&pf->waiters, 1);
+    br->io_wait_ms += (fs_now_ms() - tw0);
+    br->len = r;
+    return r;
+}
+#endif
 
 static inline int fbr_next_raw_byte(FastBitReader* br) {
     if (br->pos >= br->len) {
-        if (!br->fp) { br->eof = 1; return -1; }
-        br->len = fread(br->stream_buf, 1, sizeof(br->stream_buf), br->fp);
-        br->buf = br->stream_buf;
-        br->pos = 0;
-        if (br->len == 0) { br->eof = 1; return -1; }
+#ifndef _WIN32
+        if (br->pf) {
+            if (fbr_sync_prefetch(br, br->pos) <= br->pos) {
+                br->eof = 1;
+                return -1;
+            }
+        } else
+#endif
+        {
+            if (!br->fp) { br->eof = 1; return -1; }
+            br->len = fread(br->stream_buf, 1, sizeof(br->stream_buf), br->fp);
+            br->buf = br->stream_buf;
+            br->pos = 0;
+            if (br->len == 0) { br->eof = 1; return -1; }
+        }
     }
     return (int)br->buf[br->pos++];
 }
@@ -982,8 +1127,8 @@ static inline void idct_row_aan(const int16_t* ir, const int32_t* dr, int32_t* w
     wr[3] = (t3 - t4 + 1) >> 1; wr[4] = (t3 + t4 + 1) >> 1;
 }
 
-// Fast Sparse Row-Mask AAN 2D IDCT (8x8 -> 8x8) with bit-exact 1-row, 2-row, and 4-row column fast paths + USAT
-static inline void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const uint16_t* q_raw, uint8_t* out) {
+// Fast Sparse Row-Mask AAN 2D IDCT (8x8 -> 8x8) with bit-exact 1/2/4-row paths + ARMv7 USAT ASR #9 (L1 I-cache compact!)
+static FS_NOINLINE void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const uint16_t* q_raw, uint8_t* out) {
     const int16_t* in = blk->c;
     if (!blk->has_ac) {
         uint8_t c = clamp_u8_v7((((int)in[0] * (int)q_raw[0] + 4) >> 3) + 128);
@@ -996,7 +1141,7 @@ static inline void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const ui
         int32_t r0[8];
         idct_row_aan(in, dq, r0);
         for (int c = 0; c < 8; c++) {
-            out[c] = clamp_u8_v7(((r0[c] + 256) >> 9) + 128);
+            out[c] = clamp_u8_asr9_v7(r0[c] + 65792);
         }
         for (int r = 1; r < 8; r++) {
             memcpy(out + r * 8, out, 8);
@@ -1015,21 +1160,21 @@ static inline void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const ui
     if ((rmask & 0xFCU) == 0) {
         idct_row_aan(in + 8, dq + 8, ws + 8);
         for (int c = 0; c < 8; c++) {
-            int32_t w0 = ws[c], w1 = ws[c + 8];
+            int32_t w0 = ws[c] + 65792, w1 = ws[c + 8];
             int32_t t11 = (w1 * 362 + 128) >> 8;
             int32_t z5 = (w1 * 473 + 128) >> 8;
             int32_t t10 = ((w1 * 277 + 128) >> 8) - z5;
             int32_t t6 = z5 - w1;
             int32_t t5 = t11 - t6;
             int32_t t4 = t10 + t5;
-            out[c]      = clamp_u8_v7(((w0 + w1 + 256) >> 9) + 128);
-            out[c + 56] = clamp_u8_v7(((w0 - w1 + 256) >> 9) + 128);
-            out[c + 8]  = clamp_u8_v7(((w0 + t6 + 256) >> 9) + 128);
-            out[c + 48] = clamp_u8_v7(((w0 - t6 + 256) >> 9) + 128);
-            out[c + 16] = clamp_u8_v7(((w0 + t5 + 256) >> 9) + 128);
-            out[c + 40] = clamp_u8_v7(((w0 - t5 + 256) >> 9) + 128);
-            out[c + 24] = clamp_u8_v7(((w0 - t4 + 256) >> 9) + 128);
-            out[c + 32] = clamp_u8_v7(((w0 + t4 + 256) >> 9) + 128);
+            out[c]      = clamp_u8_asr9_v7(w0 + w1);
+            out[c + 56] = clamp_u8_asr9_v7(w0 - w1);
+            out[c + 8]  = clamp_u8_asr9_v7(w0 + t6);
+            out[c + 48] = clamp_u8_asr9_v7(w0 - t6);
+            out[c + 16] = clamp_u8_asr9_v7(w0 + t5);
+            out[c + 40] = clamp_u8_asr9_v7(w0 - t5);
+            out[c + 24] = clamp_u8_asr9_v7(w0 - t4);
+            out[c + 32] = clamp_u8_asr9_v7(w0 + t4);
         }
         return;
     }
@@ -1040,9 +1185,9 @@ static inline void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const ui
             else zero_row8_i32(ws + r * 8);
         }
         for (int c = 0; c < 8; c++) {
-            int32_t w0 = ws[c], w1 = ws[c + 8], w2 = ws[c + 16], w3 = ws[c + 24];
+            int32_t w0 = ws[c] + 65792, w1 = ws[c + 8], w2 = ws[c + 16], w3 = ws[c + 24];
             if ((w1 | w2 | w3) == 0) {
-                uint8_t cl = clamp_u8_v7(((w0 + 256) >> 9) + 128);
+                uint8_t cl = clamp_u8_asr9_v7(w0);
                 out[c] = out[c+8] = out[c+16] = out[c+24] = out[c+32] = out[c+40] = out[c+48] = out[c+56] = cl;
                 continue;
             }
@@ -1054,14 +1199,14 @@ static inline void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const ui
             int32_t t10 = ((w1 * 277 + 128) >> 8) - z5;
             int32_t t12o = ((w3 * 669 + 128) >> 8) + z5;
             int32_t t6 = t12o - t7, t5 = t11 - t6, t4 = t10 + t5;
-            out[c]      = clamp_u8_v7(((t0 + t7 + 256) >> 9) + 128);
-            out[c + 56] = clamp_u8_v7(((t0 - t7 + 256) >> 9) + 128);
-            out[c + 8]  = clamp_u8_v7(((t1 + t6 + 256) >> 9) + 128);
-            out[c + 48] = clamp_u8_v7(((t1 - t6 + 256) >> 9) + 128);
-            out[c + 16] = clamp_u8_v7(((t2 + t5 + 256) >> 9) + 128);
-            out[c + 40] = clamp_u8_v7(((t2 - t5 + 256) >> 9) + 128);
-            out[c + 24] = clamp_u8_v7(((t3 - t4 + 256) >> 9) + 128);
-            out[c + 32] = clamp_u8_v7(((t3 + t4 + 256) >> 9) + 128);
+            out[c]      = clamp_u8_asr9_v7(t0 + t7);
+            out[c + 56] = clamp_u8_asr9_v7(t0 - t7);
+            out[c + 8]  = clamp_u8_asr9_v7(t1 + t6);
+            out[c + 48] = clamp_u8_asr9_v7(t1 - t6);
+            out[c + 16] = clamp_u8_asr9_v7(t2 + t5);
+            out[c + 40] = clamp_u8_asr9_v7(t2 - t5);
+            out[c + 24] = clamp_u8_asr9_v7(t3 - t4);
+            out[c + 32] = clamp_u8_asr9_v7(t3 + t4);
         }
         return;
     }
@@ -1074,11 +1219,11 @@ static inline void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const ui
     for (int c = 0; c < 8; c++) {
         int32_t* wc = ws + c;
         if ((wc[8] | wc[16] | wc[24] | wc[32] | wc[40] | wc[48] | wc[56]) == 0) {
-            uint8_t cl = clamp_u8_v7(((wc[0] + 256) >> 9) + 128);
+            uint8_t cl = clamp_u8_asr9_v7(wc[0] + 65792);
             out[c] = out[c+8] = out[c+16] = out[c+24] = out[c+32] = out[c+40] = out[c+48] = out[c+56] = cl;
             continue;
         }
-        int32_t t0 = wc[0], t1 = wc[16], t2 = wc[32], t3 = wc[48];
+        int32_t t0 = wc[0] + 65792, t1 = wc[16], t2 = wc[32], t3 = wc[48];
         int32_t t10 = t0 + t2, t11 = t0 - t2, t13 = t1 + t3;
         int32_t t12 = (((t1 - t3) * 362 + 128) >> 8) - t13;
         t0 = t10 + t13; t3 = t10 - t13; t1 = t11 + t12; t2 = t11 - t12;
@@ -1092,19 +1237,19 @@ static inline void idct_8x8_aan(const DecBlock* blk, const int32_t* dq, const ui
         t12 = ((z10 * -669 + 128) >> 8) + z5;
         t6 = t12 - t7; t5 = t11 - t6; t4 = t10 + t5;
 
-        out[c]      = clamp_u8_v7(((t0 + t7 + 256) >> 9) + 128);
-        out[c + 56] = clamp_u8_v7(((t0 - t7 + 256) >> 9) + 128);
-        out[c + 8]  = clamp_u8_v7(((t1 + t6 + 256) >> 9) + 128);
-        out[c + 48] = clamp_u8_v7(((t1 - t6 + 256) >> 9) + 128);
-        out[c + 16] = clamp_u8_v7(((t2 + t5 + 256) >> 9) + 128);
-        out[c + 40] = clamp_u8_v7(((t2 - t5 + 256) >> 9) + 128);
-        out[c + 24] = clamp_u8_v7(((t3 - t4 + 256) >> 9) + 128);
-        out[c + 32] = clamp_u8_v7(((t3 + t4 + 256) >> 9) + 128);
+        out[c]      = clamp_u8_asr9_v7(t0 + t7);
+        out[c + 56] = clamp_u8_asr9_v7(t0 - t7);
+        out[c + 8]  = clamp_u8_asr9_v7(t1 + t6);
+        out[c + 48] = clamp_u8_asr9_v7(t1 - t6);
+        out[c + 16] = clamp_u8_asr9_v7(t2 + t5);
+        out[c + 40] = clamp_u8_asr9_v7(t2 - t5);
+        out[c + 24] = clamp_u8_asr9_v7(t3 - t4);
+        out[c + 32] = clamp_u8_asr9_v7(t3 + t4);
     }
 }
 
-// Exact Half-Height Vertical AAN IDCT (8x8 DCT -> 8x4 vertically 2:1 averaged chroma in 32 bytes)
-static inline void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, const uint16_t* q_raw, uint8_t* out32) {
+// Exact Half-Height Vertical AAN IDCT (8x8 DCT -> 8x4 vertically 2:1 averaged chroma) + ARMv7 USAT ASR #10
+static FS_NOINLINE void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, const uint16_t* q_raw, uint8_t* out32) {
     const int16_t* in = blk->c;
     uint8_t rmask = (uint8_t)(blk->row_mask & ~0x10U);
     if (!blk->has_ac || rmask == 0) {
@@ -1117,7 +1262,7 @@ static inline void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, c
         int32_t r0[8];
         idct_row_aan(in, dq, r0);
         for (int c = 0; c < 8; c++) {
-            out32[c] = clamp_u8_v7(((r0[c] + 256) >> 9) + 128);
+            out32[c] = clamp_u8_asr9_v7(r0[c] + 65792);
         }
         memcpy(out32 + 8, out32, 8);
         memcpy(out32 + 16, out32, 16);
@@ -1135,14 +1280,14 @@ static inline void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, c
     if ((rmask & 0xFCU) == 0) {
         idct_row_aan(in + 8, dq + 8, ws + 8);
         for (int c = 0; c < 8; c++) {
-            int32_t e0 = ws[c] << 1;
+            int32_t e0 = (ws[c] << 1) + 131584;
             int32_t w1 = ws[c + 8];
             int32_t z5 = (w1 * 473 + 128) >> 8;
             int32_t t10 = ((w1 * 277 + 128) >> 8) - z5;
-            out32[c]      = clamp_u8_v7(((e0 + z5 + 512) >> 10) + 128);
-            out32[c + 8]  = clamp_u8_v7(((e0 - t10 + 512) >> 10) + 128);
-            out32[c + 16] = clamp_u8_v7(((e0 + t10 + 512) >> 10) + 128);
-            out32[c + 24] = clamp_u8_v7(((e0 - z5 + 512) >> 10) + 128);
+            out32[c]      = clamp_u8_asr10_v7(e0 + z5);
+            out32[c + 8]  = clamp_u8_asr10_v7(e0 - t10);
+            out32[c + 16] = clamp_u8_asr10_v7(e0 + t10);
+            out32[c + 24] = clamp_u8_asr10_v7(e0 - z5);
         }
         return;
     }
@@ -1155,19 +1300,19 @@ static inline void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, c
         for (int c = 0; c < 8; c++) {
             int32_t w0 = ws[c], w1 = ws[c + 8], w2 = ws[c + 16], w3 = ws[c + 24];
             if ((w1 | w2 | w3) == 0) {
-                uint8_t cl = clamp_u8_v7(((w0 + 256) >> 9) + 128);
+                uint8_t cl = clamp_u8_asr9_v7(w0 + 65792);
                 out32[c] = out32[c + 8] = out32[c + 16] = out32[c + 24] = cl;
                 continue;
             }
-            int32_t e0 = w0 << 1;
+            int32_t e0 = (w0 << 1) + 131584;
             int32_t ed = (w2 * 362 + 128) >> 8;
             int32_t z5 = ((w1 - w3) * 473 + 128) >> 8;
             int32_t t10 = ((w1 * 277 + 128) >> 8) - z5;
             int32_t t12 = ((w3 * 669 + 128) >> 8) + z5;
-            out32[c]      = clamp_u8_v7(((e0 + ed + t12 + 512) >> 10) + 128);
-            out32[c + 8]  = clamp_u8_v7(((e0 - ed - t10 + 512) >> 10) + 128);
-            out32[c + 16] = clamp_u8_v7(((e0 - ed + t10 + 512) >> 10) + 128);
-            out32[c + 24] = clamp_u8_v7(((e0 + ed - t12 + 512) >> 10) + 128);
+            out32[c]      = clamp_u8_asr10_v7(e0 + ed + t12);
+            out32[c + 8]  = clamp_u8_asr10_v7(e0 - ed - t10);
+            out32[c + 16] = clamp_u8_asr10_v7(e0 - ed + t10);
+            out32[c + 24] = clamp_u8_asr10_v7(e0 + ed - t12);
         }
         return;
     }
@@ -1181,11 +1326,11 @@ static inline void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, c
     for (int c = 0; c < 8; c++) {
         int32_t* wc = ws + c;
         if ((wc[8] | wc[16] | wc[24] | wc[40] | wc[48] | wc[56]) == 0) {
-            uint8_t cl = clamp_u8_v7(((wc[0] + 256) >> 9) + 128);
+            uint8_t cl = clamp_u8_asr9_v7(wc[0] + 65792);
             out32[c] = out32[c + 8] = out32[c + 16] = out32[c + 24] = cl;
             continue;
         }
-        int32_t e0 = wc[0] << 1;
+        int32_t e0 = (wc[0] << 1) + 131584;
         int32_t ed = ((wc[16] - wc[48]) * 362 + 128) >> 8;
         int32_t z10 = wc[40] - wc[24];
         int32_t z12 = wc[8]  - wc[56];
@@ -1193,10 +1338,10 @@ static inline void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, c
         int32_t t10 = ((z12 * 277 + 128) >> 8) - z5;
         int32_t t12 = ((z10 * -669 + 128) >> 8) + z5;
 
-        out32[c]      = clamp_u8_v7(((e0 + ed + t12 + 512) >> 10) + 128);
-        out32[c + 8]  = clamp_u8_v7(((e0 - ed - t10 + 512) >> 10) + 128);
-        out32[c + 16] = clamp_u8_v7(((e0 - ed + t10 + 512) >> 10) + 128);
-        out32[c + 24] = clamp_u8_v7(((e0 + ed - t12 + 512) >> 10) + 128);
+        out32[c]      = clamp_u8_asr10_v7(e0 + ed + t12);
+        out32[c + 8]  = clamp_u8_asr10_v7(e0 - ed - t10);
+        out32[c + 16] = clamp_u8_asr10_v7(e0 - ed + t10);
+        out32[c + 24] = clamp_u8_asr10_v7(e0 + ed - t12);
     }
 }
 
@@ -1513,10 +1658,12 @@ static void fast_fdct_quant_luma(int16_t* __restrict blk, const QuantNatEntry* _
         } \
     } while (0)
 
-    // Peeled column 0 (save r0_orig before overwriting blk[0] with unquantized DC for Quick Review!)
+    // Peeled column 0 (single-load r0..r7; save r0 before overwriting blk[0] with unquantized DC!)
     {
-        int r0_orig = blk[0];
-        int s0 = r0_orig + blk[56], s1 = blk[8] + blk[48], s2 = blk[16] + blk[40], s3 = blk[24] + blk[32];
+        int r0 = blk[0], r1 = blk[8], r2 = blk[16], r3 = blk[24];
+        int r4 = blk[32], r5 = blk[40], r6 = blk[48], r7 = blk[56];
+        int s0 = r0 + r7, s1 = r1 + r6, s2 = r2 + r5, s3 = r3 + r4;
+        int d0 = r0 - r7, d1 = r1 - r6, d2 = r2 - r5, d3 = r3 - r4;
         if ((s0 | s1 | s2 | s3) == 0) {
             blk[0] = 0;
             qb->q[0] = 0;
@@ -1534,7 +1681,6 @@ static void fast_fdct_quant_luma(int16_t* __restrict blk, const QuantNatEntry* _
                 QREG_LUMA((t3 - z1) >> 3, 48);
             }
         }
-        int d3 = blk[24] - blk[32], d2 = blk[16] - blk[40], d1 = blk[8] - blk[48], d0 = r0_orig - blk[56];
         if ((d0 | d1 | d2 | d3) != 0) {
             int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
             int z5 = ((t4 - t6) * 98) >> 8;
@@ -1552,7 +1698,10 @@ static void fast_fdct_quant_luma(int16_t* __restrict blk, const QuantNatEntry* _
     if (any_ac_col) {
         for (int i = 1; i < 8; i++) {
             const int16_t* r = blk + i;
-            int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
+            int r0 = r[0], r1 = r[8], r2 = r[16], r3 = r[24];
+            int r4 = r[32], r5 = r[40], r6 = r[48], r7 = r[56];
+            int s0 = r0 + r7, s1 = r1 + r6, s2 = r2 + r5, s3 = r3 + r4;
+            int d0 = r0 - r7, d1 = r1 - r6, d2 = r2 - r5, d3 = r3 - r4;
             if ((s0 | s1 | s2 | s3) != 0) {
                 int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
                 QREG_LUMA((t0 + t1) >> 3, i);
@@ -1561,7 +1710,6 @@ static void fast_fdct_quant_luma(int16_t* __restrict blk, const QuantNatEntry* _
                 QREG_LUMA((t3 + z1) >> 3, 16 + i);
                 QREG_LUMA((t3 - z1) >> 3, 48 + i);
             }
-            int d3 = r[24] - r[32], d2 = r[16] - r[40], d1 = r[8] - r[48], d0 = r[0] - r[56];
             if ((d0 | d1 | d2 | d3) != 0) {
                 int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
                 int z5 = ((t4 - t6) * 98) >> 8;
@@ -1627,9 +1775,12 @@ static void fast_fdct_quant_chroma(int16_t* __restrict blk, const QuantNatEntry*
         } \
     } while (0)
 
-    // Peeled column 0
+    // Peeled column 0 (single-load r0..r7)
     {
-        int s0 = blk[0] + blk[56], s1 = blk[8] + blk[48], s2 = blk[16] + blk[40], s3 = blk[24] + blk[32];
+        int r0 = blk[0], r1 = blk[8], r2 = blk[16], r3 = blk[24];
+        int r4 = blk[32], r5 = blk[40], r6 = blk[48], r7 = blk[56];
+        int s0 = r0 + r7, s1 = r1 + r6, s2 = r2 + r5, s3 = r3 + r4;
+        int d0 = r0 - r7, d1 = r1 - r6, d2 = r2 - r5, d3 = r3 - r4;
         if ((s0 | s1 | s2 | s3) == 0) {
             qb->q[0] = 0;
         } else {
@@ -1643,7 +1794,6 @@ static void fast_fdct_quant_chroma(int16_t* __restrict blk, const QuantNatEntry*
                 QREG_CHROMA((t3 + z1) >> 3, 16);
             }
         }
-        int d3 = blk[24] - blk[32], d2 = blk[16] - blk[40], d1 = blk[8] - blk[48], d0 = blk[0] - blk[56];
         if ((d0 | d1 | d2 | d3) != 0) {
             int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
             int z5 = ((t4 - t6) * 98) >> 8;
@@ -1658,14 +1808,16 @@ static void fast_fdct_quant_chroma(int16_t* __restrict blk, const QuantNatEntry*
     if (any_ac_col) {
         for (int i = 1; i < 4; i++) {
             const int16_t* r = blk + i;
-            int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
+            int r0 = r[0], r1 = r[8], r2 = r[16], r3 = r[24];
+            int r4 = r[32], r5 = r[40], r6 = r[48], r7 = r[56];
+            int s0 = r0 + r7, s1 = r1 + r6, s2 = r2 + r5, s3 = r3 + r4;
+            int d0 = r0 - r7, d1 = r1 - r6, d2 = r2 - r5, d3 = r3 - r4;
             if ((s0 | s1 | s2 | s3) != 0) {
                 int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
                 QREG_CHROMA((t0 + t1) >> 3, i);
                 int z1 = ((t2 + t3) * 181) >> 8;
                 QREG_CHROMA((t3 + z1) >> 3, 16 + i);
             }
-            int d3 = r[24] - r[32], d2 = r[16] - r[40], d1 = r[8] - r[48], d0 = r[0] - r[56];
             if ((d0 | d1 | d2 | d3) != 0) {
                 int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
                 int z5 = ((t4 - t6) * 98) >> 8;
@@ -2205,13 +2357,6 @@ typedef struct {
     int busy;
 } SemWorker;
 
-static int sem_wait_eintr(sem_t* s) {
-    for (;;) {
-        if (sem_wait(s) == 0) return 1;
-        if (errno != EINTR) return 0;
-    }
-}
-
 static void* sem_worker_main(void* p) {
     SemWorker* w = (SemWorker*)p;
     if (w->pin_cpu >= 0) {
@@ -2339,39 +2484,6 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         return hdr_rc;
     }
 
-    // Slurp entropy scan into RAM in ONE sequential fread() (<=14MB) BEFORE opening output file:
-    // eliminates 100% of concurrent FAT32 SD read+write contention and makes Stage 1 pure RAM speed!
-    uint8_t* in_mem_buf = NULL;
-    size_t in_mem_len = 0;
-    int slurp_ms = 0;
-    {
-        long cur_off = ftell(fp);
-        if (cur_off >= 0 && fseek(fp, 0, SEEK_END) == 0) {
-            long end_off = ftell(fp);
-            if (fseek(fp, cur_off, SEEK_SET) == 0 && end_off > cur_off) {
-                size_t rem = (size_t)(end_off - cur_off);
-                if (rem <= 14U * 1024U * 1024U) {
-                    uint8_t* mb = (uint8_t*)malloc(rem + 8U);
-                    if (mb) {
-                        uint64_t tr0 = fs_now_ms();
-                        size_t got = fread(mb, 1, rem, fp);
-                        slurp_ms = (int)(fs_now_ms() - tr0);
-                        if (got > 0) {
-                            memset(mb + got, 0, 8);
-                            in_mem_buf = mb;
-                            in_mem_len = got;
-                            fclose(fp);
-                            fp = NULL;
-                        } else {
-                            free(mb);
-                            (void)fseek(fp, cur_off, SEEK_SET);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     int scale = (scale_denom == 2) ? 2 : ((scale_denom == 0 && info->src_w >= 7000) ? 2 : 1);
     info->scale = scale;
     info->dst_w = (scale == 2) ? (info->src_w / 2) : info->src_w;
@@ -2414,16 +2526,49 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     uint8_t clean_exif[512];
     size_t clean_exif_len = build_clean_exif_app1(clean_exif, sizeof(clean_exif), &info->exif, info->dst_w, info->dst_h);
 
+    // Open output file FIRST before reading ANY input scan data (so Tier 1/2 EACCES retries return -9 in <1ms!)
     JpegStreamState* out_state = native_jpeg_stream_open_with_exif(
         output_jpeg_path, info->dst_w, info->dst_h, eff_quality,
         clean_exif_len > 0 ? clean_exif : NULL, clean_exif_len);
     if (!out_state) {
-        free(in_mem_buf);
         free(info);
-        if (fp) fclose(fp);
+        fclose(fp);
         if (out_result) out_result->rc = -9;
         return -9;
     }
+
+    // Launch async background SD prefetcher (128KB first chunk then 256KB raw POSIX read())
+    // BEFORE worker init, LUT build, and band allocation so SD I/O overlaps 100% with compute!
+    uint8_t* in_mem_buf = NULL;
+#ifndef _WIN32
+    IoPrefetcher prefetch;
+    memset(&prefetch, 0, sizeof(IoPrefetcher));
+    prefetch.fd = -1;
+    {
+        long cur_off = ftell(fp);
+        if (cur_off >= 0 && fseek(fp, 0, SEEK_END) == 0) {
+            long end_off = ftell(fp);
+            if (fseek(fp, cur_off, SEEK_SET) == 0 && end_off > cur_off) {
+                size_t rem = (size_t)(end_off - cur_off);
+                if (rem <= 14U * 1024U * 1024U) {
+                    uint8_t* mb = (uint8_t*)malloc(rem + 8U);
+                    if (mb) {
+                        int pf_fd = open(input_jpeg_path, O_RDONLY);
+                        if (pf_fd >= 0 && lseek(pf_fd, (off_t)cur_off, SEEK_SET) == (off_t)cur_off &&
+                            io_prefetch_start(&prefetch, pf_fd, mb, rem)) {
+                            in_mem_buf = mb;
+                            fclose(fp);
+                            fp = NULL;
+                        } else {
+                            if (pf_fd >= 0) close(pf_fd);
+                            free(mb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
 
 #ifndef _WIN32
     int avail_cpus[4] = { 0, 1, 2, 3 };
@@ -2507,6 +2652,7 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
 #ifndef _WIN32
         for (int k = 0; k < 3; k++) sem_worker_destroy(&sw[k]);
         fs_restore_affinity(&saved_affinity);
+        io_prefetch_destroy(&prefetch);
 #endif
         native_jpeg_stream_close(out_state, 0);
         remove(output_jpeg_path);
@@ -2567,6 +2713,7 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
 #ifndef _WIN32
         for (int k = 0; k < 3; k++) sem_worker_destroy(&sw[k]);
         fs_restore_affinity(&saved_affinity);
+        io_prefetch_destroy(&prefetch);
 #endif
         free(in_band_work); free(in_band_dec); free(q_work); free(q_emit); free(br);
         free(preview_rgb565);
@@ -2578,12 +2725,16 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         if (out_result) out_result->rc = -10;
         return -10;
     }
-    if (in_mem_buf) {
+#ifndef _WIN32
+    if (prefetch.active && in_mem_buf) {
         br->fp = NULL;
+        br->pf = &prefetch;
         br->buf = in_mem_buf;
-        br->len = in_mem_len;
+        br->len = 0;
         br->pos = 0;
-    } else {
+    } else
+#endif
+    {
         br->fp = fp;
         br->buf = br->stream_buf;
         br->len = 0;
@@ -2789,10 +2940,12 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     }
 
     int pin_cnt = 0;
+    int io_wait_ms = (int)br->io_wait_ms;
 #ifndef _WIN32
     for (int k = 0; k < 3; k++) sem_worker_destroy(&sw[k]);
     pin_cnt = main_pinned + sw[0].pinned + sw[1].pinned + sw[2].pinned;
     fs_restore_affinity(&saved_affinity);
+    io_prefetch_destroy(&prefetch);
 #endif
 
     free(in_band_work);
@@ -2819,9 +2972,9 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         out_result->dec_ms = (int)dec_wait_ms;
         out_result->proc_ms = (int)proc_ms;
         out_result->emit_ms = (int)emit_wait_ms;
-        out_result->read_ms = slurp_ms;
+        out_result->read_ms = io_wait_ms;
         out_result->pin_cnt = pin_cnt;
-        out_result->setup_ms = out_result->total_ms - out_result->read_ms - out_result->dec_ms - out_result->proc_ms - out_result->emit_ms;
+        out_result->setup_ms = out_result->total_ms - out_result->dec_ms - out_result->proc_ms - out_result->emit_ms;
         out_result->lut_ms = lut_wall_ms;
         {
             uint64_t s2c = main_s2_cpu_ns, decc = main_dec_cpu_ns, emc = main_emit_cpu_ns;
