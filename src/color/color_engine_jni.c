@@ -954,7 +954,7 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLut17In
     (*env)->GetIntArrayRegion(env, pixelArray, 0, (jsize)count, (jint*)g_int_scratch);
 
     init_static_grain_table();
-    int grain_scale = (grainStrength == 2) ? 16 : (grainStrength == 1) ? 8 : 0;
+    int grain_scale = (grainStrength == 2) ? 4 : (grainStrength == 1) ? 2 : 0;
 
     pthread_mutex_lock(&g_lut_mutex);
     if (grain_scale == 0 && clarityStrength == 0) {
@@ -1008,18 +1008,30 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLut17In
     return JNI_TRUE;
 }
 
+static volatile int g_last_fast_rc = 0;
+
+JNIEXPORT jint JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGetLastFastRc(
+    JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    return (jint)g_last_fast_rc;
+}
+
 /**
  * Pure C Zero-JNI-Copy 4-Core Single-Pass Baseline JPEG-to-JPEG Transcoder.
  * Copies the 14.7KB active 17^3 3D LUT under g_lut_mutex so Live View preview is never blocked.
  */
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImageStreamFastScaled(
     JNIEnv *env, jclass clazz, jstring inputPath, jstring outputPath, jint scaleDenom, jint grainStrength, jint clarityStrength) {
-    if (inputPath == NULL || outputPath == NULL) return JNI_FALSE;
+    if (inputPath == NULL || outputPath == NULL) {
+        g_last_fast_rc = -1;
+        return JNI_FALSE;
+    }
     const char* in_p = (*env)->GetStringUTFChars(env, inputPath, NULL);
     const char* out_p = (*env)->GetStringUTFChars(env, outputPath, NULL);
     if (in_p == NULL || out_p == NULL) {
         if (in_p != NULL) (*env)->ReleaseStringUTFChars(env, inputPath, in_p);
         if (out_p != NULL) (*env)->ReleaseStringUTFChars(env, outputPath, out_p);
+        g_last_fast_rc = -1;
         return JNI_FALSE;
     }
 
@@ -1027,15 +1039,21 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImage
     if (lut_copy == NULL) {
         (*env)->ReleaseStringUTFChars(env, inputPath, in_p);
         (*env)->ReleaseStringUTFChars(env, outputPath, out_p);
+        g_last_fast_rc = -10;
         return JNI_FALSE;
     }
     pthread_mutex_lock(&g_lut_mutex);
     memcpy(lut_copy, &g_lut17, sizeof(Lut17Context));
     pthread_mutex_unlock(&g_lut_mutex);
 
-    int ok = native_fast_transcode_jpeg(lut_copy, in_p, out_p, (int)scaleDenom, 92, (int)grainStrength, (int)clarityStrength);
+    int rc = native_fast_transcode_jpeg(lut_copy, in_p, out_p, (int)scaleDenom, 92, (int)grainStrength, (int)clarityStrength);
+    g_last_fast_rc = rc;
+    int ok = (rc > 0) ? 1 : 0;
     if (!ok) {
+        LOGE("native_fast_transcode_jpeg failed (rc=%d) for %s -> %s", rc, in_p, out_p);
         ok = native_process_image_stream_fast(in_p, out_p, (int)grainStrength, (int)clarityStrength);
+    } else {
+        LOGI("native_fast_transcode_jpeg succeeded (rc=%d) for %s -> %s", rc, in_p, out_p);
     }
 
     free(lut_copy);

@@ -201,7 +201,7 @@ public class CaptureController {
         if (baseLut != null) {
             ColorEngine.precomputeLut17WithBaseSafe(
                 baseLut,
-                recipe.computeCcmQ8(),
+                recipe.computeAdjustmentCcmQ8(),
                 recipe.generateToneCurve('R'),
                 recipe.generateToneCurve('G'),
                 recipe.generateToneCurve('B')
@@ -706,6 +706,7 @@ public class CaptureController {
             boolean usedFastTranscode = false;
             File cacheStreamFile = null;
             long fastTranscodeMs = 0;
+            int lastFastRc = 0;
             long brdIdxMs = 0;
             long brdDecMs = 0;
             long brdJniMs = 0;
@@ -719,22 +720,35 @@ public class CaptureController {
                     streamSuccess = true;
                     usedFastTranscode = true;
                     inlineExifWritten = true;
-                } else if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, targetOutputFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
-                    streamSuccess = true;
-                    usedFastTranscode = true;
-                    usedDirectTarget = true;
-                    inlineExifWritten = true;
-                } else if (context != null && context.getCacheDir() != null) {
-                    cacheStreamFile = new File(context.getCacheDir(), String.format(Locale.US, "fuji_stream_%04d.jpg", seqNum));
-                    if (cacheStreamFile.exists()) cacheStreamFile.delete();
-                    if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, cacheStreamFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
-                        streamSuccess = true;
-                        usedFastTranscode = true;
-                        usedCacheStream = true;
-                        inlineExifWritten = true;
-                    } else {
-                        if (cacheStreamFile.exists()) cacheStreamFile.delete();
-                        cacheStreamFile = null;
+                    lastFastRc = 1;
+                } else {
+                    lastFastRc = ColorEngine.getLastFastRcSafe();
+                    // Only retry Tier 2/3 output targets when Tier 1 failed to open the .tmp output file (rc == -9)
+                    if (lastFastRc == -9) {
+                        if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, targetOutputFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                            streamSuccess = true;
+                            usedFastTranscode = true;
+                            usedDirectTarget = true;
+                            inlineExifWritten = true;
+                            lastFastRc = 1;
+                        } else {
+                            lastFastRc = ColorEngine.getLastFastRcSafe();
+                            if (lastFastRc == -9 && context != null && context.getCacheDir() != null) {
+                                cacheStreamFile = new File(context.getCacheDir(), String.format(Locale.US, "fuji_stream_%04d.jpg", seqNum));
+                                if (cacheStreamFile.exists()) cacheStreamFile.delete();
+                                if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, cacheStreamFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                                    streamSuccess = true;
+                                    usedFastTranscode = true;
+                                    usedCacheStream = true;
+                                    inlineExifWritten = true;
+                                    lastFastRc = 1;
+                                } else {
+                                    lastFastRc = ColorEngine.getLastFastRcSafe();
+                                    if (cacheStreamFile.exists()) cacheStreamFile.delete();
+                                    cacheStreamFile = null;
+                                }
+                            }
+                        }
                     }
                 }
                 fastTranscodeMs = System.currentTimeMillis() - tFast0;
@@ -1100,11 +1114,11 @@ public class CaptureController {
             final long totalMs = System.currentTimeMillis() - captureStartTime;
             final float mp = (float)(dstW * dstH) / 1000000.0f;
             final String savedFileName = (gradedSavedPath != null) ? new File(gradedSavedPath).getName() : String.format(Locale.US, "fuji_%04d.jpg", seqNum);
-            final String perfDetail = usedFastTranscode
-                ? String.format(Locale.US, " [C-FAST sd:%d c:%d]", sdWaitMs, fastTranscodeMs)
-                : String.format(Locale.US, " [BRD sd:%d idx:%d dec:%d jni:%d]", sdWaitMs, brdIdxMs, brdDecMs, brdJniMs);
+            final String perfTag = usedFastTranscode
+                ? String.format(Locale.US, "C-FAST sd:%d c:%d", sdWaitMs, fastTranscodeMs)
+                : String.format(Locale.US, "BRD rc:%d sd:%d idx:%d dec:%d jni:%d", lastFastRc, sdWaitMs, brdIdxMs, brdDecMs, brdJniMs);
             final String telemetry = String.format(Locale.US, "SAVED %s (%dx%d | %.1fMP) in %dms",
-                savedFileName, dstW, dstH, mp, totalMs) + perfDetail;
+                savedFileName, dstW, dstH, mp, totalMs) + " [" + perfTag + "]";
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
@@ -1124,9 +1138,8 @@ public class CaptureController {
                 }
             }
             if (reviewBmp != null) {
-                String tierTag = usedFastTranscode ? "C-FAST" : (usedCacheStream ? "C-MS" : (usedDirectTarget ? "C-DIR" : "C"));
                 if (resultListener != null) {
-                    deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, gradedSavedPath, tierTag);
+                    deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, gradedSavedPath, perfTag);
                 } else if (uiController != null) {
                     uiController.showQuickReview(reviewBmp);
                 } else if (!reviewBmp.isRecycled()) {

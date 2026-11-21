@@ -395,10 +395,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         FujiRecipe r = appState.getActiveRecipe();
         byte[] baseLut = LutManager.getLutTable(this, r.filmSim.lutFile);
         byte[] curve = r.generateToneCurve('R');
-        short[] ccm = r.computeCcmQ8();
         if (baseLut != null) {
-            ColorEngine.precomputeLut17WithBaseSafe(baseLut, ccm, curve, curve, curve);
+            short[] adjCcm = r.computeAdjustmentCcmQ8();
+            ColorEngine.precomputeLut17WithBaseSafe(baseLut, adjCcm, curve, curve, curve);
         } else {
+            short[] ccm = r.computeCcmQ8();
             ColorEngine.precomputeLut17Safe(ccm, curve, curve, curve);
         }
     }

@@ -391,6 +391,17 @@ public class ColorEngine {
         }
     }
 
+    /** Returns the diagnostic return code from the last nativeProcessImageStreamFastScaled call (1=OK, <0=error stage). */
+    public static int getLastFastRcSafe() {
+        if (!sNativeAvailable) return -99;
+        try {
+            return nativeGetLastFastRc();
+        } catch (Throwable t) {
+            return -98;
+        }
+    }
+
     public static native boolean nativeProcessImageStreamFast(String inputPath, String outputPath, int grainStrength, int clarityStrength);
     public static native boolean nativeProcessImageStreamFastScaled(String inputPath, String outputPath, int scaleDenom, int grainStrength, int clarityStrength);
+    public static native int nativeGetLastFastRc();
 }

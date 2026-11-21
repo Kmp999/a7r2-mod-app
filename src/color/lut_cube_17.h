@@ -262,7 +262,7 @@ static inline void lut17_process_rgb565_advanced_offset(const Lut17Context* __re
     if (!lut || !buffer || width <= 0 || height <= 0) return;
 
     init_static_grain_table();
-    int grain_scale = (grain_strength == 2) ? 16 : (grain_strength == 1) ? 8 : 0;
+    int grain_scale = (grain_strength == 2) ? 4 : (grain_strength == 1) ? 2 : 0;
     int idx = 0;
 
     if (grain_scale == 0 && clarity_strength == 0) {
@@ -359,7 +359,7 @@ static inline void lut17_process_argb8888_advanced_offset(const Lut17Context* __
     if (!lut || !buffer || width <= 0 || height <= 0) return;
 
     init_static_grain_table();
-    int grain_scale = (grain_strength == 2) ? 16 : (grain_strength == 1) ? 8 : 0;
+    int grain_scale = (grain_strength == 2) ? 4 : (grain_strength == 1) ? 2 : 0;
     int idx = 0;
 
     if (grain_scale == 0 && clarity_strength == 0) {

@@ -83,17 +83,17 @@ public class FujiRecipe {
     // 16 Core Recipe Parameters
     public int recipeSlotIndex = 0;       // 0..6 (C1..C7)
     public FilmSim filmSim = FilmSim.CLASSIC_CHROME;
-    public DynamicRange dynamicRange = DynamicRange.DR200;
+    public DynamicRange dynamicRange = DynamicRange.DR100;
     public EffectLevel grainEffect = EffectLevel.WEAK;
     public EffectLevel colorChrome = EffectLevel.STRONG;
     public EffectLevel colorChromeBlue = EffectLevel.WEAK;
     public WhiteBalance whiteBalance = WhiteBalance.KELVIN;
     public int colorTempK = 5600;         // 2500K .. 10000K
-    public int wbShiftR = 2;              // -9 .. +9 (Red / Amber)
-    public int wbShiftB = -3;             // -9 .. +9 (Blue)
-    public int highlightTone = 1;         // -2 .. +4
-    public int shadowTone = 2;            // -2 .. +4
-    public int color = 1;                 // -4 .. +4 (Saturation)
+    public int wbShiftR = 1;              // -9 .. +9 (Red / Amber)
+    public int wbShiftB = -2;             // -9 .. +9 (Blue)
+    public int highlightTone = 0;         // -2 .. +4
+    public int shadowTone = 1;            // -2 .. +4
+    public int color = 0;                 // -4 .. +4 (Saturation)
     public int sharpness = 0;             // -4 .. +4
     public int noiseReduction = -2;       // -4 .. +4 (High ISO NR)
     public int clarity = 0;               // -4 .. +4
@@ -157,56 +157,56 @@ public class FujiRecipe {
         switch (slot) {
             case 0: // C1: Classic Chrome Street
                 filmSim = FilmSim.CLASSIC_CHROME;
-                dynamicRange = DynamicRange.DR200;
+                dynamicRange = DynamicRange.DR100;
                 grainEffect = EffectLevel.WEAK;
                 colorChrome = EffectLevel.STRONG;
-                wbShiftR = 2; wbShiftB = -3;
-                highlightTone = 1; shadowTone = 2;
-                color = 1; sharpness = 0; noiseReduction = -2;
+                wbShiftR = 1; wbShiftB = -2;
+                highlightTone = 0; shadowTone = 1;
+                color = 0; sharpness = 0; noiseReduction = -2;
                 break;
             case 1: // C2: Classic Neg Moody
                 filmSim = FilmSim.CLASSIC_NEG;
-                dynamicRange = DynamicRange.DR400;
-                grainEffect = EffectLevel.STRONG;
+                dynamicRange = DynamicRange.DR100;
+                grainEffect = EffectLevel.WEAK;
                 colorChrome = EffectLevel.STRONG;
-                wbShiftR = 3; wbShiftB = -4;
-                highlightTone = 2; shadowTone = 1;
-                color = -1; sharpness = -1; noiseReduction = -3;
+                wbShiftR = 2; wbShiftB = -2;
+                highlightTone = 1; shadowTone = 1;
+                color = 0; sharpness = -1; noiseReduction = -3;
                 break;
             case 2: // C3: Velvia Landscape
                 filmSim = FilmSim.VELVIA;
-                dynamicRange = DynamicRange.DR200;
+                dynamicRange = DynamicRange.DR100;
                 grainEffect = EffectLevel.OFF;
                 colorChrome = EffectLevel.STRONG;
-                wbShiftR = 1; wbShiftB = -1;
-                highlightTone = 1; shadowTone = 2;
-                color = 2; sharpness = 1; noiseReduction = -1;
+                wbShiftR = 0; wbShiftB = 0;
+                highlightTone = 1; shadowTone = 1;
+                color = 1; sharpness = 1; noiseReduction = -1;
                 break;
             case 3: // C4: Astia Soft Portrait
                 filmSim = FilmSim.ASTIA;
-                dynamicRange = DynamicRange.DR200;
+                dynamicRange = DynamicRange.DR100;
                 grainEffect = EffectLevel.OFF;
                 colorChrome = EffectLevel.WEAK;
                 wbShiftR = 1; wbShiftB = 0;
                 highlightTone = -1; shadowTone = 0;
-                color = 1; sharpness = 0; noiseReduction = 0;
+                color = 0; sharpness = 0; noiseReduction = 0;
                 break;
             case 4: // C5: Eterna Cinematic
                 filmSim = FilmSim.ETERNA;
-                dynamicRange = DynamicRange.DR400;
+                dynamicRange = DynamicRange.DR100;
                 grainEffect = EffectLevel.WEAK;
                 colorChrome = EffectLevel.WEAK;
-                wbShiftR = 2; wbShiftB = -2;
+                wbShiftR = 1; wbShiftB = -1;
                 highlightTone = -1; shadowTone = -1;
-                color = -2; sharpness = -2; noiseReduction = 0;
+                color = -1; sharpness = -2; noiseReduction = 0;
                 break;
             case 5: // C6: Acros B&W Noir
                 filmSim = FilmSim.ACROS;
-                dynamicRange = DynamicRange.DR200;
-                grainEffect = EffectLevel.STRONG;
+                dynamicRange = DynamicRange.DR100;
+                grainEffect = EffectLevel.WEAK;
                 colorChrome = EffectLevel.OFF;
                 wbShiftR = 0; wbShiftB = 0;
-                highlightTone = 2; shadowTone = 2;
+                highlightTone = 1; shadowTone = 2;
                 color = 0; sharpness = 1; noiseReduction = -4;
                 break;
             case 6: // C7: Provia Everyday Standard
@@ -338,30 +338,89 @@ public class FujiRecipe {
                 break;
         }
 
-        // 2. Adjust for Color (Saturation) parameter (-4 to +4)
+        // 2. Luminance-preserving Color (Saturation) adjustment (-4 to +4)
         if (filmSim != FilmSim.ACROS && color != 0) {
-            // Factor: 1.0 + (color * 0.08)
-            int satMul = 256 + (color * 20); // Q8.8
-            r00 = (r00 * satMul) >> 8;
-            r11 = (r11 * satMul) >> 8;
-            r22 = (r22 * satMul) >> 8;
+            int sat = 256 + (color * 20); // Q8.8: 0.69 .. 1.31
+            int inv = 256 - sat;
+            int rw = (inv * 77 + 128) >> 8;
+            int gw = (inv * 150 + 128) >> 8;
+            int bw = inv - rw - gw;
+            int s00 = sat + rw, s01 = gw,       s02 = bw;
+            int s10 = rw,       s11 = sat + gw, s12 = bw;
+            int s20 = rw,       s21 = gw,       s22 = sat + bw;
+            int n00 = (s00 * r00 + s01 * r10 + s02 * r20 + 128) >> 8;
+            int n01 = (s00 * r01 + s01 * r11 + s02 * r21 + 128) >> 8;
+            int n02 = (s00 * r02 + s01 * r12 + s02 * r22 + 128) >> 8;
+            int n10 = (s10 * r00 + s11 * r10 + s12 * r20 + 128) >> 8;
+            int n11 = (s10 * r01 + s11 * r11 + s12 * r21 + 128) >> 8;
+            int n12 = (s10 * r02 + s11 * r12 + s12 * r22 + 128) >> 8;
+            int n20 = (s20 * r00 + s21 * r10 + s22 * r20 + 128) >> 8;
+            int n21 = (s20 * r01 + s21 * r11 + s22 * r21 + 128) >> 8;
+            int n22 = (s20 * r02 + s21 * r12 + s22 * r22 + 128) >> 8;
+            r00 = n00; r01 = n01; r02 = n02;
+            r10 = n10; r11 = n11; r12 = n12;
+            r20 = n20; r21 = n21; r22 = n22;
         }
 
-        // 3. Adjust for WB Shift (R and B)
-        // wbShiftR scales Red row, wbShiftB scales Blue row
+        // 3. Subtle WB Shift (R and B): ~2% per step
         if (wbShiftR != 0) {
-            int rMul = 256 + (wbShiftR * 8);
-            r00 = (r00 * rMul) >> 8;
-            r01 = (r01 * rMul) >> 8;
-            r02 = (r02 * rMul) >> 8;
+            int rMul = 256 + (wbShiftR * 5);
+            r00 = (r00 * rMul + 128) >> 8;
+            r01 = (r01 * rMul + 128) >> 8;
+            r02 = (r02 * rMul + 128) >> 8;
         }
         if (wbShiftB != 0) {
-            int bMul = 256 + (wbShiftB * 8);
-            r20 = (r20 * bMul) >> 8;
-            r21 = (r21 * bMul) >> 8;
-            r22 = (r22 * bMul) >> 8;
+            int bMul = 256 + (wbShiftB * 5);
+            r20 = (r20 * bMul + 128) >> 8;
+            r21 = (r21 * bMul + 128) >> 8;
+            r22 = (r22 * bMul + 128) >> 8;
         }
 
+        ccm[0] = (short) r00; ccm[1] = (short) r01; ccm[2] = (short) r02;
+        ccm[3] = (short) r10; ccm[4] = (short) r11; ccm[5] = (short) r12;
+        ccm[6] = (short) r20; ccm[7] = (short) r21; ccm[8] = (short) r22;
+        return ccm;
+    }
+
+    /**
+     * Computes an identity-based 3x3 adjustment CCM in Q8.8 fixed-point (256 = 1.0)
+     * containing ONLY user Color (luminance-preserving saturation) and WB Shift tweaks.
+     * Used when a real 3D .lut file is loaded so the film's color matrix is never double-applied.
+     */
+    public short[] computeAdjustmentCcmQ8() {
+        int r00 = 256, r01 = 0,   r02 = 0;
+        int r10 = 0,   r11 = 256, r12 = 0;
+        int r20 = 0,   r21 = 0,   r22 = 256;
+
+        if (filmSim == FilmSim.ACROS) {
+            r00 = 77; r01 = 150; r02 = 29;
+            r10 = 77; r11 = 150; r12 = 29;
+            r20 = 77; r21 = 150; r22 = 29;
+        } else if (color != 0) {
+            int sat = 256 + (color * 20);
+            int inv = 256 - sat;
+            int rw = (inv * 77 + 128) >> 8;
+            int gw = (inv * 150 + 128) >> 8;
+            int bw = inv - rw - gw;
+            r00 = sat + rw; r01 = gw;       r02 = bw;
+            r10 = rw;       r11 = sat + gw; r12 = bw;
+            r20 = rw;       r21 = gw;       r22 = sat + bw;
+        }
+
+        if (wbShiftR != 0) {
+            int rMul = 256 + (wbShiftR * 5);
+            r00 = (r00 * rMul + 128) >> 8;
+            r01 = (r01 * rMul + 128) >> 8;
+            r02 = (r02 * rMul + 128) >> 8;
+        }
+        if (wbShiftB != 0) {
+            int bMul = 256 + (wbShiftB * 5);
+            r20 = (r20 * bMul + 128) >> 8;
+            r21 = (r21 * bMul + 128) >> 8;
+            r22 = (r22 * bMul + 128) >> 8;
+        }
+
+        short[] ccm = new short[9];
         ccm[0] = (short) r00; ccm[1] = (short) r01; ccm[2] = (short) r02;
         ccm[3] = (short) r10; ccm[4] = (short) r11; ccm[5] = (short) r12;
         ccm[6] = (short) r20; ccm[7] = (short) r21; ccm[8] = (short) r22;
@@ -374,7 +433,8 @@ public class FujiRecipe {
 
     /**
      * Generates a 256-byte 1D Tone Curve lookup table for a specific channel.
-     * Incorporates Highlight Tone (-2..+4), Shadow Tone (-2..+4), and Film simulation characteristics.
+     * Preserves exact black (0->0), midtone (0.5->0.5 at neutral), and white (255->255) endpoints
+     * with smooth anchored S-curve contrast, Highlight/Shadow tone, and DR200/DR400 lift.
      */
     public synchronized byte[] generateToneCurve(char channel) {
         int key = (filmSim.ordinal() << 16)
@@ -387,53 +447,66 @@ public class FujiRecipe {
 
         byte[] curve = new byte[256];
 
-        // Base contrast adjustment: S-curve
-        int contrastBoost = (highlightTone + shadowTone) * 8;
-        int shadowLift = -shadowTone * 6;      // Positive shadowTone darkens shadows
-        int highlightRoll = highlightTone * 6; // Positive highlightTone boosts highlights
+        // User Highlight/Shadow Tone adjustments (-2..+4)
+        int contrastBoost = (highlightTone + shadowTone) * 6;
+        int shadowLift = -shadowTone * 5;      // Positive shadowTone deepens shadows
+        int highlightRoll = highlightTone * 5; // Positive highlightTone crisps highlights
 
-        // Film-specific adjustments
-        if (filmSim == FilmSim.VELVIA) {
-            contrastBoost += 25;
-            shadowLift -= 15;
-        } else if (filmSim == FilmSim.ETERNA) {
-            contrastBoost -= 20;
-            shadowLift += 20;
-            highlightRoll += 15;
-        } else if (filmSim == FilmSim.CLASSIC_NEG) {
-            contrastBoost += 15;
-            shadowLift += 10;
+        // Only apply synthetic film contrast overrides when no 3D .lut file is bundled (e.g. ACROS)
+        if (filmSim.lutFile == null) {
+            if (filmSim == FilmSim.VELVIA) {
+                contrastBoost += 25;
+                shadowLift -= 10;
+            } else if (filmSim == FilmSim.ETERNA) {
+                contrastBoost -= 20;
+                shadowLift += 12;
+                highlightRoll -= 10;
+            } else if (filmSim == FilmSim.CLASSIC_NEG) {
+                contrastBoost += 15;
+                shadowLift += 6;
+            }
         }
 
-        double contrastFactor = 1.0 + ((double) contrastBoost / 100.0);
+        double contrastAmount = (double) contrastBoost / 100.0;
+        double k = Math.abs(contrastAmount) * 2.5;
+        double zMax = 0.5 * k;
+        double sNorm = (k > 0.001) ? (zMax / (1.0 + zMax)) : 1.0;
 
-        // Fast algebraic sigmoid: eliminates 768 expensive Math.exp() calls on Dalvik ARM
+        // Endpoint-normalized algebraic sigmoid: exact 0.0->0.0, 0.5->0.5, 1.0->1.0, and identity at contrast=0
         for (int i = 0; i < 256; i++) {
             double x = i / 255.0;
-            double centered = (x - 0.5) * contrastFactor;
-            double z = centered * 3.0;
-            double s = 0.5 + 0.5 * (z / (1.0 + Math.abs(z)));
+            double s = x;
+            if (k > 0.001) {
+                double z = (x - 0.5) * k;
+                double sig = 0.5 + 0.5 * ((z / (1.0 + Math.abs(z))) / sNorm);
+                if (contrastAmount > 0.0) {
+                    s = sig;
+                } else {
+                    s = x + (x - sig) * 0.5;
+                }
+            }
 
-            // Step 2.2: DR200 / DR400 Shadow & Midtone Compensatory Lift
+            // Step 2.2: DR200 / DR400 Shadow & Midtone Compensatory Lift (black-anchored at x=0)
             // Compensates for -1.0 EV (DR200) or -2.0 EV (DR400) hardware exposure pull
-            // with smooth highlight roll-off to protect specular highlights from clipping
+            // while preserving true black (0->0) and smooth highlight roll-off to 0.0 at x = 1.0
+            double blackAnchor = (x <= 0.0) ? 0.0 : (x / (x + 0.25));
             double drLift = 0.0;
             if (dynamicRange == DynamicRange.DR200) {
                 // +1.0 EV non-linear lift in shadows/midtones, smoothly rolling off to 0.0 at x = 1.0
-                drLift = 0.18 * (1.0 - Math.pow(x, 1.5));
+                drLift = blackAnchor * 0.18 * (1.0 - Math.pow(x, 1.5));
             } else if (dynamicRange == DynamicRange.DR400) {
                 // +2.0 EV non-linear lift in shadows/midtones, smoothly rolling off to 0.0 at x = 1.0
-                drLift = 0.32 * (1.0 - Math.pow(x, 1.3));
+                drLift = blackAnchor * 0.32 * (1.0 - Math.pow(x, 1.3));
             }
             s += drLift;
 
-            // Shadow adjustment below 0.35
-            if (x < 0.35) {
-                s += ((double) shadowLift / 255.0) * ((0.35 - x) / 0.35);
+            // Shadow Tone adjustment in (0.0 .. 0.5), anchored at 0.0 and 0.5 (never lifts pure black to gray)
+            if (shadowLift != 0 && x > 0.0 && x < 0.5) {
+                s += ((double) shadowLift / 255.0) * Math.sin(Math.PI * x * 2.0);
             }
-            // Highlight adjustment above 0.65
-            if (x > 0.65) {
-                s += ((double) highlightRoll / 255.0) * ((x - 0.65) / 0.35);
+            // Highlight Tone adjustment in (0.5 .. 1.0), anchored at 0.5 and 1.0 (never inverts highlights)
+            if (highlightRoll != 0 && x > 0.5 && x < 1.0) {
+                s += ((double) highlightRoll / 255.0) * Math.sin(Math.PI * (x - 0.5) * 2.0);
             }
 
             if (s < 0.0) s = 0.0;
