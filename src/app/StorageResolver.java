@@ -807,17 +807,29 @@ public final class StorageResolver {
         java.io.RandomAccessFile raf = null;
         try {
             raf = new java.io.RandomAccessFile(file, "r");
-            long searchLen = Math.min(len, 16384L);
-            raf.seek(len - searchLen);
-            byte[] tail = new byte[(int)searchLen];
-            raf.readFully(tail);
-            for (int i = tail.length - 2; i >= 0; i--) {
-                if ((tail[i] & 0xFF) == 0xFF && (tail[i+1] & 0xFF) == 0xD9) {
+            // Fast 1-sector (512B) EOI check avoids reading 16KB on every poll while BIONZ X writes
+            long fastLen = Math.min(len, 512L);
+            raf.seek(len - fastLen);
+            byte[] fastTail = new byte[(int)fastLen];
+            raf.readFully(fastTail);
+            for (int i = fastTail.length - 2; i >= 0; i--) {
+                if ((fastTail[i] & 0xFF) == 0xFF && (fastTail[i+1] & 0xFF) == 0xD9) {
                     return true;
                 }
             }
+            if (len > 512L) {
+                long searchLen = Math.min(len, 16384L);
+                raf.seek(len - searchLen);
+                byte[] tail = new byte[(int)searchLen];
+                raf.readFully(tail);
+                for (int i = tail.length - 2; i >= 0; i--) {
+                    if ((tail[i] & 0xFF) == 0xFF && (tail[i+1] & 0xFF) == 0xD9) {
+                        return true;
+                    }
+                }
+            }
             // Fallback for Sony MPF trailer metadata > 16KB: require size stability before accepting
-            try { Thread.sleep(80); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(40); } catch (InterruptedException ignored) {}
             if (file.length() != len) return false;
             return len > 200000;
         } catch (Throwable t) {
