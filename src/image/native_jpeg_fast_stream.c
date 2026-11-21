@@ -907,7 +907,8 @@ static void decode_src_tile_16x16_sub(const FastJpegInfo* info, const DecBlock* 
 
     if (info->samp_mode == 0) { // 4:2:0
         int r = ty - band_in_my0;
-        if (r < 0) r = 0; if (r >= band_in_rows) r = band_in_rows - 1;
+        if (r < 0) r = 0;
+        if (r >= band_in_rows) r = band_in_rows - 1;
         int cx = tx < info->in_mcus_x ? tx : (info->in_mcus_x - 1);
         const DecBlock* mb = in_band + ((size_t)r * (size_t)info->in_mcus_x + (size_t)cx) * 6U;
         uint8_t yb[4][64];
@@ -923,7 +924,8 @@ static void decode_src_tile_16x16_sub(const FastJpegInfo* info, const DecBlock* 
         int cx = tx < info->in_mcus_x ? tx : (info->in_mcus_x - 1);
         for (int half = 0; half < 2; half++) {
             int r = ty * 2 + half - band_in_my0;
-            if (r < 0) r = 0; if (r >= band_in_rows) r = band_in_rows - 1;
+            if (r < 0) r = 0;
+            if (r >= band_in_rows) r = band_in_rows - 1;
             const DecBlock* mb = in_band + ((size_t)r * (size_t)info->in_mcus_x + (size_t)cx) * 4U;
             uint8_t y0[64], y1[64], cbh[64], crh[64];
             idct_8x8_aan(mb[0].c, mb[0].has_ac, dqY, qY, y0);
@@ -944,7 +946,8 @@ static void decode_src_tile_16x16_sub(const FastJpegInfo* info, const DecBlock* 
         }
     } else if (info->samp_mode == 3) { // 4:4:0 (1x2 vertical: 2 side-by-side 8x16 MCUs)
         int r = ty - band_in_my0;
-        if (r < 0) r = 0; if (r >= band_in_rows) r = band_in_rows - 1;
+        if (r < 0) r = 0;
+        if (r >= band_in_rows) r = band_in_rows - 1;
         for (int hx = 0; hx < 2; hx++) {
             int cx = tx * 2 + hx;
             if (cx >= info->in_mcus_x) cx = info->in_mcus_x - 1;
@@ -966,7 +969,8 @@ static void decode_src_tile_16x16_sub(const FastJpegInfo* info, const DecBlock* 
     } else { // 4:4:4 (2x2 8x8 MCUs)
         for (int hy = 0; hy < 2; hy++) {
             int r = ty * 2 + hy - band_in_my0;
-            if (r < 0) r = 0; if (r >= band_in_rows) r = band_in_rows - 1;
+            if (r < 0) r = 0;
+            if (r >= band_in_rows) r = band_in_rows - 1;
             for (int hx = 0; hx < 2; hx++) {
                 int cx = tx * 2 + hx;
                 if (cx >= info->in_mcus_x) cx = info->in_mcus_x - 1;
