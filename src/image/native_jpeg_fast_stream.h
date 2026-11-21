@@ -20,6 +20,19 @@ typedef struct {
     int ncpu;                 // Detected online CPU cores from /proc/cpuinfo
     int has_neon;             // 1 if /proc/cpuinfo reports neon/asimd
     int is_v7;                // 1 if compiled for ARMv7-A (armeabi-v7a)
+    // ---- Diagnostics (answer "slow silicon" vs "starved by scheduler") ----
+    int setup_ms;             // total - dec - proc - emit (header parse, buffers, thread start, tail)
+    int lut_ms;               // wall time resolving/building the 64x64x17 LUT (0 when cached)
+    int cpu_dec_ms;           // Thread CPU time of Huffman decode (all threads)
+    int cpu_s2_ms;            // Thread CPU time of Stage 2 (all workers incl. caller)
+    int cpu_emit_ms;          // Thread CPU time of Stage 3 emit thread
+    int idct_ms;              // Sampled (1/32 MCU) CPU ms spent in IDCT, extrapolated to whole image
+    int lut_eval_ms;          // Sampled CPU ms in 3D LUT grading
+    int fdct_ms;              // Sampled CPU ms in grain + FDCT + quantization
+    int bench1;               // Calibration: M dependent-ops/s, 1 thread
+    int bench_all;            // Calibration: M dependent-ops/s, ncpu threads at once
+    int cur_mhz;              // cpu0 scaling_cur_freq in MHz (0 if unreadable)
+    int bg_cgroup;            // 1 if the grading thread sits in a background cgroup
     uint16_t* preview_rgb565; // Allocated RGB_565 DC preview (caller frees via free()), or NULL
     int preview_w;
     int preview_h;

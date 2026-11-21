@@ -393,7 +393,10 @@ public class FujiQMenuView extends View {
             }
             canvas.drawBitmap(reviewBitmap, srcRect, dstRect, null);
 
-            canvas.drawRect(0, h - 48, w, h, barBgPaint);
+            String[] lines = (reviewInfo != null ? reviewInfo : "PREVIEW").split("\n");
+            int nLines = Math.min(lines.length, 4);
+            int barH = Math.max(48, 12 + nLines * 16);
+            canvas.drawRect(0, h - barH, w, h, barBgPaint);
             if (reviewInfo != null && reviewInfo.contains("SAVE FAILED")) {
                 headerPaint.setColor(0xFFFF4444);
             } else if (reviewInfo != null && reviewInfo.contains("SAVED OK")) {
@@ -401,15 +404,11 @@ public class FujiQMenuView extends View {
             } else {
                 headerPaint.setColor(COLOR_AMBER_GOLD);
             }
-            String[] lines = (reviewInfo != null ? reviewInfo : "PREVIEW").split("\n");
-            if (lines.length > 1) {
-                canvas.drawText(lines[0], 16, h - 26, headerPaint);
-                canvas.drawText(lines[1], 16, h - 10, headerPaint);
-            } else {
-                canvas.drawText(lines[0], 16, h - 18, headerPaint);
+            for (int li = 0; li < nLines; li++) {
+                canvas.drawText(lines[li], 16, h - barH + 18 + li * 16, headerPaint);
             }
             headerPaint.setColor(COLOR_AMBER_GOLD);
-            canvas.drawText("PRESS PLAY / SHUTTER TO EXIT", w - 16, h - 18, debugPaint);
+            canvas.drawText("PRESS PLAY / SHUTTER TO EXIT", w - 16, h - barH - 6, debugPaint);
             return;
         }
 

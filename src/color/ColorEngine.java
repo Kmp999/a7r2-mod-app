@@ -405,7 +405,7 @@ public class ColorEngine {
     public static int[] getLastFastStatsSafe() {
         if (!sNativeAvailable) return null;
         try {
-            int[] stats = new int[10];
+            int[] stats = new int[24];
             if (nativeGetLastFastStats(stats)) {
                 return stats;
             }

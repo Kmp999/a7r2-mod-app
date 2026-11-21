@@ -8,7 +8,9 @@
 #ifndef _WIN32
 #include <errno.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -41,6 +43,91 @@ static uint64_t fs_now_ms(void) {
     return 0;
 #endif
 }
+
+// Per-thread CPU time (ns): separates "slow silicon" from "thread starved by scheduler / cgroup"
+static uint64_t fs_thread_cpu_ns(void) {
+#ifndef _WIN32
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#else
+    return 0;
+#endif
+}
+
+typedef struct {
+    uint64_t idct_ns, lut_ns, fdct_ns;
+    uint32_t n, tick;
+} ProfAcc;
+
+static void fs_read_sched_info(int* out_bg, int* out_mhz) {
+    int bg = 0, mhz = 0;
+#ifndef _WIN32
+    char path[96];
+    char line[192];
+    snprintf(path, sizeof(path), "/proc/self/task/%ld/cgroup", (long)syscall(SYS_gettid));
+    FILE* f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "bg_") != NULL || strstr(line, "background") != NULL) bg = 1;
+        }
+        fclose(f);
+    }
+    f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r");
+    if (f) {
+        long khz = 0;
+        if (fscanf(f, "%ld", &khz) == 1) mhz = (int)(khz / 1000);
+        fclose(f);
+    }
+#endif
+    *out_bg = bg;
+    *out_mhz = mhz;
+}
+
+#ifndef _WIN32
+// One-time per-process calibration: does running on N threads really give N x throughput?
+static volatile uint32_t s_bench_sink = 0;
+static int s_bench_done = 0, s_bench_one = 0, s_bench_all = 0;
+
+static void* fs_bench_thread(void* p) {
+    uint64_t* out = (uint64_t*)p;
+    uint32_t x = 12345u;
+    uint64_t iters = 0;
+    uint64_t t_end = fs_now_ms() + 30;
+    do {
+        for (int i = 0; i < 20000; i++) { x = x * 1664525u + 1013904223u; }
+        iters += 20000;
+    } while (fs_now_ms() < t_end);
+    s_bench_sink = x;
+    *out = iters;
+    return NULL;
+}
+
+static void fs_bench_once(int nthreads) {
+    if (s_bench_done) return;
+    s_bench_done = 1;
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > 4) nthreads = 4;
+    uint64_t one = 0;
+    fs_bench_thread(&one);
+    uint64_t cnt[4] = { 0, 0, 0, 0 };
+    pthread_t th[3];
+    int started[3] = { 0, 0, 0 };
+    for (int k = 1; k < nthreads; k++) {
+        if (pthread_create(&th[k - 1], NULL, fs_bench_thread, &cnt[k]) == 0) started[k - 1] = 1;
+    }
+    fs_bench_thread(&cnt[0]);
+    uint64_t sum = cnt[0];
+    for (int k = 1; k < nthreads; k++) {
+        if (started[k - 1]) {
+            pthread_join(th[k - 1], NULL);
+            sum += cnt[k];
+        }
+    }
+    s_bench_one = (int)(one / 30000ULL);
+    s_bench_all = (int)(sum / 30000ULL);
+}
+#endif
 
 static int s_cpu_probed = 0;
 static int s_cpu_ncpu = 1;
@@ -1602,7 +1689,9 @@ static inline void transcode_mcu_fast_1x(const FastJpegInfo* info, const uint32_
                                          const DecBlock* in_band, int band_in_my0, int band_in_rows,
                                          int omx, int out_my, const uint8_t grain_mid_lut[256],
                                          int has_grain, int clarity_strength,
-                                         JpegQuantBlock* out_6, uint16_t* preview, int pw, int ph) {
+                                         JpegQuantBlock* out_6, uint16_t* preview, int pw, int ph, ProfAcc* prof) {
+    int do_prof = (prof != NULL) && ((++prof->tick & 31U) == 0U);
+    uint64_t tp_a = do_prof ? fs_thread_cpu_ns() : 0;
     const int32_t* dqY = info->dq_aan[info->tq[0]]; const uint16_t* qY = info->qt_raw[info->tq[0]];
     const int32_t* dqU = info->dq_aan[info->tq[1]]; const uint16_t* qU = info->qt_raw[info->tq[1]];
     const int32_t* dqV = info->dq_aan[info->tq[2]]; const uint16_t* qV = info->qt_raw[info->tq[2]];
@@ -1642,6 +1731,7 @@ static inline void transcode_mcu_fast_1x(const FastJpegInfo* info, const uint32_
         idct_8x8_aan(&mb[5], dqV, qV, cr8);
     }
 
+    uint64_t tp_b = do_prof ? fs_thread_cpu_ns() : 0;
     int16_t y_blk[4][64], cb_blk[64], cr_blk[64];
     int chroma_res = info->chroma_res;
     for (int by = 0; by < 2; by++) {
@@ -1666,12 +1756,20 @@ static inline void transcode_mcu_fast_1x(const FastJpegInfo* info, const uint32_
         }
     }
 
+    uint64_t tp_c = do_prof ? fs_thread_cpu_ns() : 0;
     if (has_grain || clarity_strength != 0) {
         apply_luma_grain_clarity_mcu(y_blk, omx * 16, out_my * 16, grain_mid_lut, has_grain, clarity_strength);
     }
     int cb_q[4], cr_q[4];
     if (preview) sample_quadrant_chroma(cb_blk, cr_blk, cb_q, cr_q);
     quantize_mcu_fast(info, y_blk, cb_blk, cr_blk, out_6);
+    if (do_prof) {
+        uint64_t tp_d = fs_thread_cpu_ns();
+        prof->idct_ns += tp_b - tp_a;
+        prof->lut_ns += tp_c - tp_b;
+        prof->fdct_ns += tp_d - tp_c;
+        prof->n++;
+    }
     if (preview) emit_mcu_preview_2x2(preview, pw, ph, omx, out_my, y_blk, cb_q, cr_q);
 }
 
@@ -1816,6 +1914,7 @@ typedef struct {
     uint16_t* preview_rgb565;
     int preview_w;
     int preview_h;
+    ProfAcc* prof;
 } FastBandSlice;
 
 static void run_fast_band_slice(void* arg) {
@@ -1832,7 +1931,7 @@ static void run_fast_band_slice(void* arg) {
                                       s->band_in_my0, s->band_in_rows, omx, out_my,
                                       s->grain_mid_lut, s->has_grain, s->clarity_strength,
                                       row_qb + (size_t)omx * 6U,
-                                      s->preview_rgb565, s->preview_w, s->preview_h);
+                                      s->preview_rgb565, s->preview_w, s->preview_h, s->prof);
             }
         } else if (info->scale == 1) {
             uint8_t y16[256], cb8[64], cr8[64];
@@ -1976,6 +2075,7 @@ typedef struct {
     void* arg;
     int active;
     int busy;
+    uint64_t cpu_ns;
 } PipeWorker;
 
 static int pw_read_byte(int fd, uint8_t* out) {
@@ -2001,7 +2101,11 @@ static void* pipe_worker_main(void* p) {
     uint8_t cmd = 0;
     while (pw_read_byte(w->wake_fd[0], &cmd)) {
         if (cmd == 'Q') break;
-        if (w->fn) w->fn(w->arg);
+        if (w->fn) {
+            uint64_t c0 = fs_thread_cpu_ns();
+            w->fn(w->arg);
+            w->cpu_ns += fs_thread_cpu_ns() - c0;
+        }
         if (!pw_write_byte(w->done_fd[1], 'D')) break;
     }
     return NULL;
@@ -2065,9 +2169,14 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
                                   int grain_strength,
                                   int clarity_strength,
                                   FastTranscodeResult* out_result) {
-    uint64_t t_start = fs_now_ms();
     int ncpu = 1, has_neon = 0, is_v7 = 0;
     fs_probe_cpu(&ncpu, &has_neon, &is_v7);
+#ifndef _WIN32
+    fs_bench_once(ncpu);   // one-time (~100ms, first shot after app start only)
+#endif
+    uint64_t t_start = fs_now_ms();
+    int sched_bg = 0, sched_mhz = 0;
+    fs_read_sched_info(&sched_bg, &sched_mhz);
     if (out_result) {
         memset(out_result, 0, sizeof(FastTranscodeResult));
         out_result->ncpu = ncpu;
@@ -2165,6 +2274,7 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
 #endif
 
     // Resolve or 4-core-build the static cached 64x64x17 direct-chroma LUT (0.0ms on repeat shots!)
+    uint64_t t_lut0 = fs_now_ms();
     uint64_t lut_h = hash_lut17(lut);
     const uint32_t* ycc64 = NULL;
     int chroma_res = 1;
@@ -2212,6 +2322,11 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     pthread_mutex_unlock(&s_ycc64_mutex);
 #endif
     info->chroma_res = chroma_res;
+    int lut_wall_ms = (int)(fs_now_ms() - t_lut0);
+#ifndef _WIN32
+    uint64_t s2_cpu_base[3];
+    for (int k = 0; k < 3; k++) s2_cpu_base[k] = s2_pw[k].cpu_ns;
+#endif
 
     if (!ycc64) {
 #ifndef _WIN32
@@ -2285,6 +2400,10 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     int y_cnt = (info->samp_mode == 0) ? 4 : ((info->samp_mode == 1 || info->samp_mode == 3) ? 2 : 1);
     int std_order = (info->sos_order[0] == 0 && info->sos_order[1] == 1 && info->sos_order[2] == 2);
     uint64_t dec_wait_ms = 0, proc_ms = 0, emit_wait_ms = 0;
+    ProfAcc prof_acc[4];
+    memset(prof_acc, 0, sizeof(prof_acc));
+    uint64_t main_s2_cpu_ns = 0, main_dec_cpu_ns = 0;
+    int prof_total_mcus = info->out_mcus_x * info->out_mcus_y;
 
     EmitJob emit_job;
     memset(&emit_job, 0, sizeof(emit_job));
@@ -2300,7 +2419,9 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         cur_band_in_rows = need0;
         DecodeBandJob d0 = { info, br, in_band_work, cur_band_in_rows, y_cnt, std_order, dc_pred, &mcus_until_rst, 0 };
         uint64_t td0 = fs_now_ms();
+        uint64_t cd0 = fs_thread_cpu_ns();
         decode_band_rows(&d0);
+        main_dec_cpu_ns += fs_thread_cpu_ns() - cd0;
         dec_wait_ms += (fs_now_ms() - td0);
         cur_in_my += cur_band_in_rows;
         fail_rc = d0.fail_rc;
@@ -2364,6 +2485,7 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
             slices[k].preview_rgb565 = preview_rgb565;
             slices[k].preview_w = preview_w;
             slices[k].preview_h = preview_h;
+            slices[k].prof = &prof_acc[k];
             cur_lm += sl;
         }
 
@@ -2374,7 +2496,11 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
                 trig[k - 1] = pipe_worker_trigger(&s2_pw[k - 1], run_fast_band_slice, &slices[k]);
             }
         }
-        if (slices[0].local_my_end > slices[0].local_my_start) run_fast_band_slice(&slices[0]);
+        if (slices[0].local_my_end > slices[0].local_my_start) {
+            uint64_t cs0 = fs_thread_cpu_ns();
+            run_fast_band_slice(&slices[0]);
+            main_s2_cpu_ns += fs_thread_cpu_ns() - cs0;
+        }
         for (int k = 1; k < worker_count; k++) {
             if (slices[k].local_my_end > slices[k].local_my_start && !trig[k - 1]) run_fast_band_slice(&slices[k]);
         }
@@ -2469,6 +2595,37 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         out_result->dec_ms = (int)dec_wait_ms;
         out_result->proc_ms = (int)proc_ms;
         out_result->emit_ms = (int)emit_wait_ms;
+        out_result->setup_ms = out_result->total_ms - out_result->dec_ms - out_result->proc_ms - out_result->emit_ms;
+        out_result->lut_ms = lut_wall_ms;
+        {
+            uint64_t s2c = main_s2_cpu_ns, decc = main_dec_cpu_ns, emc = 0;
+            uint64_t pn = 0, pi = 0, pl = 0, pf = 0;
+#ifndef _WIN32
+            for (int k = 0; k < 3; k++) s2c += s2_pw[k].cpu_ns - s2_cpu_base[k];
+            decc += dec_pw.cpu_ns;
+            emc = emit_pw.cpu_ns;
+#endif
+            for (int k = 0; k < 4; k++) {
+                pn += prof_acc[k].n;
+                pi += prof_acc[k].idct_ns;
+                pl += prof_acc[k].lut_ns;
+                pf += prof_acc[k].fdct_ns;
+            }
+            out_result->cpu_s2_ms = (int)(s2c / 1000000ULL);
+            out_result->cpu_dec_ms = (int)(decc / 1000000ULL);
+            out_result->cpu_emit_ms = (int)(emc / 1000000ULL);
+            if (pn > 0) {
+                out_result->idct_ms = (int)(pi * (uint64_t)prof_total_mcus / pn / 1000000ULL);
+                out_result->lut_eval_ms = (int)(pl * (uint64_t)prof_total_mcus / pn / 1000000ULL);
+                out_result->fdct_ms = (int)(pf * (uint64_t)prof_total_mcus / pn / 1000000ULL);
+            }
+        }
+#ifndef _WIN32
+        out_result->bench1 = s_bench_one;
+        out_result->bench_all = s_bench_all;
+#endif
+        out_result->cur_mhz = sched_mhz;
+        out_result->bg_cgroup = sched_bg;
         out_result->preview_rgb565 = preview_rgb565;
         out_result->preview_w = preview_rgb565 ? preview_w : 0;
         out_result->preview_h = preview_rgb565 ? preview_h : 0;

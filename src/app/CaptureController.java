@@ -600,6 +600,16 @@ public class CaptureController {
      */
     public void processStripStreamingCapture(String rawJpegPath, final byte[] inMemoryJpegData, final int seqNum, final long captureStartTime) {
         appState.setProcessing(true);
+        // The grading thread is created at THREAD_PRIORITY_BACKGROUND (nice 10 + bg cgroup, ~5% CPU share when
+        // anything else is runnable) and every native pthread inherits that. Run the heavy transcode at default
+        // priority (same as the UI thread, never above it) and restore afterwards.
+        int prevPrio = Integer.MIN_VALUE;
+        int procNice = 99;
+        try {
+            prevPrio = android.os.Process.getThreadPriority(android.os.Process.myTid());
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT);
+            procNice = android.os.Process.getThreadPriority(android.os.Process.myTid());
+        } catch (Throwable ignored) {}
         try {
             // 1. Resolve master raw JPEG file (Zero Data Destruction: NEVER delete DSC0xxxx.JPG)
             if (rawJpegPath == null && inMemoryJpegData != null && inMemoryJpegData.length > 0) {
@@ -1120,6 +1130,11 @@ public class CaptureController {
                     fastStats[2], fastStats[3], fastStats[4],
                     fastStats[5], (fastStats[7] != 0 ? 7 : 5), (fastStats[6] != 0 ? "N" : ""))
                 : null;
+            final String profDiag = (fastStats != null && fastStats.length >= 22)
+                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d lutb:%d b1:%d b4:%d f:%d bg:%d n:%d",
+                    fastStats[13], fastStats[12], fastStats[14], fastStats[15], fastStats[16], fastStats[17],
+                    fastStats[10], fastStats[11], fastStats[18], fastStats[19], fastStats[20], fastStats[21], procNice)
+                : null;
             final String perfTag = usedFastTranscode
                 ? String.format(Locale.US, "C-FAST sd:%d c:%d", sdWaitMs, fastTranscodeMs)
                 : String.format(Locale.US, "BRD rc:%d sd:%d idx:%d dec:%d jni:%d", lastFastRc, sdWaitMs, brdIdxMs, brdDecMs, brdJniMs);
@@ -1147,7 +1162,7 @@ public class CaptureController {
             }
             if (reviewBmp != null) {
                 String reviewSubline = (cpuDiag != null)
-                    ? (cpuDiag + " | " + savedFileName)
+                    ? (cpuDiag + (profDiag != null ? "\n" + profDiag : "") + " | " + savedFileName)
                     : gradedSavedPath;
                 if (resultListener != null) {
                     deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, reviewSubline, perfTag);
@@ -1164,6 +1179,9 @@ public class CaptureController {
                 uiController.updateStatusAsync("ERR: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             }
         } finally {
+            if (prevPrio != Integer.MIN_VALUE) {
+                try { android.os.Process.setThreadPriority(prevPrio); } catch (Throwable ignored) {}
+            }
             int remaining = pendingJobsCount.decrementAndGet();
             if (remaining < 0) {
                 pendingJobsCount.set(0);
