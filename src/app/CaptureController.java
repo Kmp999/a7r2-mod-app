@@ -450,7 +450,7 @@ public class CaptureController {
                             if (photoPath != null) {
                                 jobStarted = true;
                                 if (uiController != null) uiController.updateStatusAsync("Grading " + newPhoto.getName() + "...");
-                                processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime);
+                                processStripStreamingCapture(photoPath, null, actualSeq, captureStartTime, true);
                             } else {
                                 File master = StorageResolver.findRawMasterFile(seqNum);
                                 if (master != null && claimPhotoForProcessing(master)) {
@@ -601,6 +601,10 @@ public class CaptureController {
      * - EXIF Preservation: copies camera hardware EXIF tags from DSC0xxxx.JPG, updating dims to 3976x2652.
      */
     public void processStripStreamingCapture(String rawJpegPath, final byte[] inMemoryJpegData, final int seqNum, final long captureStartTime) {
+        processStripStreamingCapture(rawJpegPath, inMemoryJpegData, seqNum, captureStartTime, false);
+    }
+
+    public void processStripStreamingCapture(String rawJpegPath, final byte[] inMemoryJpegData, final int seqNum, final long captureStartTime, boolean skipInitialEoiCheck) {
         appState.setProcessing(true);
         // The grading thread is created at THREAD_PRIORITY_BACKGROUND (nice 10 + bg cgroup, ~5% CPU share when
         // anything else is runnable) and every native pthread inherits that. Run the heavy transcode at default
@@ -628,8 +632,8 @@ public class CaptureController {
             }
 
             File rawMasterFile = new File(rawJpegPath);
-            // Verify file size stability and JPEG EOI marker (0xFF 0xD9) if not already complete
-            if (!StorageResolver.isJpegComplete(rawMasterFile)) {
+            // Verify file size stability and JPEG EOI marker (0xFF 0xD9) if not already verified by waitForNewCameraPhoto
+            if (!skipInitialEoiCheck && !StorageResolver.isJpegComplete(rawMasterFile)) {
                 StorageResolver.waitForJpegComplete(rawMasterFile, 1500);
             }
 
@@ -1048,26 +1052,65 @@ public class CaptureController {
                 }
             }
 
+            // Grab in-memory DC RGB565 preview BEFORE Tier-3 finalization so Quick Review never waits on MediaStore SD copy!
+            Bitmap reviewBmp = usedFastTranscode ? ColorEngine.takeLastFastPreviewBitmapSafe() : null;
+
             // 7. Finalize native output (Tier 1 atomic .tmp rename / Tier 2 direct / Tier 3 cache -> MediaStore)
             String gradedSavedPath = null;
             if (streamSuccess && usedCacheStream && cacheStreamFile != null && cacheStreamFile.exists() && cacheStreamFile.length() > 0) {
-                gradedSavedPath = StorageResolver.saveJpegFileViaMediaStore(context, cacheStreamFile, targetOutputFile.getName(), presetName);
-                cacheStreamFile.delete();
-                if (gradedSavedPath != null) {
-                    if (!inlineExifWritten && new File(gradedSavedPath).exists()) {
-                        if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
-                            StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
-                        } else {
-                            StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
-                        }
+                boolean queuedAsyncSave = false;
+                if (usedFastTranscode && reviewBmp != null && !isShuttingDown) {
+                    final File asyncCacheFile = cacheStreamFile;
+                    final String asyncTargetName = targetOutputFile.getName();
+                    final String asyncPresetName = presetName;
+                    final String asyncRawPath = rawJpegPath;
+                    final boolean asyncInlineExif = inlineExifWritten;
+                    final FujiRecipe.DynamicRange asyncDr = recipe.dynamicRange;
+                    try {
+                        ioExecutor.execute(new Runnable() {
+                            @Override
+                            public void run() {
+                                String saved = StorageResolver.saveJpegFileViaMediaStore(context, asyncCacheFile, asyncTargetName, asyncPresetName);
+                                asyncCacheFile.delete();
+                                if (saved != null) {
+                                    if (!asyncInlineExif && new File(saved).exists()) {
+                                        if (asyncDr != null && asyncDr != FujiRecipe.DynamicRange.DR100) {
+                                            StorageResolver.copyExifMetadata(asyncRawPath, saved, asyncPresetName, asyncDr.label, dstW, dstH);
+                                        } else {
+                                            StorageResolver.copyExifMetadata(asyncRawPath, saved, asyncPresetName, dstW, dstH);
+                                        }
+                                    }
+                                    StorageResolver.registerWithAvindex(context, saved);
+                                } else {
+                                    Log.e(TAG, "Async MediaStore save failed for " + asyncTargetName);
+                                }
+                            }
+                        });
+                        gradedSavedPath = targetOutputFile.getAbsolutePath();
+                        queuedAsyncSave = true;
+                    } catch (java.util.concurrent.RejectedExecutionException ree) {
+                        Log.w(TAG, "ioExecutor rejected async MediaStore save; falling back to sync", ree);
                     }
-                    final String avindexPath = gradedSavedPath;
-                    ioExecutor.execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            StorageResolver.registerWithAvindex(context, avindexPath);
+                }
+                if (!queuedAsyncSave) {
+                    gradedSavedPath = StorageResolver.saveJpegFileViaMediaStore(context, cacheStreamFile, targetOutputFile.getName(), presetName);
+                    cacheStreamFile.delete();
+                    if (gradedSavedPath != null) {
+                        if (!inlineExifWritten && new File(gradedSavedPath).exists()) {
+                            if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
+                                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
+                            } else {
+                                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
+                            }
                         }
-                    });
+                        final String avindexPath = gradedSavedPath;
+                        ioExecutor.execute(new Runnable() {
+                            @Override
+                            public void run() {
+                                StorageResolver.registerWithAvindex(context, avindexPath);
+                            }
+                        });
+                    }
                 }
             } else if (streamSuccess && usedDirectTarget && targetOutputFile.exists() && targetOutputFile.length() > 0) {
                 gradedSavedPath = targetOutputFile.getAbsolutePath();
@@ -1133,9 +1176,9 @@ public class CaptureController {
                     fastStats[5], (fastStats[7] != 0 ? 7 : 5), (fastStats[6] != 0 ? "N" : ""))
                 : null;
             final String profDiag = (fastStats != null && fastStats.length >= 24)
-                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d rd:%d lutb:%d pin:%d t%d b:%d/%d",
+                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d rd:%d lutb:%d pin:%d t%d dct:%d%%",
                     fastStats[13], fastStats[12], fastStats[14], fastStats[15], fastStats[16], fastStats[17],
-                    fastStats[10], fastStats[22], fastStats[11], fastStats[23], usedFastTier, fastStats[18], fastStats[19])
+                    fastStats[10], fastStats[22], fastStats[11], fastStats[23], usedFastTier, fastStats[18])
                 : null;
             final String perfTag = usedFastTranscode
                 ? String.format(Locale.US, "C-FAST sd:%d c:%d", sdWaitMs, fastTranscodeMs)
@@ -1146,7 +1189,6 @@ public class CaptureController {
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
             // 10. Instant Zero-I/O Quick Review from in-memory DC RGB565 preview (skips 1-1.5s SD re-read & Skia decode!)
-            Bitmap reviewBmp = usedFastTranscode ? ColorEngine.takeLastFastPreviewBitmapSafe() : null;
             if (reviewBmp == null) {
                 File reviewFile = (gradedSavedPath != null && new File(gradedSavedPath).exists())
                     ? new File(gradedSavedPath) : targetOutputFile;
@@ -1346,7 +1388,7 @@ public class CaptureController {
             processingExecutor.shutdownNow();
         }
         try {
-            if (!ioExecutor.awaitTermination(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            if (!ioExecutor.awaitTermination(3000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
                 ioExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {

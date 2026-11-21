@@ -1043,7 +1043,7 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGetLastFastS
     vals[15] = (jint)g_last_fast_res.idct_ms;
     vals[16] = (jint)g_last_fast_res.lut_eval_ms;
     vals[17] = (jint)g_last_fast_res.fdct_ms;
-    vals[18] = (jint)g_last_fast_res.bench1;
+    vals[18] = (jint)g_last_fast_res.dct_fast_pct;
     vals[19] = (jint)g_last_fast_res.bench_all;
     vals[20] = (jint)g_last_fast_res.cur_mhz;
     vals[21] = (jint)g_last_fast_res.bg_cgroup;
