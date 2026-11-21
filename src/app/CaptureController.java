@@ -1130,10 +1130,10 @@ public class CaptureController {
                     fastStats[2], fastStats[3], fastStats[4],
                     fastStats[5], (fastStats[7] != 0 ? 7 : 5), (fastStats[6] != 0 ? "N" : ""))
                 : null;
-            final String profDiag = (fastStats != null && fastStats.length >= 22)
-                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d lutb:%d b1:%d b4:%d f:%d bg:%d n:%d",
+            final String profDiag = (fastStats != null && fastStats.length >= 24)
+                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d rd:%d lutb:%d pin:%d b:%d/%d n:%d",
                     fastStats[13], fastStats[12], fastStats[14], fastStats[15], fastStats[16], fastStats[17],
-                    fastStats[10], fastStats[11], fastStats[18], fastStats[19], fastStats[20], fastStats[21], procNice)
+                    fastStats[10], fastStats[22], fastStats[11], fastStats[23], fastStats[18], fastStats[19], procNice)
                 : null;
             final String perfTag = usedFastTranscode
                 ? String.format(Locale.US, "C-FAST sd:%d c:%d", sdWaitMs, fastTranscodeMs)

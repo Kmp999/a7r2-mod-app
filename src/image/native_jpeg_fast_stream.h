@@ -33,6 +33,8 @@ typedef struct {
     int bench_all;            // Calibration: M dependent-ops/s, ncpu threads at once
     int cur_mhz;              // cpu0 scaling_cur_freq in MHz (0 if unreadable)
     int bg_cgroup;            // 1 if the grading thread sits in a background cgroup
+    int read_ms;              // One-shot sequential input JPEG RAM read time in ms (0 if streaming)
+    int pin_cnt;              // Number of threads pinned to distinct CPU cores
     uint16_t* preview_rgb565; // Allocated RGB_565 DC preview (caller frees via free()), or NULL
     int preview_w;
     int preview_h;

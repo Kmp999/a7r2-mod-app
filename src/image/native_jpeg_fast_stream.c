@@ -8,6 +8,7 @@
 #ifndef _WIN32
 #include <errno.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
@@ -92,6 +93,82 @@ static void fs_read_sched_info(int* out_bg, int* out_mhz) {
     *out_bg = bg;
     *out_mhz = mhz;
 }
+
+#ifndef _WIN32
+// Linux API-9-safe CPU affinity helpers via raw syscall (prevents Linux 3.0 SMP core-piling onto CPU 0!)
+typedef struct {
+    unsigned long bits[16];
+    int valid;
+} FsCpuMask;
+
+static int fs_get_avail_cpus(int out_cpus[4], FsCpuMask* out_saved) {
+    memset(out_saved, 0, sizeof(FsCpuMask));
+    int count = 0;
+#if defined(__linux__)
+#if defined(__NR_sched_getaffinity)
+    const long nr_get = __NR_sched_getaffinity;
+#elif defined(__arm__)
+    const long nr_get = 242;
+#else
+    const long nr_get = -1;
+#endif
+    if (nr_get >= 0) {
+        long rc = syscall(nr_get, (pid_t)0, (size_t)sizeof(out_saved->bits), out_saved->bits);
+        if (rc > 0) {
+            out_saved->valid = 1;
+            int max_bits = (int)(sizeof(unsigned long) * 8);
+            if (max_bits > 64) max_bits = 64;
+            for (int c = 0; c < max_bits && count < 4; c++) {
+                if ((out_saved->bits[0] & (1UL << c)) != 0UL) {
+                    out_cpus[count++] = c;
+                }
+            }
+        }
+    }
+#else
+    (void)out_cpus;
+#endif
+    return count;
+}
+
+static int fs_pin_current_cpu(int cpu_id) {
+#if defined(__linux__)
+#if defined(__NR_sched_setaffinity)
+    const long nr_set = __NR_sched_setaffinity;
+#elif defined(__arm__)
+    const long nr_set = 241;
+#else
+    const long nr_set = -1;
+#endif
+    if (nr_set >= 0 && cpu_id >= 0 && cpu_id < (int)(sizeof(unsigned long) * 8)) {
+        unsigned long mask[16];
+        memset(mask, 0, sizeof(mask));
+        mask[0] = (1UL << cpu_id);
+        return (syscall(nr_set, (pid_t)0, (size_t)sizeof(mask), mask) == 0) ? 1 : 0;
+    }
+#else
+    (void)cpu_id;
+#endif
+    return 0;
+}
+
+static void fs_restore_affinity(const FsCpuMask* saved) {
+#if defined(__linux__)
+#if defined(__NR_sched_setaffinity)
+    const long nr_set = __NR_sched_setaffinity;
+#elif defined(__arm__)
+    const long nr_set = 241;
+#else
+    const long nr_set = -1;
+#endif
+    if (nr_set >= 0 && saved && saved->valid) {
+        (void)syscall(nr_set, (pid_t)0, (size_t)sizeof(saved->bits), saved->bits);
+    }
+#else
+    (void)saved;
+#endif
+}
+#endif
 
 #ifndef _WIN32
 // One-time per-process calibration: does running on N threads really give N x throughput?
@@ -280,7 +357,8 @@ static void build_ycc64_slice(void* arg) {
                 uint32_t oy  = (uint32_t)clamp_u8_v7(oy_i);
                 uint32_t ocb = (uint32_t)clamp_u8_v7(ocb_i);
                 uint32_t ocr = (uint32_t)clamp_u8_v7(ocr_i);
-                col[yi] = (oy << 16) | (ocb << 8) | ocr;
+                // 8:12:12 SWAR layout: bits 24..31=oy, 12..19=ocb (4 guard bits), 0..7=ocr (4 guard bits)
+                col[yi] = (oy << 24) | (ocb << 12) | ocr;
                 int dcb = (int)ocb - 128; if (dcb < 0) dcb = -dcb;
                 int dcr = (int)ocr - 128; if (dcr < 0) dcr = -dcr;
                 if (dcb > max_dev) max_dev = dcb;
@@ -526,10 +604,11 @@ static void build_fast_huff(FastHuffTable* t, const uint8_t bits[17], const uint
     t->valid = 1;
 }
 
-// Buffered 64KB 64-bit MSB-aligned JPEG entropy reader (refills 32 bits at a time via ARMv7 REV!)
+// Buffered 64-bit MSB-aligned JPEG entropy reader (direct RAM buffer OR 64KB FILE* stream; 32-bit ARMv7 REV refill!)
 typedef struct {
     FILE* fp;
-    uint8_t buf[65536];
+    uint8_t* buf;
+    uint8_t stream_buf[65536];
     size_t pos, len;
     uint64_t bitbuf;
     int bitcnt;
@@ -540,7 +619,9 @@ typedef struct {
 
 static inline int fbr_next_raw_byte(FastBitReader* br) {
     if (br->pos >= br->len) {
-        br->len = fread(br->buf, 1, sizeof(br->buf), br->fp);
+        if (!br->fp) { br->eof = 1; return -1; }
+        br->len = fread(br->stream_buf, 1, sizeof(br->stream_buf), br->fp);
+        br->buf = br->stream_buf;
         br->pos = 0;
         if (br->len == 0) { br->eof = 1; return -1; }
     }
@@ -599,7 +680,10 @@ static int fbr_consume_restart(FastBitReader* br) {
 }
 
 typedef struct {
-    int16_t c[64];
+    union {
+        int16_t c[64];
+        uint32_t c32[32];
+    };
     uint8_t has_ac;
     uint8_t row_mask;   // bit r set iff row r has non-zero AC (r=0: cols 1..7; r=1..7: cols 0..7)
     uint8_t dirty_rows; // bit r set iff row r had non-zero writes in previous decode (sparse clear!)
@@ -651,7 +735,7 @@ static inline int decode_huff_block_reg(FastBitReader* br,
                 if (bitcnt < 16) { \
                     br->bitbuf = bitbuf; br->bitcnt = bitcnt; br->pos = pos; \
                     fbr_fill_slow(br); \
-                    bitbuf = br->bitbuf; bitcnt = br->bitcnt; pos = br->pos; len = br->len; \
+                    bitbuf = br->bitbuf; bitcnt = br->bitcnt; pos = br->pos; len = br->len; buf = br->buf; \
                 } \
             } \
         } \
@@ -675,7 +759,7 @@ static inline int decode_huff_block_reg(FastBitReader* br,
                 if (bitcnt < 1) { \
                     br->bitbuf = bitbuf; br->bitcnt = bitcnt; br->pos = pos; \
                     fbr_fill_slow(br); \
-                    bitbuf = br->bitbuf; bitcnt = br->bitcnt; pos = br->pos; len = br->len; \
+                    bitbuf = br->bitbuf; bitcnt = br->bitcnt; pos = br->pos; len = br->len; buf = br->buf; \
                 } \
                 _code = (_code << 1) | (int32_t)(bitbuf >> 63); \
                 bitbuf <<= 1; \
@@ -722,11 +806,14 @@ static inline int decode_huff_block_reg(FastBitReader* br,
         return 1;
     }
 
-    // Sparse-clear ONLY rows that were touched by a previous band in this slot!
+    // Sparse-clear ONLY rows touched by previous band using inline 32-bit stores (zero libc memset register clobber!)
     uint8_t dirty = blk->dirty_rows;
     if (dirty) {
-        if (dirty & 1) {
-            out64[1] = out64[2] = out64[3] = out64[4] = out64[5] = out64[6] = out64[7] = 0;
+        if (dirty & 1U) {
+            out64[1] = 0;
+            blk->c32[1] = 0;
+            blk->c32[2] = 0;
+            blk->c32[3] = 0;
             dirty &= (uint8_t)~1U;
         }
         while (dirty) {
@@ -736,7 +823,11 @@ static inline int decode_huff_block_reg(FastBitReader* br,
             int dr = 0;
             while (((dirty >> dr) & 1) == 0) dr++;
 #endif
-            memset(out64 + dr * 8, 0, 16);
+            uint32_t* zp = blk->c32 + (dr << 2);
+            zp[0] = 0;
+            zp[1] = 0;
+            zp[2] = 0;
+            zp[3] = 0;
             dirty &= (uint8_t)(dirty - 1);
         }
     }
@@ -1110,6 +1201,13 @@ static inline void idct_8x4_half_v_aan(const DecBlock* blk, const int32_t* dq, c
 }
 
 typedef struct {
+    int16_t dz;
+    uint16_t inv_q;
+    uint8_t zz;
+    uint8_t pad[3];
+} QuantNatEntry;
+
+typedef struct {
     int src_w, src_h;
     int dst_w, dst_h;
     int scale;          // 1 or 2
@@ -1129,10 +1227,8 @@ typedef struct {
     FastHuffTable ac_huff[4];
     int restart_interval;
     int chroma_res;
-    uint16_t inv_q_luma_nat[64];
-    uint16_t inv_q_chroma_nat[64];
-    int16_t dz_luma_nat[64];
-    int16_t dz_chroma_nat[64];
+    QuantNatEntry q_luma_nat[64];
+    QuantNatEntry q_chroma_nat[64];
     CleanExifInfo exif;
 } FastJpegInfo;
 
@@ -1294,13 +1390,13 @@ static int parse_jpeg_headers(FILE* fp, FastJpegInfo* info) {
 
 static inline int16_t lut64_eval_y(const uint32_t* col, uint8_t y) {
     int y0 = (int)(y >> 4), yf = (int)(y & 15U);
-    int ya = (int)(col[y0] >> 16);
-    int yb = (int)(col[y0 + 1] >> 16);
-    return (int16_t)((((ya << 4) + (yb - ya) * yf + 8) >> 4) - 128);
+    int ya = (int)(col[y0] >> 24);
+    int yb = (int)(col[y0 + 1] >> 24);
+    return (int16_t)((((ya - 128) << 4) + 8 + (yb - ya) * yf) >> 4);
 }
 
-// Ultra-Fast 2-Load Direct-Chroma 64x64x17 YCbCr 3D LUT for one 2x2 pixel quad:
-// - ZERO chroma simplex weights, ZERO chroma multiplies, ZERO bounds clamps!
+// Ultra-Fast 2-Load Direct-Chroma 64x64x17 YCbCr 3D LUT with 8:12:12 SWAR Linear-Y Chroma:
+// - ZERO chroma simplex weights, ZERO bounds clamps, 1 SWAR mul-add interpolates BOTH Cb and Cr bit-exactly!
 // - Same-cell fast path (~80% of quads): ONLY 2 LUT loads total for all 4 Y + Cb + Cr!
 // - 1-cycle chroma residual pass-through restores exact smooth sub-bucket chroma gradients!
 static inline void grade_ycc_quad_2x2_direct64(const uint32_t* __restrict ycc64, int chroma_res,
@@ -1308,7 +1404,6 @@ static inline void grade_ycc_quad_2x2_direct64(const uint32_t* __restrict ycc64,
                                                uint8_t cb, uint8_t cr,
                                                int16_t* oy00, int16_t* oy01, int16_t* oy10, int16_t* oy11,
                                                int16_t* ocb, int16_t* ocr) {
-    // 1-cycle shift+or index, 1-cycle ARM add-shift multiply by 17 (idx + (idx << 4))!
     size_t cidx = (((size_t)(cr >> 2) << 6) | (size_t)(cb >> 2));
     const uint32_t* col = ycc64 + (cidx + (cidx << 4));
 
@@ -1317,25 +1412,25 @@ static inline void grade_ycc_quad_2x2_direct64(const uint32_t* __restrict ycc64,
         uint32_t va = col[y0];
         uint32_t vb = col[y0 + 1];
 
-        int ya = (int)(va >> 16), yb = (int)(vb >> 16);
-        int a16 = (ya << 4) + 8, d = yb - ya;
+        int ya = (int)(va >> 24), yb = (int)(vb >> 24);
+        int a16 = ((ya - 128) << 4) + 8, d = yb - ya;
         int f0 = (int)(y00 & 15U), f1 = (int)(y01 & 15U), f2 = (int)(y10 & 15U), f3 = (int)(y11 & 15U);
-        *oy00 = (int16_t)(((a16 + d * f0) >> 4) - 128);
-        *oy01 = (int16_t)(((a16 + d * f1) >> 4) - 128);
-        *oy10 = (int16_t)(((a16 + d * f2) >> 4) - 128);
-        *oy11 = (int16_t)(((a16 + d * f3) >> 4) - 128);
+        *oy00 = (int16_t)((a16 + d * f0) >> 4);
+        *oy01 = (int16_t)((a16 + d * f1) >> 4);
+        *oy10 = (int16_t)((a16 + d * f2) >> 4);
+        *oy11 = (int16_t)((a16 + d * f3) >> 4);
 
-        int yaf = (f0 + f1 + f2 + f3 + 2) >> 2;
-        int cba = (int)((va >> 8) & 0xFFU), cbb = (int)((vb >> 8) & 0xFFU);
-        int cra = (int)(va & 0xFFU),        crb = (int)(vb & 0xFFU);
-        int rcb = (((cba << 4) + (cbb - cba) * yaf + 8) >> 4) - 128;
-        int rcr = (((cra << 4) + (crb - cra) * yaf + 8) >> 4) - 128;
+        uint32_t yaf = (uint32_t)((f0 + f1 + f2 + f3 + 2) >> 2);
+        uint32_t cc = (va & 0x00FFFFFFU) * (16U - yaf) + (vb & 0x00FFFFFFU) * yaf + 0x00008008U;
+        int rcb = (int)(cc >> 16);
+        int rcr = (int)((cc >> 4) & 0xFFU);
         if (chroma_res) {
-            rcb = (int)clamp_s8_v7(rcb + (int)(cb & 3U) - 2);
-            rcr = (int)clamp_s8_v7(rcr + (int)(cr & 3U) - 2);
+            *ocb = clamp_s8_v7(rcb + (int)(cb & 3U) - 130);
+            *ocr = clamp_s8_v7(rcr + (int)(cr & 3U) - 130);
+        } else {
+            *ocb = (int16_t)(rcb - 128);
+            *ocr = (int16_t)(rcr - 128);
         }
-        *ocb = (int16_t)rcb;
-        *ocr = (int16_t)rcr;
         return;
     }
 
@@ -1345,27 +1440,35 @@ static inline void grade_ycc_quad_2x2_direct64(const uint32_t* __restrict ycc64,
     *oy11 = lut64_eval_y(col, y11);
 
     int ya = ((int)y00 + (int)y01 + (int)y10 + (int)y11 + 2) >> 2;
-    int ya0 = ya >> 4, yaf = ya & 15;
+    int ya0 = ya >> 4;
+    uint32_t yaf = (uint32_t)(ya & 15);
     uint32_t va = col[ya0];
     uint32_t vb = col[ya0 + 1];
-    int cba = (int)((va >> 8) & 0xFFU), cbb = (int)((vb >> 8) & 0xFFU);
-    int cra = (int)(va & 0xFFU),        crb = (int)(vb & 0xFFU);
-    int rcb = (((cba << 4) + (cbb - cba) * yaf + 8) >> 4) - 128;
-    int rcr = (((cra << 4) + (crb - cra) * yaf + 8) >> 4) - 128;
+    uint32_t cc = (va & 0x00FFFFFFU) * (16U - yaf) + (vb & 0x00FFFFFFU) * yaf + 0x00008008U;
+    int rcb = (int)(cc >> 16);
+    int rcr = (int)((cc >> 4) & 0xFFU);
     if (chroma_res) {
-        rcb = (int)clamp_s8_v7(rcb + (int)(cb & 3U) - 2);
-        rcr = (int)clamp_s8_v7(rcr + (int)(cr & 3U) - 2);
+        *ocb = clamp_s8_v7(rcb + (int)(cb & 3U) - 130);
+        *ocr = clamp_s8_v7(rcr + (int)(cr & 3U) - 130);
+    } else {
+        *ocb = (int16_t)(rcb - 128);
+        *ocr = (int16_t)(rcr - 128);
     }
-    *ocb = (int16_t)rcb;
-    *ocr = (int16_t)rcr;
 }
 
-// Register-Fused Luma AAN FDCT + Bit-Exact Deadzone Quantization via 64-bit CLZ/CTZ nz_mask:
-// - ZERO stores/reloads of blk[1..63] between column FDCT and quantization (saves 128 mem ops/block!)
-// - ZERO scan beyond last_nz; DC-only output blocks write 0 AC bytes!
-// - Preserves unquantized DC in blk[0] for zero-I/O Quick Review preview extraction!
-static void fast_fdct_quant_luma(int16_t* __restrict blk, const uint16_t* __restrict inv_q_nat,
-                                 const int16_t* __restrict dz_nat, JpegQuantBlock* __restrict qb) {
+// Register-Clean Split Even/Odd Luma AAN FDCT + Direct-Write Sparse-Prev-Clear Deadzone Quantization:
+// - ZERO qtmp[64], ZERO libc memset call, ZERO nz_lo/nz_hi scatter loop!
+// - Splits column FDCT into even half (c0,c2,c4,c6) then odd half (c1,c3,c5,c7) -> <=11 live regs (zero ARM32 stack spills!)
+// - Packed QuantNatEntry collapses 3 table base pointers into 1!
+// - Requires q_work/q_emit allocated via calloc so qb->q[k]==0 for all k > qb->last_nz.
+static void fast_fdct_quant_luma(int16_t* __restrict blk, const QuantNatEntry* __restrict qent,
+                                 JpegQuantBlock* __restrict qb) {
+    int prev_nz = (int)qb->last_nz;
+    if (prev_nz > 0) {
+        int16_t* qp = qb->q;
+        for (int k = 1; k <= prev_nz; k++) qp[k] = 0;
+    }
+
     int any_ac_col = 0;
     for (int i = 0; i < 8; i++) {
         int16_t* r = blk + i * 8;
@@ -1395,113 +1498,97 @@ static void fast_fdct_quant_luma(int16_t* __restrict blk, const uint16_t* __rest
         r[7] = (int16_t)(z11 - z4);
     }
 
-    int16_t qtmp[64];
-    uint32_t nz_lo = 0, nz_hi = 0;
-    int col_limit = any_ac_col ? 8 : 1;
-
+    int last_nz = 0;
     #define QREG_LUMA(val, nat) do { \
         int _c = (val); \
-        int _dz = dz_nat[(nat)]; \
+        const QuantNatEntry* _e = &qent[(nat)]; \
+        int _dz = _e->dz; \
         if ((unsigned)(_c + _dz) > (unsigned)(_dz << 1)) { \
             int _s = _c < 0; \
-            int _qv = (((_s ? -_c : _c) * (int)inv_q_nat[(nat)] + 32768) >> 16); \
+            int _qv = (((_s ? -_c : _c) * (int)_e->inv_q + 32768) >> 16); \
             if (_qv > 1023) { _qv = 1023; } \
-            int _zi = NAT_TO_ZZ[(nat)]; \
-            qtmp[_zi] = (int16_t)(_s ? -_qv : _qv); \
-            if (_zi < 32) { nz_lo |= (1U << _zi); } \
-            else { nz_hi |= (1U << (_zi - 32)); } \
+            int _zi = (int)_e->zz; \
+            qb->q[_zi] = (int16_t)(_s ? -_qv : _qv); \
+            if (_zi > last_nz) { last_nz = _zi; } \
         } \
     } while (0)
 
-    for (int i = 0; i < col_limit; i++) {
-        int16_t* r = blk + i;
-        int d3 = r[24] - r[32], d2 = r[16] - r[40], d1 = r[8] - r[48], d0 = r[0] - r[56];
-        int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
-        if ((d0 | d1 | d2 | d3 | s0 | s1 | s2 | s3) == 0) {
-            if (i == 0) {
-                blk[0] = 0;
-                qb->q[0] = 0;
-            }
-            continue;
-        }
-        int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
-        int c0 = (t0 + t1) >> 3;
-        int c4 = (t0 - t1) >> 3;
-        int z1 = ((t2 + t3) * 181) >> 8;
-        int c2 = (t3 + z1) >> 3;
-        int c6 = (t3 - z1) >> 3;
-        int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
-        int z5 = ((t4 - t6) * 98) >> 8;
-        int z2 = ((t4 * 139) >> 8) + z5;
-        int z4 = ((t6 * 334) >> 8) + z5;
-        int z3 = (t5 * 181) >> 8;
-        int z11 = d0 + z3, z13 = d0 - z3;
-        int c5 = (z13 + z2) >> 3;
-        int c3 = (z13 - z2) >> 3;
-        int c1 = (z11 + z4) >> 3;
-        int c7 = (z11 - z4) >> 3;
-
-        if (i == 0) {
+    // Peeled column 0 (save r0_orig before overwriting blk[0] with unquantized DC for Quick Review!)
+    {
+        int r0_orig = blk[0];
+        int s0 = r0_orig + blk[56], s1 = blk[8] + blk[48], s2 = blk[16] + blk[40], s3 = blk[24] + blk[32];
+        if ((s0 | s1 | s2 | s3) == 0) {
+            blk[0] = 0;
+            qb->q[0] = 0;
+        } else {
+            int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
+            int c0 = (t0 + t1) >> 3;
             blk[0] = (int16_t)c0;
             int sd = c0 < 0;
-            int qd = (((sd ? -c0 : c0) * (int)inv_q_nat[0]) + 32768) >> 16;
+            int qd = (((sd ? -c0 : c0) * (int)qent[0].inv_q) + 32768) >> 16;
             qb->q[0] = (int16_t)(sd ? -qd : qd);
-        } else {
-            QREG_LUMA(c0, i);
+            if (((t0 - t1) | t2 | t3) != 0) {
+                QREG_LUMA((t0 - t1) >> 3, 32);
+                int z1 = ((t2 + t3) * 181) >> 8;
+                QREG_LUMA((t3 + z1) >> 3, 16);
+                QREG_LUMA((t3 - z1) >> 3, 48);
+            }
         }
-        QREG_LUMA(c1,  8 + i);
-        QREG_LUMA(c2, 16 + i);
-        QREG_LUMA(c3, 24 + i);
-        QREG_LUMA(c4, 32 + i);
-        QREG_LUMA(c5, 40 + i);
-        QREG_LUMA(c6, 48 + i);
-        QREG_LUMA(c7, 56 + i);
+        int d3 = blk[24] - blk[32], d2 = blk[16] - blk[40], d1 = blk[8] - blk[48], d0 = r0_orig - blk[56];
+        if ((d0 | d1 | d2 | d3) != 0) {
+            int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
+            int z5 = ((t4 - t6) * 98) >> 8;
+            int z2 = ((t4 * 139) >> 8) + z5;
+            int z4 = ((t6 * 334) >> 8) + z5;
+            int z3 = (t5 * 181) >> 8;
+            int z11 = d0 + z3, z13 = d0 - z3;
+            QREG_LUMA((z11 + z4) >> 3,  8);
+            QREG_LUMA((z11 - z4) >> 3, 56);
+            QREG_LUMA((z13 + z2) >> 3, 40);
+            QREG_LUMA((z13 - z2) >> 3, 24);
+        }
+    }
+
+    if (any_ac_col) {
+        for (int i = 1; i < 8; i++) {
+            const int16_t* r = blk + i;
+            int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
+            if ((s0 | s1 | s2 | s3) != 0) {
+                int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
+                QREG_LUMA((t0 + t1) >> 3, i);
+                QREG_LUMA((t0 - t1) >> 3, 32 + i);
+                int z1 = ((t2 + t3) * 181) >> 8;
+                QREG_LUMA((t3 + z1) >> 3, 16 + i);
+                QREG_LUMA((t3 - z1) >> 3, 48 + i);
+            }
+            int d3 = r[24] - r[32], d2 = r[16] - r[40], d1 = r[8] - r[48], d0 = r[0] - r[56];
+            if ((d0 | d1 | d2 | d3) != 0) {
+                int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
+                int z5 = ((t4 - t6) * 98) >> 8;
+                int z2 = ((t4 * 139) >> 8) + z5;
+                int z4 = ((t6 * 334) >> 8) + z5;
+                int z3 = (t5 * 181) >> 8;
+                int z11 = d0 + z3, z13 = d0 - z3;
+                QREG_LUMA((z11 + z4) >> 3,  8 + i);
+                QREG_LUMA((z11 - z4) >> 3, 56 + i);
+                QREG_LUMA((z13 + z2) >> 3, 40 + i);
+                QREG_LUMA((z13 - z2) >> 3, 24 + i);
+            }
+        }
     }
     #undef QREG_LUMA
-
-    if ((nz_lo | nz_hi) == 0) {
-        qb->last_nz = 0;
-        return;
-    }
-    int last_nz;
-#if defined(__GNUC__) || defined(__clang__)
-    if (nz_hi) last_nz = 63 - __builtin_clz(nz_hi);
-    else last_nz = 31 - __builtin_clz(nz_lo);
-#else
-    last_nz = 0;
-    for (int zi = 1; zi < 64; zi++) {
-        if ((zi < 32 ? (nz_lo & (1U << zi)) : (nz_hi & (1U << (zi - 32)))) != 0) last_nz = zi;
-    }
-#endif
     qb->last_nz = (uint8_t)last_nz;
-    memset(qb->q + 1, 0, (size_t)last_nz * sizeof(int16_t));
-    while (nz_lo) {
-#if defined(__GNUC__) || defined(__clang__)
-        int zi = __builtin_ctz(nz_lo);
-#else
-        int zi = 0;
-        while (((nz_lo >> zi) & 1U) == 0) zi++;
-#endif
-        qb->q[zi] = qtmp[zi];
-        nz_lo &= nz_lo - 1U;
-    }
-    while (nz_hi) {
-#if defined(__GNUC__) || defined(__clang__)
-        int zi = 32 + __builtin_ctz(nz_hi);
-#else
-        int zi = 32;
-        while (((nz_hi >> (zi - 32)) & 1U) == 0) zi++;
-#endif
-        qb->q[zi] = qtmp[zi];
-        nz_hi &= nz_hi - 1U;
-    }
 }
 
-// Fast 4x4 Top-Left Chroma FDCT + Register-Fused Deadzone Quantization:
-// At Q88 Chroma, all u>=4 or v>=4 coefficients use Q=24 (mean diff 0.04/255 vs 8x8 — visually identical!),
-// cutting chroma FDCT + quantization cycles by >60% with a single 32-bit nz_lo bitmask (max zi = 24)!
-static void fast_fdct_quant_chroma(int16_t* __restrict blk, const uint16_t* __restrict inv_q_nat,
-                                   const int16_t* __restrict dz_nat, JpegQuantBlock* __restrict qb) {
+// Fast 4x4 Top-Left Chroma FDCT + Direct-Write Sparse-Prev-Clear Deadzone Quantization:
+static void fast_fdct_quant_chroma(int16_t* __restrict blk, const QuantNatEntry* __restrict qent,
+                                   JpegQuantBlock* __restrict qb) {
+    int prev_nz = (int)qb->last_nz;
+    if (prev_nz > 0) {
+        int16_t* qp = qb->q;
+        for (int k = 1; k <= prev_nz; k++) qp[k] = 0;
+    }
+
     int any_ac_col = 0;
     for (int i = 0; i < 8; i++) {
         int16_t* r = blk + i * 8;
@@ -1525,139 +1612,152 @@ static void fast_fdct_quant_chroma(int16_t* __restrict blk, const uint16_t* __re
         r[3] = (int16_t)((d0 - z3) - z2);
     }
 
-    int16_t qtmp[32];
-    uint32_t nz_lo = 0;
-    int col_limit = any_ac_col ? 4 : 1;
-
+    int last_nz = 0;
     #define QREG_CHROMA(val, nat) do { \
         int _c = (val); \
-        int _dz = dz_nat[(nat)]; \
+        const QuantNatEntry* _e = &qent[(nat)]; \
+        int _dz = _e->dz; \
         if ((unsigned)(_c + _dz) > (unsigned)(_dz << 1)) { \
             int _s = _c < 0; \
-            int _qv = (((_s ? -_c : _c) * (int)inv_q_nat[(nat)] + 32768) >> 16); \
+            int _qv = (((_s ? -_c : _c) * (int)_e->inv_q + 32768) >> 16); \
             if (_qv > 1023) { _qv = 1023; } \
-            int _zi = NAT_TO_ZZ[(nat)]; \
-            qtmp[_zi] = (int16_t)(_s ? -_qv : _qv); \
-            nz_lo |= (1U << _zi); \
+            int _zi = (int)_e->zz; \
+            qb->q[_zi] = (int16_t)(_s ? -_qv : _qv); \
+            if (_zi > last_nz) { last_nz = _zi; } \
         } \
     } while (0)
 
-    for (int i = 0; i < col_limit; i++) {
-        int16_t* r = blk + i;
-        int d3 = r[24] - r[32], d2 = r[16] - r[40], d1 = r[8] - r[48], d0 = r[0] - r[56];
-        int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
-        if ((d0 | d1 | d2 | d3 | s0 | s1 | s2 | s3) == 0) {
-            if (i == 0) qb->q[0] = 0;
-            continue;
-        }
-        int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
-        int c0 = (t0 + t1) >> 3;
-        int z1 = ((t2 + t3) * 181) >> 8;
-        int c2 = (t3 + z1) >> 3;
-        int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
-        int z5 = ((t4 - t6) * 98) >> 8;
-        int z2 = ((t4 * 139) >> 8) + z5;
-        int z4 = ((t6 * 334) >> 8) + z5;
-        int z3 = (t5 * 181) >> 8;
-        int c1 = ((d0 + z3) + z4) >> 3;
-        int c3 = ((d0 - z3) - z2) >> 3;
-
-        if (i == 0) {
-            int sd = c0 < 0;
-            int qd = (((sd ? -c0 : c0) * (int)inv_q_nat[0]) + 32768) >> 16;
-            qb->q[0] = (int16_t)(sd ? -qd : qd);
+    // Peeled column 0
+    {
+        int s0 = blk[0] + blk[56], s1 = blk[8] + blk[48], s2 = blk[16] + blk[40], s3 = blk[24] + blk[32];
+        if ((s0 | s1 | s2 | s3) == 0) {
+            qb->q[0] = 0;
         } else {
-            QREG_CHROMA(c0, i);
+            int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
+            int c0 = (t0 + t1) >> 3;
+            int sd = c0 < 0;
+            int qd = (((sd ? -c0 : c0) * (int)qent[0].inv_q) + 32768) >> 16;
+            qb->q[0] = (int16_t)(sd ? -qd : qd);
+            if ((t2 | t3) != 0) {
+                int z1 = ((t2 + t3) * 181) >> 8;
+                QREG_CHROMA((t3 + z1) >> 3, 16);
+            }
         }
-        QREG_CHROMA(c1,  8 + i);
-        QREG_CHROMA(c2, 16 + i);
-        QREG_CHROMA(c3, 24 + i);
+        int d3 = blk[24] - blk[32], d2 = blk[16] - blk[40], d1 = blk[8] - blk[48], d0 = blk[0] - blk[56];
+        if ((d0 | d1 | d2 | d3) != 0) {
+            int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
+            int z5 = ((t4 - t6) * 98) >> 8;
+            int z2 = ((t4 * 139) >> 8) + z5;
+            int z4 = ((t6 * 334) >> 8) + z5;
+            int z3 = (t5 * 181) >> 8;
+            QREG_CHROMA(((d0 + z3) + z4) >> 3,  8);
+            QREG_CHROMA(((d0 - z3) - z2) >> 3, 24);
+        }
+    }
+
+    if (any_ac_col) {
+        for (int i = 1; i < 4; i++) {
+            const int16_t* r = blk + i;
+            int s0 = r[0] + r[56], s1 = r[8] + r[48], s2 = r[16] + r[40], s3 = r[24] + r[32];
+            if ((s0 | s1 | s2 | s3) != 0) {
+                int t0 = s0 + s3, t3 = s0 - s3, t1 = s1 + s2, t2 = s1 - s2;
+                QREG_CHROMA((t0 + t1) >> 3, i);
+                int z1 = ((t2 + t3) * 181) >> 8;
+                QREG_CHROMA((t3 + z1) >> 3, 16 + i);
+            }
+            int d3 = r[24] - r[32], d2 = r[16] - r[40], d1 = r[8] - r[48], d0 = r[0] - r[56];
+            if ((d0 | d1 | d2 | d3) != 0) {
+                int t4 = d2 + d3, t5 = d1 + d2, t6 = d0 + d1;
+                int z5 = ((t4 - t6) * 98) >> 8;
+                int z2 = ((t4 * 139) >> 8) + z5;
+                int z4 = ((t6 * 334) >> 8) + z5;
+                int z3 = (t5 * 181) >> 8;
+                QREG_CHROMA(((d0 + z3) + z4) >> 3,  8 + i);
+                QREG_CHROMA(((d0 - z3) - z2) >> 3, 24 + i);
+            }
+        }
     }
     #undef QREG_CHROMA
-
-    if (nz_lo == 0) {
-        qb->last_nz = 0;
-        return;
-    }
-#if defined(__GNUC__) || defined(__clang__)
-    int last_nz = 31 - __builtin_clz(nz_lo);
-#else
-    int last_nz = 0;
-    for (int zi = 1; zi < 32; zi++) {
-        if (nz_lo & (1U << zi)) last_nz = zi;
-    }
-#endif
     qb->last_nz = (uint8_t)last_nz;
-    memset(qb->q + 1, 0, (size_t)last_nz * sizeof(int16_t));
-    while (nz_lo) {
-#if defined(__GNUC__) || defined(__clang__)
-        int zi = __builtin_ctz(nz_lo);
-#else
-        int zi = 0;
-        while (((nz_lo >> zi) & 1U) == 0) zi++;
-#endif
-        qb->q[zi] = qtmp[zi];
-        nz_lo &= nz_lo - 1U;
-    }
 }
 
 static inline void quantize_mcu_fast(const FastJpegInfo* info, int16_t y_blk[4][64],
                                      int16_t cb_blk[64], int16_t cr_blk[64], JpegQuantBlock* out_6) {
     for (int b = 0; b < 4; b++) {
-        fast_fdct_quant_luma(y_blk[b], info->inv_q_luma_nat, info->dz_luma_nat, out_6 + b);
+        fast_fdct_quant_luma(y_blk[b], info->q_luma_nat, out_6 + b);
     }
-    fast_fdct_quant_chroma(cb_blk, info->inv_q_chroma_nat, info->dz_chroma_nat, out_6 + 4);
-    fast_fdct_quant_chroma(cr_blk, info->inv_q_chroma_nat, info->dz_chroma_nat, out_6 + 5);
+    fast_fdct_quant_chroma(cb_blk, info->q_chroma_nat, out_6 + 4);
+    fast_fdct_quant_chroma(cr_blk, info->q_chroma_nat, out_6 + 5);
 }
 
-// Fast Table-Driven Luma-Domain Film Grain & Clarity directly on L1-resident y_blk[4][64]
+// Wrapped 64x72 static grain table (eliminates 35.6M per-pixel '& 63' masks on 17.8MP!)
+static int8_t s_grain_64x72[64 * 72];
+static int s_grain_72_ready = 0;
+
+static void init_grain_64x72(void) {
+    if (s_grain_72_ready) return;
+    init_static_grain_table();
+    for (int r = 0; r < 64; r++) {
+        const int8_t* src = STATIC_GRAIN_64x64 + r * 64;
+        int8_t* dst = s_grain_64x72 + r * 72;
+        memcpy(dst, src, 64);
+        memcpy(dst + 64, src, 8);
+    }
+    s_grain_72_ready = 1;
+}
+
+// Fast Table-Driven Luma-Domain Film Grain & Clarity directly on signed L1-resident y_blk[4][64] (SSAT #8, zero +128/-128!)
 static void apply_luma_grain_clarity_mcu(int16_t y_blk[4][64], int global_x0, int global_y0,
                                          const uint8_t grain_mid_lut[256], int has_grain, int clarity_strength) {
+    const uint8_t* gmid = grain_mid_lut + 128;
+    int x_tile = (global_x0 >> 4);
     if (has_grain && clarity_strength == 0) {
-        int x_tile = (global_x0 >> 4);
         for (int y = 0; y < 16; y++) {
             int gy = global_y0 + y;
             int b_idx = (y >= 8) ? 2 : 0;
             int sy8 = (y & 7) * 8;
             int phase = (int)(((uint32_t)gy * 2654435761U) >> 26);
-            const int8_t* g1 = STATIC_GRAIN_64x64 + ((gy & 63) << 6);
-            const int8_t* g2 = STATIC_GRAIN_64x64 + (((gy * 7 + x_tile) & 63) << 6);
+            const int8_t* g1_row = s_grain_64x72 + (gy & 63) * 72;
+            const int8_t* g2_row = s_grain_64x72 + ((gy * 7 + x_tile) & 63) * 72;
             for (int half = 0; half < 2; half++) {
                 int16_t* row = y_blk[b_idx + half] + sy8;
                 int gx_base = global_x0 + (half << 3);
-                for (int x = 0; x < 8; x++) {
-                    int luma = (int)row[x] + 128;
-                    int raw = (int)g1[(gx_base + x) & 63] + (int)g2[(gx_base + x + phase) & 63];
-                    int nl = (int)clamp_u8_v7(luma + ((raw * (int)grain_mid_lut[luma]) >> 9));
-                    row[x] = (int16_t)(nl - 128);
+                const int8_t* g1 = g1_row + (gx_base & 63);
+                const int8_t* g2 = g2_row + ((gx_base + phase) & 63);
+                for (int x = 0; x < 8; x += 2) {
+                    int v0 = row[x], v1 = row[x + 1];
+                    int r0 = (int)g1[x] + (int)g2[x];
+                    int r1 = (int)g1[x + 1] + (int)g2[x + 1];
+                    row[x]     = clamp_s8_v7(v0 + ((r0 * (int)gmid[v0]) >> 9));
+                    row[x + 1] = clamp_s8_v7(v1 + ((r1 * (int)gmid[v1]) >> 9));
                 }
             }
         }
         return;
     }
 
-    int x_tile = (global_x0 >> 4);
     for (int y = 0; y < 16; y++) {
         int gy = global_y0 + y;
         int b_idx = (y >= 8) ? 2 : 0;
         int sy8 = (y & 7) * 8;
         int phase = (int)(((uint32_t)gy * 2654435761U) >> 26);
-        const int8_t* g1 = STATIC_GRAIN_64x64 + ((gy & 63) << 6);
-        const int8_t* g2 = STATIC_GRAIN_64x64 + (((gy * 7 + x_tile) & 63) << 6);
-        int prev_luma = (int)y_blk[b_idx][sy8] + 128;
+        const int8_t* g1_row = s_grain_64x72 + (gy & 63) * 72;
+        const int8_t* g2_row = s_grain_64x72 + ((gy * 7 + x_tile) & 63) * 72;
+        int prev_v = (int)y_blk[b_idx][sy8];
         for (int half = 0; half < 2; half++) {
             int16_t* row = y_blk[b_idx + half] + sy8;
             int gx_base = global_x0 + (half << 3);
+            const int8_t* g1 = g1_row + (gx_base & 63);
+            const int8_t* g2 = g2_row + ((gx_base + phase) & 63);
             for (int x = 0; x < 8; x++) {
-                int luma = (int)row[x] + 128;
-                int delta = ((luma - prev_luma) * clarity_strength) >> 4;
+                int v = (int)row[x];
+                int delta = ((v - prev_v) * clarity_strength) >> 4;
                 if (has_grain) {
-                    int raw = (int)g1[(gx_base + x) & 63] + (int)g2[(gx_base + x + phase) & 63];
-                    delta += (raw * (int)grain_mid_lut[luma]) >> 9;
+                    int raw = (int)g1[x] + (int)g2[x];
+                    delta += (raw * (int)gmid[v]) >> 9;
                 }
-                prev_luma = luma;
-                int nl = (int)clamp_u8_v7(luma + delta);
-                row[x] = (int16_t)(nl - 128);
+                prev_v = v;
+                row[x] = clamp_s8_v7(v + delta);
             }
         }
     }
@@ -1750,16 +1850,22 @@ static inline void transcode_mcu_fast_1x(const FastJpegInfo* info, const uint32_
             int16_t* yd = y_blk[blk_i];
             int cy0 = by * 4, cx0 = bx * 4;
             for (int qy = 0; qy < 4; qy++) {
-                int yr0 = (qy * 2) * 8, yr1 = yr0 + 8;
-                int cr_row = (cy0 + qy) * 8 + cx0;
+                const uint8_t* ys0 = ys + (qy << 4);
+                const uint8_t* ys1 = ys0 + 8;
+                int16_t* yd0 = yd + (qy << 4);
+                int16_t* yd1 = yd0 + 8;
+                int cr_row = ((cy0 + qy) << 3) + cx0;
+                const uint8_t* cbp = cb8 + cr_row;
+                const uint8_t* crp = cr8 + cr_row;
+                int16_t* ocbp = cb_blk + cr_row;
+                int16_t* ocrp = cr_blk + cr_row;
                 for (int qx = 0; qx < 4; qx++) {
-                    int x0 = qx * 2, x1 = x0 + 1;
-                    int cidx = cr_row + qx;
                     grade_ycc_quad_2x2_direct64(ycc64, chroma_res,
-                                                ys[yr0 + x0], ys[yr0 + x1], ys[yr1 + x0], ys[yr1 + x1],
-                                                cb8[cidx], cr8[cidx],
-                                                &yd[yr0 + x0], &yd[yr0 + x1], &yd[yr1 + x0], &yd[yr1 + x1],
-                                                &cb_blk[cidx], &cr_blk[cidx]);
+                                                ys0[0], ys0[1], ys1[0], ys1[1],
+                                                cbp[qx], crp[qx],
+                                                yd0, yd0 + 1, yd1, yd1 + 1,
+                                                ocbp + qx, ocrp + qx);
+                    ys0 += 2; ys1 += 2; yd0 += 2; yd1 += 2;
                 }
             }
         }
@@ -1914,8 +2020,10 @@ typedef struct {
     int band_in_my0;
     int band_in_rows;
     int out_my_base;
-    int local_my_start;
-    int local_my_end;
+    int cur_out_rows;
+    int chunks_per_row;
+    int total_chunks;
+    volatile int next_chunk;
     const uint8_t* grain_mid_lut;
     int has_grain;
     int clarity_strength;
@@ -1923,68 +2031,81 @@ typedef struct {
     uint16_t* preview_rgb565;
     int preview_w;
     int preview_h;
-    ProfAcc* prof;
-} FastBandSlice;
+} SharedBandWork;
 
-static void run_fast_band_slice(void* arg) {
-    FastBandSlice* s = (FastBandSlice*)arg;
-    const FastJpegInfo* info = s->info;
+static void run_one_chunk(const SharedBandWork* bw, int cid, ProfAcc* prof) {
+    const FastJpegInfo* info = bw->info;
+    int lm = cid / bw->chunks_per_row;
+    int sub = cid - lm * bw->chunks_per_row;
+    int x0 = (info->out_mcus_x * sub) / bw->chunks_per_row;
+    int x1 = (info->out_mcus_x * (sub + 1)) / bw->chunks_per_row;
+    if (x0 >= x1) return;
 
-    for (int lm = s->local_my_start; lm < s->local_my_end; lm++) {
-        int out_my = s->out_my_base + lm;
-        JpegQuantBlock* row_qb = s->q_out_base + (size_t)lm * (size_t)info->out_mcus_x * 6U;
+    int out_my = bw->out_my_base + lm;
+    JpegQuantBlock* row_qb = bw->q_out_base + (size_t)lm * (size_t)info->out_mcus_x * 6U;
 
-        if (info->scale == 1 && (info->samp_mode == 0 || info->samp_mode == 1)) {
-            for (int omx = 0; omx < info->out_mcus_x; omx++) {
-                transcode_mcu_fast_1x(info, s->ycc64, s->in_band,
-                                      s->band_in_my0, s->band_in_rows, omx, out_my,
-                                      s->grain_mid_lut, s->has_grain, s->clarity_strength,
-                                      row_qb + (size_t)omx * 6U,
-                                      s->preview_rgb565, s->preview_w, s->preview_h, s->prof);
-            }
-        } else if (info->scale == 1) {
-            uint8_t y16[256], cb8[64], cr8[64];
-            for (int omx = 0; omx < info->out_mcus_x; omx++) {
-                decode_src_tile_16x16_sub(info, s->in_band, s->band_in_my0, s->band_in_rows,
-                                          omx, out_my, y16, cb8, cr8);
-                grade_and_quant_y16_cb8_cr8(info, s->ycc64, y16, cb8, cr8,
-                                            omx, out_my, s->grain_mid_lut, s->has_grain, s->clarity_strength,
-                                            row_qb + (size_t)omx * 6U,
-                                            s->preview_rgb565, s->preview_w, s->preview_h);
-            }
-        } else {
-            uint8_t y16[256], cb8[64], cr8[64];
-            uint8_t sy[256], su8[64], sv8[64];
-            for (int omx = 0; omx < info->out_mcus_x; omx++) {
-                for (int qy = 0; qy < 2; qy++) {
-                    for (int qx = 0; qx < 2; qx++) {
-                        decode_src_tile_16x16_sub(info, s->in_band, s->band_in_my0, s->band_in_rows,
-                                                  omx * 2 + qx, out_my * 2 + qy, sy, su8, sv8);
-                        for (int dy = 0; dy < 8; dy++) {
-                            int oy = (qy * 8 + dy) * 16 + qx * 8;
-                            int r0 = (dy * 2) * 16, r1 = r0 + 16;
-                            for (int dx = 0; dx < 8; dx++) {
-                                int c0 = dx * 2, c1 = c0 + 1;
-                                y16[oy + dx] = (uint8_t)((sy[r0+c0] + sy[r0+c1] + sy[r1+c0] + sy[r1+c1] + 2) >> 2);
-                            }
+    if (info->scale == 1 && (info->samp_mode == 0 || info->samp_mode == 1)) {
+        for (int omx = x0; omx < x1; omx++) {
+            transcode_mcu_fast_1x(info, bw->ycc64, bw->in_band,
+                                  bw->band_in_my0, bw->band_in_rows, omx, out_my,
+                                  bw->grain_mid_lut, bw->has_grain, bw->clarity_strength,
+                                  row_qb + (size_t)omx * 6U,
+                                  bw->preview_rgb565, bw->preview_w, bw->preview_h, prof);
+        }
+    } else if (info->scale == 1) {
+        uint8_t y16[256], cb8[64], cr8[64];
+        for (int omx = x0; omx < x1; omx++) {
+            decode_src_tile_16x16_sub(info, bw->in_band, bw->band_in_my0, bw->band_in_rows,
+                                      omx, out_my, y16, cb8, cr8);
+            grade_and_quant_y16_cb8_cr8(info, bw->ycc64, y16, cb8, cr8,
+                                        omx, out_my, bw->grain_mid_lut, bw->has_grain, bw->clarity_strength,
+                                        row_qb + (size_t)omx * 6U,
+                                        bw->preview_rgb565, bw->preview_w, bw->preview_h);
+        }
+    } else {
+        uint8_t y16[256], cb8[64], cr8[64];
+        uint8_t sy[256], su8[64], sv8[64];
+        for (int omx = x0; omx < x1; omx++) {
+            for (int qy = 0; qy < 2; qy++) {
+                for (int qx = 0; qx < 2; qx++) {
+                    decode_src_tile_16x16_sub(info, bw->in_band, bw->band_in_my0, bw->band_in_rows,
+                                              omx * 2 + qx, out_my * 2 + qy, sy, su8, sv8);
+                    for (int dy = 0; dy < 8; dy++) {
+                        int oy = (qy * 8 + dy) * 16 + qx * 8;
+                        int r0 = (dy * 2) * 16, r1 = r0 + 16;
+                        for (int dx = 0; dx < 8; dx++) {
+                            int c0 = dx * 2, c1 = c0 + 1;
+                            y16[oy + dx] = (uint8_t)((sy[r0+c0] + sy[r0+c1] + sy[r1+c0] + sy[r1+c1] + 2) >> 2);
                         }
-                        for (int dy = 0; dy < 4; dy++) {
-                            int r0 = (dy * 2) * 8, r1 = r0 + 8;
-                            int oc = (qy * 4 + dy) * 8 + qx * 4;
-                            for (int dx = 0; dx < 4; dx++) {
-                                int c0 = dx * 2, c1 = c0 + 1;
-                                cb8[oc + dx] = (uint8_t)((su8[r0+c0] + su8[r0+c1] + su8[r1+c0] + su8[r1+c1] + 2) >> 2);
-                                cr8[oc + dx] = (uint8_t)((sv8[r0+c0] + sv8[r0+c1] + sv8[r1+c0] + sv8[r1+c1] + 2) >> 2);
-                            }
+                    }
+                    for (int dy = 0; dy < 4; dy++) {
+                        int r0 = (dy * 2) * 8, r1 = r0 + 8;
+                        int oc = (qy * 4 + dy) * 8 + qx * 4;
+                        for (int dx = 0; dx < 4; dx++) {
+                            int c0 = dx * 2, c1 = c0 + 1;
+                            cb8[oc + dx] = (uint8_t)((su8[r0+c0] + su8[r0+c1] + su8[r1+c0] + su8[r1+c1] + 2) >> 2);
+                            cr8[oc + dx] = (uint8_t)((sv8[r0+c0] + sv8[r0+c1] + sv8[r1+c0] + sv8[r1+c1] + 2) >> 2);
                         }
                     }
                 }
-                grade_and_quant_y16_cb8_cr8(info, s->ycc64, y16, cb8, cr8,
-                                            omx, out_my, s->grain_mid_lut, s->has_grain, s->clarity_strength,
-                                            row_qb + (size_t)omx * 6U,
-                                            s->preview_rgb565, s->preview_w, s->preview_h);
             }
+            grade_and_quant_y16_cb8_cr8(info, bw->ycc64, y16, cb8, cr8,
+                                        omx, out_my, bw->grain_mid_lut, bw->has_grain, bw->clarity_strength,
+                                        row_qb + (size_t)omx * 6U,
+                                        bw->preview_rgb565, bw->preview_w, bw->preview_h);
         }
+    }
+}
+
+static void run_steal_chunks(SharedBandWork* bw, ProfAcc* prof) {
+    for (;;) {
+#ifndef _WIN32
+        int cid = __sync_fetch_and_add(&bw->next_chunk, 1);
+#else
+        int cid = bw->next_chunk++;
+#endif
+        if (cid >= bw->total_chunks) break;
+        run_one_chunk(bw, cid, prof);
     }
 }
 
@@ -2070,103 +2191,103 @@ typedef struct {
 } EmitJob;
 
 #ifndef _WIN32
-static void run_emit_job(void* arg) {
-    EmitJob* j = (EmitJob*)arg;
-    j->ok = native_jpeg_emit_quantized_blocks(j->state, j->blocks, j->num_mcus);
-}
-
-// Persistent POSIX pipe worker (API-9 Bionic safe: zero pthread_cond_wait, zero busy-wait, zero per-band pthread_create!)
+// Persistent Core-Pinned POSIX Semaphore Worker (API-9 Bionic safe: FUTEX_WAKE, zero pipe WF_SYNC core-piling!)
 typedef struct {
     pthread_t tid;
-    int wake_fd[2];
-    int done_fd[2];
+    sem_t wake_sem;
+    sem_t done_sem;
+    int pin_cpu;
+    int pinned;
+    volatile int quit;
     void (*fn)(void*);
     void* arg;
     int active;
     int busy;
-    uint64_t cpu_ns;
-} PipeWorker;
+} SemWorker;
 
-static int pw_read_byte(int fd, uint8_t* out) {
+static int sem_wait_eintr(sem_t* s) {
     for (;;) {
-        ssize_t n = read(fd, out, 1);
-        if (n == 1) return 1;
-        if (n < 0 && errno == EINTR) continue;
-        return 0;
+        if (sem_wait(s) == 0) return 1;
+        if (errno != EINTR) return 0;
     }
 }
 
-static int pw_write_byte(int fd, uint8_t val) {
-    for (;;) {
-        ssize_t n = write(fd, &val, 1);
-        if (n == 1) return 1;
-        if (n < 0 && errno == EINTR) continue;
-        return 0;
+static void* sem_worker_main(void* p) {
+    SemWorker* w = (SemWorker*)p;
+    if (w->pin_cpu >= 0) {
+        w->pinned = fs_pin_current_cpu(w->pin_cpu);
     }
-}
-
-static void* pipe_worker_main(void* p) {
-    PipeWorker* w = (PipeWorker*)p;
-    uint8_t cmd = 0;
-    while (pw_read_byte(w->wake_fd[0], &cmd)) {
-        if (cmd == 'Q') break;
+    while (sem_wait_eintr(&w->wake_sem)) {
+        if (w->quit) break;
         if (w->fn) {
-            uint64_t c0 = fs_thread_cpu_ns();
             w->fn(w->arg);
-            w->cpu_ns += fs_thread_cpu_ns() - c0;
         }
-        if (!pw_write_byte(w->done_fd[1], 'D')) break;
+        sem_post(&w->done_sem);
     }
     return NULL;
 }
 
-static void pipe_worker_init(PipeWorker* w, void (*fn)(void*)) {
-    memset(w, 0, sizeof(PipeWorker));
-    w->wake_fd[0] = w->wake_fd[1] = -1;
-    w->done_fd[0] = w->done_fd[1] = -1;
-    w->fn = fn;
-    if (pipe(w->wake_fd) != 0) return;
-    if (pipe(w->done_fd) != 0) {
-        close(w->wake_fd[0]); close(w->wake_fd[1]);
-        w->wake_fd[0] = w->wake_fd[1] = -1;
+static void sem_worker_init(SemWorker* w, int pin_cpu) {
+    memset(w, 0, sizeof(SemWorker));
+    w->pin_cpu = pin_cpu;
+    if (sem_init(&w->wake_sem, 0, 0) != 0) return;
+    if (sem_init(&w->done_sem, 0, 0) != 0) {
+        sem_destroy(&w->wake_sem);
         return;
     }
-    if (pthread_create(&w->tid, NULL, pipe_worker_main, w) == 0) {
+    if (pthread_create(&w->tid, NULL, sem_worker_main, w) == 0) {
         w->active = 1;
     } else {
-        close(w->wake_fd[0]); close(w->wake_fd[1]);
-        close(w->done_fd[0]); close(w->done_fd[1]);
-        w->wake_fd[0] = w->wake_fd[1] = -1;
-        w->done_fd[0] = w->done_fd[1] = -1;
+        sem_destroy(&w->wake_sem);
+        sem_destroy(&w->done_sem);
     }
 }
 
-static int pipe_worker_trigger(PipeWorker* w, void (*fn_override)(void*), void* arg) {
+static int sem_worker_trigger(SemWorker* w, void (*fn)(void*), void* arg) {
     if (!w->active) return 0;
-    if (fn_override) w->fn = fn_override;
+    w->fn = fn;
     w->arg = arg;
-    if (pw_write_byte(w->wake_fd[1], 'G')) {
-        w->busy = 1;
-        return 1;
-    }
-    return 0;
+    w->busy = 1;
+    sem_post(&w->wake_sem);
+    return 1;
 }
 
-static void pipe_worker_wait(PipeWorker* w) {
+static void sem_worker_wait(SemWorker* w) {
     if (!w->active || !w->busy) return;
-    uint8_t ack = 0;
-    pw_read_byte(w->done_fd[0], &ack);
+    sem_wait_eintr(&w->done_sem);
     w->busy = 0;
 }
 
-static void pipe_worker_destroy(PipeWorker* w) {
+static void sem_worker_destroy(SemWorker* w) {
     if (!w->active) return;
-    if (w->busy) pipe_worker_wait(w);
-    pw_write_byte(w->wake_fd[1], 'Q');
+    if (w->busy) sem_worker_wait(w);
+    w->quit = 1;
+    sem_post(&w->wake_sem);
     pthread_join(w->tid, NULL);
-    close(w->wake_fd[0]); close(w->wake_fd[1]);
-    close(w->done_fd[0]); close(w->done_fd[1]);
+    sem_destroy(&w->wake_sem);
+    sem_destroy(&w->done_sem);
     w->active = 0;
+}
+
+typedef struct {
+    SharedBandWork* bw;
+    EmitJob* emit_job; // Non-NULL only on Core 1 when emitting Band N-1 before stealing Stage-2 chunks!
+    ProfAcc* prof;
+    uint64_t emit_cpu_ns;
+    uint64_t s2_cpu_ns;
+} UnifiedWorkerTask;
+
+static void run_unified_worker_task(void* arg) {
+    UnifiedWorkerTask* t = (UnifiedWorkerTask*)arg;
+    if (t->emit_job) {
+        uint64_t c0 = fs_thread_cpu_ns();
+        t->emit_job->ok = native_jpeg_emit_quantized_blocks(
+            t->emit_job->state, t->emit_job->blocks, t->emit_job->num_mcus);
+        t->emit_cpu_ns += fs_thread_cpu_ns() - c0;
+    }
+    uint64_t cs = fs_thread_cpu_ns();
+    run_steal_chunks(t->bw, t->prof);
+    t->s2_cpu_ns += fs_thread_cpu_ns() - cs;
 }
 #endif
 
@@ -2181,7 +2302,7 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     int ncpu = 1, has_neon = 0, is_v7 = 0;
     fs_probe_cpu(&ncpu, &has_neon, &is_v7);
 #ifndef _WIN32
-    fs_bench_once(ncpu);   // one-time (~100ms, first shot after app start only)
+    fs_bench_once(ncpu);   // one-time (~60ms, first shot after app start only)
 #endif
     uint64_t t_start = fs_now_ms();
     int sched_bg = 0, sched_mhz = 0;
@@ -2197,7 +2318,6 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         if (out_result) out_result->rc = -1;
         return -1;
     }
-    init_static_grain_table();
 
     FILE* fp = fopen(input_jpeg_path, "rb");
     if (!fp) {
@@ -2217,6 +2337,39 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         fclose(fp);
         if (out_result) out_result->rc = hdr_rc;
         return hdr_rc;
+    }
+
+    // Slurp entropy scan into RAM in ONE sequential fread() (<=14MB) BEFORE opening output file:
+    // eliminates 100% of concurrent FAT32 SD read+write contention and makes Stage 1 pure RAM speed!
+    uint8_t* in_mem_buf = NULL;
+    size_t in_mem_len = 0;
+    int slurp_ms = 0;
+    {
+        long cur_off = ftell(fp);
+        if (cur_off >= 0 && fseek(fp, 0, SEEK_END) == 0) {
+            long end_off = ftell(fp);
+            if (fseek(fp, cur_off, SEEK_SET) == 0 && end_off > cur_off) {
+                size_t rem = (size_t)(end_off - cur_off);
+                if (rem <= 14U * 1024U * 1024U) {
+                    uint8_t* mb = (uint8_t*)malloc(rem + 8U);
+                    if (mb) {
+                        uint64_t tr0 = fs_now_ms();
+                        size_t got = fread(mb, 1, rem, fp);
+                        slurp_ms = (int)(fs_now_ms() - tr0);
+                        if (got > 0) {
+                            memset(mb + got, 0, 8);
+                            in_mem_buf = mb;
+                            in_mem_len = got;
+                            fclose(fp);
+                            fp = NULL;
+                        } else {
+                            free(mb);
+                            (void)fseek(fp, cur_off, SEEK_SET);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     int scale = (scale_denom == 2) ? 2 : ((scale_denom == 0 && info->src_w >= 7000) ? 2 : 1);
@@ -2249,10 +2402,12 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
             uint32_t ic = (aan_num + ((uint32_t)vc << 7)) / ((uint32_t)vc << 8);
             uint16_t iql = (uint16_t)(il > 65535U ? 65535U : il);
             uint16_t iqc = (uint16_t)(ic > 65535U ? 65535U : ic);
-            info->inv_q_luma_nat[i]   = iql;
-            info->inv_q_chroma_nat[i] = iqc;
-            info->dz_luma_nat[i]      = (int16_t)(iql > 0 ? (32767U / iql) : 32767U);
-            info->dz_chroma_nat[i]    = (int16_t)(iqc > 0 ? (32767U / iqc) : 32767U);
+            info->q_luma_nat[i].inv_q   = iql;
+            info->q_luma_nat[i].dz      = (int16_t)(iql > 0 ? (32767U / iql) : 32767U);
+            info->q_luma_nat[i].zz      = NAT_TO_ZZ[i];
+            info->q_chroma_nat[i].inv_q = iqc;
+            info->q_chroma_nat[i].dz    = (int16_t)(iqc > 0 ? (32767U / iqc) : 32767U);
+            info->q_chroma_nat[i].zz    = NAT_TO_ZZ[i];
         }
     }
 
@@ -2263,26 +2418,40 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         output_jpeg_path, info->dst_w, info->dst_h, eff_quality,
         clean_exif_len > 0 ? clean_exif : NULL, clean_exif_len);
     if (!out_state) {
+        free(in_mem_buf);
         free(info);
-        fclose(fp);
+        if (fp) fclose(fp);
         if (out_result) out_result->rc = -9;
         return -9;
     }
 
+#ifndef _WIN32
+    int avail_cpus[4] = { 0, 1, 2, 3 };
+    FsCpuMask saved_affinity;
+    int n_avail = fs_get_avail_cpus(avail_cpus, &saved_affinity);
     int worker_count = (ncpu >= 4) ? 4 : (ncpu >= 2 ? ncpu : 2);
     if (worker_count > 4) worker_count = 4;
-
-#ifndef _WIN32
-    PipeWorker dec_pw, emit_pw, s2_pw[3];
-    pipe_worker_init(&dec_pw, decode_band_rows);
-    pipe_worker_init(&emit_pw, run_emit_job);
+    if (n_avail > 0 && n_avail < worker_count) worker_count = n_avail;
+    int can_pin = (worker_count >= 2) ? 1 : 0;
+    // Spawn workers BEFORE pinning main so child threads inherit full multi-core mask (SD_BALANCE_FORK)!
+    SemWorker sw[3];
     for (int k = 0; k < 3; k++) {
-        if (k + 1 < worker_count) pipe_worker_init(&s2_pw[k], run_fast_band_slice);
-        else memset(&s2_pw[k], 0, sizeof(PipeWorker));
+        if (k + 1 < worker_count) {
+            int target_cpu = can_pin ? ((k + 1 < n_avail) ? avail_cpus[k + 1] : (k + 1)) : -1;
+            sem_worker_init(&sw[k], target_cpu);
+        } else {
+            memset(&sw[k], 0, sizeof(SemWorker));
+        }
     }
+    int main_pinned = 0;
+    if (can_pin) {
+        main_pinned = fs_pin_current_cpu((n_avail >= 1) ? avail_cpus[0] : 0);
+    }
+#else
+    int worker_count = 1;
 #endif
 
-    // Resolve or 4-core-build the static cached 64x64x17 direct-chroma LUT (0.0ms on repeat shots!)
+    // Resolve or 4-core-build the static cached 64x64x17 SWAR direct-chroma LUT (0.0ms on repeat shots!)
     uint64_t t_lut0 = fs_now_ms();
     uint64_t lut_h = hash_lut17(lut);
     const uint32_t* ycc64 = NULL;
@@ -2290,6 +2459,7 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
 #ifndef _WIN32
     pthread_mutex_lock(&s_ycc64_mutex);
 #endif
+    init_grain_64x72();
     if (!s_ycc64_cache) {
         s_ycc64_cache = (uint32_t*)malloc(YCC64_NODES * sizeof(uint32_t));
     }
@@ -2305,14 +2475,14 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
 #ifndef _WIN32
         int btrig[3] = { 0, 0, 0 };
         for (int k = 1; k < worker_count; k++) {
-            btrig[k - 1] = pipe_worker_trigger(&s2_pw[k - 1], build_ycc64_slice, &bs[k]);
+            btrig[k - 1] = sem_worker_trigger(&sw[k - 1], build_ycc64_slice, &bs[k]);
         }
         build_ycc64_slice(&bs[0]);
         for (int k = 1; k < worker_count; k++) {
             if (!btrig[k - 1]) build_ycc64_slice(&bs[k]);
         }
         for (int k = 1; k < worker_count; k++) {
-            if (btrig[k - 1]) pipe_worker_wait(&s2_pw[k - 1]);
+            if (btrig[k - 1]) sem_worker_wait(&sw[k - 1]);
         }
 #else
         for (int k = 0; k < worker_count; k++) build_ycc64_slice(&bs[k]);
@@ -2332,21 +2502,17 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
 #endif
     info->chroma_res = chroma_res;
     int lut_wall_ms = (int)(fs_now_ms() - t_lut0);
-#ifndef _WIN32
-    uint64_t s2_cpu_base[3];
-    for (int k = 0; k < 3; k++) s2_cpu_base[k] = s2_pw[k].cpu_ns;
-#endif
 
     if (!ycc64) {
 #ifndef _WIN32
-        pipe_worker_destroy(&dec_pw);
-        pipe_worker_destroy(&emit_pw);
-        for (int k = 0; k < 3; k++) pipe_worker_destroy(&s2_pw[k]);
+        for (int k = 0; k < 3; k++) sem_worker_destroy(&sw[k]);
+        fs_restore_affinity(&saved_affinity);
 #endif
         native_jpeg_stream_close(out_state, 0);
         remove(output_jpeg_path);
+        free(in_mem_buf);
         free(info);
-        fclose(fp);
+        if (fp) fclose(fp);
         if (out_result) out_result->rc = -10;
         return -10;
     }
@@ -2370,37 +2536,59 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         }
     }
 
-    // Compact L2-friendly 4-row bands (~4.7MB total RAM -> tiny Band-0 stall & zero page-cache thrashing!)
-    const int band_out_rows = 4;
+    // 8-row bands on 1:1 (27 bands total, ~9.5MB RAM -> halves barrier frequency; auto-fallback to 4 on tight RAM!)
+    int band_out_rows = (scale == 2) ? 4 : 8;
     int in_rows_per_out = ((info->samp_mode == 0 || info->samp_mode == 3) ? 1 : 2) * scale;
-    int band_in_max_rows = band_out_rows * in_rows_per_out;
-
-    size_t in_band_blks = (size_t)band_in_max_rows * (size_t)info->in_mcus_x * (size_t)info->blks_per_mcu;
-    size_t q_band_blks = (size_t)band_out_rows * (size_t)info->out_mcus_x * 6U;
-
-    // calloc in_band buffers so dirty_rows & c[64] start clean at 0 for sparse clearing!
-    DecBlock* in_band_work = (DecBlock*)calloc(in_band_blks, sizeof(DecBlock));
-    DecBlock* in_band_dec  = (DecBlock*)calloc(in_band_blks, sizeof(DecBlock));
-    JpegQuantBlock* q_work = (JpegQuantBlock*)malloc(q_band_blks * sizeof(JpegQuantBlock));
-    JpegQuantBlock* q_emit = (JpegQuantBlock*)malloc(q_band_blks * sizeof(JpegQuantBlock));
+    DecBlock* in_band_work = NULL;
+    DecBlock* in_band_dec  = NULL;
+    JpegQuantBlock* q_work = NULL;
+    JpegQuantBlock* q_emit = NULL;
+    for (;;) {
+        int band_in_max_rows = band_out_rows * in_rows_per_out;
+        size_t in_band_blks = (size_t)band_in_max_rows * (size_t)info->in_mcus_x * (size_t)info->blks_per_mcu;
+        size_t q_band_blks  = (size_t)band_out_rows * (size_t)info->out_mcus_x * 6U;
+        // calloc BOTH in_band and q_work/q_emit so sparse dirty_rows & sparse prev-last_nz invariants hold from Band 0!
+        in_band_work = (DecBlock*)calloc(in_band_blks, sizeof(DecBlock));
+        in_band_dec  = (DecBlock*)calloc(in_band_blks, sizeof(DecBlock));
+        q_work       = (JpegQuantBlock*)calloc(q_band_blks, sizeof(JpegQuantBlock));
+        q_emit       = (JpegQuantBlock*)calloc(q_band_blks, sizeof(JpegQuantBlock));
+        if (in_band_work && in_band_dec && q_work && q_emit) break;
+        if (band_out_rows > 4) {
+            free(in_band_work); free(in_band_dec); free(q_work); free(q_emit);
+            in_band_work = NULL; in_band_dec = NULL; q_work = NULL; q_emit = NULL;
+            band_out_rows = 4;
+            continue;
+        }
+        break;
+    }
     FastBitReader* br = (FastBitReader*)calloc(1, sizeof(FastBitReader));
 
     if (!in_band_work || !q_work || !q_emit || !br) {
 #ifndef _WIN32
-        pipe_worker_destroy(&dec_pw);
-        pipe_worker_destroy(&emit_pw);
-        for (int k = 0; k < 3; k++) pipe_worker_destroy(&s2_pw[k]);
+        for (int k = 0; k < 3; k++) sem_worker_destroy(&sw[k]);
+        fs_restore_affinity(&saved_affinity);
 #endif
         free(in_band_work); free(in_band_dec); free(q_work); free(q_emit); free(br);
         free(preview_rgb565);
         native_jpeg_stream_close(out_state, 0);
         remove(output_jpeg_path);
+        free(in_mem_buf);
         free(info);
-        fclose(fp);
+        if (fp) fclose(fp);
         if (out_result) out_result->rc = -10;
         return -10;
     }
-    br->fp = fp;
+    if (in_mem_buf) {
+        br->fp = NULL;
+        br->buf = in_mem_buf;
+        br->len = in_mem_len;
+        br->pos = 0;
+    } else {
+        br->fp = fp;
+        br->buf = br->stream_buf;
+        br->len = 0;
+        br->pos = 0;
+    }
 
     int dc_pred[3] = { 0, 0, 0 };
     int mcus_until_rst = info->restart_interval;
@@ -2408,17 +2596,19 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     int cur_in_my = 0;
     int y_cnt = (info->samp_mode == 0) ? 4 : ((info->samp_mode == 1 || info->samp_mode == 3) ? 2 : 1);
     int std_order = (info->sos_order[0] == 0 && info->sos_order[1] == 1 && info->sos_order[2] == 2);
+    int chunks_per_row = (info->out_mcus_x >= 32) ? 4 : 1;
     uint64_t dec_wait_ms = 0, proc_ms = 0, emit_wait_ms = 0;
     ProfAcc prof_acc[4];
     memset(prof_acc, 0, sizeof(prof_acc));
-    uint64_t main_s2_cpu_ns = 0, main_dec_cpu_ns = 0;
+    uint64_t main_s2_cpu_ns = 0, main_dec_cpu_ns = 0, main_emit_cpu_ns = 0;
     int prof_total_mcus = info->out_mcus_x * info->out_mcus_y;
 
-    EmitJob emit_job;
-    memset(&emit_job, 0, sizeof(emit_job));
-    emit_job.ok = 1;
+#ifndef _WIN32
+    UnifiedWorkerTask wtasks[3];
+    memset(wtasks, 0, sizeof(wtasks));
+#endif
 
-    // Prime Band 0 synchronously into in_band_work (~1.8% of image -> ~10ms!)
+    // Prime Band 0 synchronously into in_band_work
     int cur_band_in_my0 = 0;
     int cur_band_in_rows = 0;
     if (info->out_mcus_y > 0) {
@@ -2436,19 +2626,24 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         fail_rc = d0.fail_rc;
     }
 
+    int has_prev_emit = 0;
+    int prev_emit_mcus = 0;
+
+    // Unified 4-Core Pinned Work-Stealing Band Loop (EXACTLY 4 active threads on 4 physical cores, 1 barrier/band!):
+    //  - Core 0 (main):  Huffman-decodes Band N+1 from RAM, then immediately steals Stage-2 chunks of Band N!
+    //  - Core 1 (sw[0]): Huffman-emits Band N-1 to SD, then immediately steals Stage-2 chunks of Band N!
+    //  - Core 2 (sw[1]): Dedicated Stage-2 work-stealer on Band N!
+    //  - Core 3 (sw[2]): Dedicated Stage-2 work-stealer on Band N!
     for (int out_my0 = 0; out_my0 < info->out_mcus_y && !fail_rc; out_my0 += band_out_rows) {
         int cur_out_rows = info->out_mcus_y - out_my0;
         if (cur_out_rows > band_out_rows) cur_out_rows = band_out_rows;
 
-        // Overlap Stage 1 (SD read + 64-bit ac_fast Huffman decode of Band N+1) with Stage 2 (4-core IDCT+LUT+FDCT of Band N)!
         int next_out_my0 = out_my0 + band_out_rows;
         int has_next = (next_out_my0 < info->out_mcus_y) ? 1 : 0;
         int next_band_in_my0 = cur_in_my;
         int next_band_in_rows = 0;
         DecodeBandJob dec_job;
         memset(&dec_job, 0, sizeof(dec_job));
-        int dec_async = 0;
-
         if (has_next) {
             int next_out_rows = info->out_mcus_y - next_out_my0;
             if (next_out_rows > band_out_rows) next_out_rows = band_out_rows;
@@ -2464,121 +2659,140 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
             dec_job.std_order = std_order;
             dec_job.dc_pred = dc_pred;
             dec_job.mcus_until_rst = &mcus_until_rst;
-#ifndef _WIN32
-            if (in_band_dec != NULL && next_band_in_rows > 0) {
-                dec_async = pipe_worker_trigger(&dec_pw, decode_band_rows, &dec_job);
-            }
-#endif
         }
 
-        // Stage 2: Parallel 4-Core Sparse IDCT + 2-Load Direct 64x64x17 LUT + Fused Luma/4x4 Chroma FDCT
+        SharedBandWork bw;
+        bw.info = info;
+        bw.ycc64 = ycc64;
+        bw.in_band = in_band_work;
+        bw.band_in_my0 = cur_band_in_my0;
+        bw.band_in_rows = cur_band_in_rows > 0 ? cur_band_in_rows : 1;
+        bw.out_my_base = out_my0;
+        bw.cur_out_rows = cur_out_rows;
+        bw.chunks_per_row = chunks_per_row;
+        bw.total_chunks = cur_out_rows * chunks_per_row;
+        bw.next_chunk = 0;
+        bw.grain_mid_lut = grain_mid_lut;
+        bw.has_grain = (grain_scale > 0) ? 1 : 0;
+        bw.clarity_strength = clarity_strength;
+        bw.q_out_base = q_work;
+        bw.preview_rgb565 = preview_rgb565;
+        bw.preview_w = preview_w;
+        bw.preview_h = preview_h;
+
         uint64_t tp0 = fs_now_ms();
-        FastBandSlice slices[4];
-        int cur_lm = 0;
-        for (int k = 0; k < worker_count; k++) {
-            int rem = cur_out_rows - cur_lm;
-            int rem_c = worker_count - k;
-            int sl = (rem > 0) ? ((rem + rem_c - 1) / rem_c) : 0;
-            slices[k].info = info;
-            slices[k].ycc64 = ycc64;
-            slices[k].in_band = in_band_work;
-            slices[k].band_in_my0 = cur_band_in_my0;
-            slices[k].band_in_rows = cur_band_in_rows > 0 ? cur_band_in_rows : 1;
-            slices[k].out_my_base = out_my0;
-            slices[k].local_my_start = cur_lm;
-            slices[k].local_my_end = cur_lm + sl;
-            slices[k].grain_mid_lut = grain_mid_lut;
-            slices[k].has_grain = (grain_scale > 0) ? 1 : 0;
-            slices[k].clarity_strength = clarity_strength;
-            slices[k].q_out_base = q_work;
-            slices[k].preview_rgb565 = preview_rgb565;
-            slices[k].preview_w = preview_w;
-            slices[k].preview_h = preview_h;
-            slices[k].prof = &prof_acc[k];
-            cur_lm += sl;
-        }
-
 #ifndef _WIN32
+        EmitJob emit_job;
+        emit_job.state = out_state;
+        emit_job.blocks = q_emit;
+        emit_job.num_mcus = prev_emit_mcus;
+        emit_job.ok = 1;
+
         int trig[3] = { 0, 0, 0 };
-        for (int k = 1; k < worker_count; k++) {
-            if (slices[k].local_my_end > slices[k].local_my_start) {
-                trig[k - 1] = pipe_worker_trigger(&s2_pw[k - 1], run_fast_band_slice, &slices[k]);
+        for (int k = 0; k < 3; k++) {
+            if (sw[k].active) {
+                wtasks[k].bw = &bw;
+                wtasks[k].emit_job = (k == 0 && has_prev_emit) ? &emit_job : NULL;
+                wtasks[k].prof = &prof_acc[k + 1];
+                trig[k] = sem_worker_trigger(&sw[k], run_unified_worker_task, &wtasks[k]);
             }
         }
-        if (slices[0].local_my_end > slices[0].local_my_start) {
+
+        // If Core 1 worker wasn't available, emit Band N-1 synchronously on main
+        if (has_prev_emit && !trig[0]) {
+            uint64_t ce0 = fs_thread_cpu_ns();
+            emit_job.ok = native_jpeg_emit_quantized_blocks(out_state, q_emit, prev_emit_mcus);
+            main_emit_cpu_ns += fs_thread_cpu_ns() - ce0;
+        }
+
+        // Core 0 (main): decode Band N+1 into in_band_dec (in parallel with Cores 1-3!), then steal Stage-2 chunks!
+        int dec_done_overlapped = 0;
+        if (has_next && in_band_dec != NULL) {
+            if (next_band_in_rows > 0) {
+                uint64_t cd1 = fs_thread_cpu_ns();
+                decode_band_rows(&dec_job);
+                main_dec_cpu_ns += fs_thread_cpu_ns() - cd1;
+            }
+            dec_done_overlapped = 1;
+        }
+        {
             uint64_t cs0 = fs_thread_cpu_ns();
-            run_fast_band_slice(&slices[0]);
+            run_steal_chunks(&bw, &prof_acc[0]);
             main_s2_cpu_ns += fs_thread_cpu_ns() - cs0;
         }
-        for (int k = 1; k < worker_count; k++) {
-            if (slices[k].local_my_end > slices[k].local_my_start && !trig[k - 1]) run_fast_band_slice(&slices[k]);
-        }
-        for (int k = 1; k < worker_count; k++) {
-            if (trig[k - 1]) pipe_worker_wait(&s2_pw[k - 1]);
+
+        for (int k = 0; k < 3; k++) {
+            if (trig[k]) sem_worker_wait(&sw[k]);
         }
         proc_ms += (fs_now_ms() - tp0);
 
-        // Wait for overlapped Stage 1 decode of Band N+1
+        if (has_prev_emit && !emit_job.ok) {
+            fail_rc = -13;
+            break;
+        }
         if (has_next) {
-            uint64_t td1 = fs_now_ms();
-            if (dec_async) {
-                pipe_worker_wait(&dec_pw);
+            if (dec_done_overlapped) {
                 DecBlock* tdb = in_band_work; in_band_work = in_band_dec; in_band_dec = tdb;
-            } else {
+            } else if (next_band_in_rows > 0) {
+                uint64_t td1 = fs_now_ms();
+                uint64_t cd2 = fs_thread_cpu_ns();
+                dec_job.dst_band = in_band_work;
+                decode_band_rows(&dec_job);
+                main_dec_cpu_ns += fs_thread_cpu_ns() - cd2;
+                dec_wait_ms += (fs_now_ms() - td1);
+            }
+            cur_in_my += next_band_in_rows;
+            cur_band_in_my0 = next_band_in_my0;
+            cur_band_in_rows = next_band_in_rows;
+            if (dec_job.fail_rc) {
+                fail_rc = dec_job.fail_rc;
+                break;
+            }
+        }
+#else
+        if (has_prev_emit) {
+            if (!native_jpeg_emit_quantized_blocks(out_state, q_emit, prev_emit_mcus)) {
+                fail_rc = -13;
+                break;
+            }
+        }
+        run_steal_chunks(&bw, &prof_acc[0]);
+        proc_ms += (fs_now_ms() - tp0);
+        if (has_next) {
+            if (next_band_in_rows > 0) {
                 dec_job.dst_band = in_band_work;
                 decode_band_rows(&dec_job);
             }
-            dec_wait_ms += (fs_now_ms() - td1);
             cur_in_my += next_band_in_rows;
             cur_band_in_my0 = next_band_in_my0;
             cur_band_in_rows = next_band_in_rows;
-            if (dec_job.fail_rc) { fail_rc = dec_job.fail_rc; break; }
+            if (dec_job.fail_rc) {
+                fail_rc = dec_job.fail_rc;
+                break;
+            }
         }
-
-        // Wait for previous band's Stage 3 Huffman emit, swap q_work <-> q_emit (0 memcpy!), trigger next emit
-        if (emit_pw.busy) {
-            uint64_t te0 = fs_now_ms();
-            pipe_worker_wait(&emit_pw);
-            emit_wait_ms += (fs_now_ms() - te0);
-            if (!emit_job.ok) { fail_rc = -13; break; }
-        }
-        JpegQuantBlock* tmp = q_work; q_work = q_emit; q_emit = tmp;
-        emit_job.state = out_state;
-        emit_job.blocks = q_emit;
-        emit_job.num_mcus = cur_out_rows * info->out_mcus_x;
-        emit_job.ok = 1;
-        if (!pipe_worker_trigger(&emit_pw, run_emit_job, &emit_job)) {
-            uint64_t te1 = fs_now_ms();
-            if (!native_jpeg_emit_quantized_blocks(out_state, q_emit, emit_job.num_mcus)) fail_rc = -13;
-            emit_wait_ms += (fs_now_ms() - te1);
-        }
-#else
-        (void)dec_async;
-        for (int k = 0; k < worker_count; k++) {
-            if (slices[k].local_my_end > slices[k].local_my_start) run_fast_band_slice(&slices[k]);
-        }
-        if (has_next) {
-            dec_job.dst_band = in_band_work;
-            decode_band_rows(&dec_job);
-            cur_in_my += next_band_in_rows;
-            cur_band_in_my0 = next_band_in_my0;
-            cur_band_in_rows = next_band_in_rows;
-            if (dec_job.fail_rc) { fail_rc = dec_job.fail_rc; break; }
-        }
-        if (!native_jpeg_emit_quantized_blocks(out_state, q_work, cur_out_rows * info->out_mcus_x)) fail_rc = -13;
 #endif
+        JpegQuantBlock* tq = q_work; q_work = q_emit; q_emit = tq;
+        prev_emit_mcus = cur_out_rows * info->out_mcus_x;
+        has_prev_emit = 1;
     }
 
-#ifndef _WIN32
-    if (emit_pw.busy) {
-        uint64_t te2 = fs_now_ms();
-        pipe_worker_wait(&emit_pw);
-        emit_wait_ms += (fs_now_ms() - te2);
-        if (!emit_job.ok) fail_rc = -13;
+    // Emit final band synchronously
+    if (!fail_rc && has_prev_emit) {
+        uint64_t te_fin = fs_now_ms();
+        uint64_t ce_fin = fs_thread_cpu_ns();
+        if (!native_jpeg_emit_quantized_blocks(out_state, q_emit, prev_emit_mcus)) {
+            fail_rc = -13;
+        }
+        main_emit_cpu_ns += fs_thread_cpu_ns() - ce_fin;
+        emit_wait_ms += (fs_now_ms() - te_fin);
     }
-    pipe_worker_destroy(&dec_pw);
-    pipe_worker_destroy(&emit_pw);
-    for (int k = 0; k < 3; k++) pipe_worker_destroy(&s2_pw[k]);
+
+    int pin_cnt = 0;
+#ifndef _WIN32
+    for (int k = 0; k < 3; k++) sem_worker_destroy(&sw[k]);
+    pin_cnt = main_pinned + sw[0].pinned + sw[1].pinned + sw[2].pinned;
+    fs_restore_affinity(&saved_affinity);
 #endif
 
     free(in_band_work);
@@ -2586,8 +2800,9 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     free(q_work);
     free(q_emit);
     free(br);
+    free(in_mem_buf);
     free(info);
-    fclose(fp);
+    if (fp) fclose(fp);
 
     int success = (fail_rc == 0) ? 1 : 0;
     int closed = native_jpeg_stream_close(out_state, success);
@@ -2604,15 +2819,18 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
         out_result->dec_ms = (int)dec_wait_ms;
         out_result->proc_ms = (int)proc_ms;
         out_result->emit_ms = (int)emit_wait_ms;
-        out_result->setup_ms = out_result->total_ms - out_result->dec_ms - out_result->proc_ms - out_result->emit_ms;
+        out_result->read_ms = slurp_ms;
+        out_result->pin_cnt = pin_cnt;
+        out_result->setup_ms = out_result->total_ms - out_result->read_ms - out_result->dec_ms - out_result->proc_ms - out_result->emit_ms;
         out_result->lut_ms = lut_wall_ms;
         {
-            uint64_t s2c = main_s2_cpu_ns, decc = main_dec_cpu_ns, emc = 0;
+            uint64_t s2c = main_s2_cpu_ns, decc = main_dec_cpu_ns, emc = main_emit_cpu_ns;
             uint64_t pn = 0, pi = 0, pl = 0, pf = 0;
 #ifndef _WIN32
-            for (int k = 0; k < 3; k++) s2c += s2_pw[k].cpu_ns - s2_cpu_base[k];
-            decc += dec_pw.cpu_ns;
-            emc = emit_pw.cpu_ns;
+            for (int k = 0; k < 3; k++) {
+                s2c += wtasks[k].s2_cpu_ns;
+                emc += wtasks[k].emit_cpu_ns;
+            }
 #endif
             for (int k = 0; k < 4; k++) {
                 pn += prof_acc[k].n;

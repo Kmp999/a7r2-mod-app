@@ -1022,7 +1022,7 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGetLastFastS
     JNIEnv *env, jclass clazz, jintArray outStats) {
     (void)clazz;
     if (outStats == NULL || (*env)->GetArrayLength(env, outStats) < 10) return JNI_FALSE;
-    jint vals[22];
+    jint vals[24];
     memset(vals, 0, sizeof(vals));
     pthread_mutex_lock(&g_fast_res_mutex);
     vals[0] = (jint)g_last_fast_res.rc;
@@ -1047,10 +1047,12 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGetLastFastS
     vals[19] = (jint)g_last_fast_res.bench_all;
     vals[20] = (jint)g_last_fast_res.cur_mhz;
     vals[21] = (jint)g_last_fast_res.bg_cgroup;
+    vals[22] = (jint)g_last_fast_res.read_ms;
+    vals[23] = (jint)g_last_fast_res.pin_cnt;
     pthread_mutex_unlock(&g_fast_res_mutex);
     {
         jsize alen = (*env)->GetArrayLength(env, outStats);
-        (*env)->SetIntArrayRegion(env, outStats, 0, (alen < 22) ? alen : 22, vals);
+        (*env)->SetIntArrayRegion(env, outStats, 0, (alen < 24) ? alen : 24, vals);
     }
     return JNI_TRUE;
 }
