@@ -1009,6 +1009,8 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeApplyLut17In
 }
 
 static volatile int g_last_fast_rc = 0;
+static pthread_mutex_t g_fast_res_mutex = PTHREAD_MUTEX_INITIALIZER;
+static FastTranscodeResult g_last_fast_res;
 
 JNIEXPORT jint JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGetLastFastRc(
     JNIEnv *env, jclass clazz) {
@@ -1016,8 +1018,54 @@ JNIEXPORT jint JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGetLastFastRc(
     return (jint)g_last_fast_rc;
 }
 
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeGetLastFastStats(
+    JNIEnv *env, jclass clazz, jintArray outStats) {
+    (void)clazz;
+    if (outStats == NULL || (*env)->GetArrayLength(env, outStats) < 10) return JNI_FALSE;
+    jint vals[10];
+    pthread_mutex_lock(&g_fast_res_mutex);
+    vals[0] = (jint)g_last_fast_res.rc;
+    vals[1] = (jint)g_last_fast_res.total_ms;
+    vals[2] = (jint)g_last_fast_res.dec_ms;
+    vals[3] = (jint)g_last_fast_res.proc_ms;
+    vals[4] = (jint)g_last_fast_res.emit_ms;
+    vals[5] = (jint)g_last_fast_res.ncpu;
+    vals[6] = (jint)g_last_fast_res.has_neon;
+    vals[7] = (jint)g_last_fast_res.is_v7;
+    vals[8] = (jint)g_last_fast_res.preview_w;
+    vals[9] = (jint)g_last_fast_res.preview_h;
+    pthread_mutex_unlock(&g_fast_res_mutex);
+    (*env)->SetIntArrayRegion(env, outStats, 0, 10, vals);
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeTakeLastFastPreview(
+    JNIEnv *env, jclass clazz, jobject dstDirectBuffer) {
+    (void)clazz;
+    if (dstDirectBuffer == NULL) return JNI_FALSE;
+    void* dst = (*env)->GetDirectBufferAddress(env, dstDirectBuffer);
+    jlong cap = (*env)->GetDirectBufferCapacity(env, dstDirectBuffer);
+    if (dst == NULL || cap <= 0) return JNI_FALSE;
+
+    jboolean copied = JNI_FALSE;
+    pthread_mutex_lock(&g_fast_res_mutex);
+    if (g_last_fast_res.preview_rgb565 != NULL && g_last_fast_res.preview_w > 0 && g_last_fast_res.preview_h > 0) {
+        size_t bytes = (size_t)g_last_fast_res.preview_w * (size_t)g_last_fast_res.preview_h * 2U;
+        if ((size_t)cap >= bytes) {
+            memcpy(dst, g_last_fast_res.preview_rgb565, bytes);
+            copied = JNI_TRUE;
+        }
+        free(g_last_fast_res.preview_rgb565);
+        g_last_fast_res.preview_rgb565 = NULL;
+        g_last_fast_res.preview_w = 0;
+        g_last_fast_res.preview_h = 0;
+    }
+    pthread_mutex_unlock(&g_fast_res_mutex);
+    return copied;
+}
+
 /**
- * Pure C Zero-JNI-Copy 4-Core Single-Pass Baseline JPEG-to-JPEG Transcoder.
+ * Pure C Zero-JNI-Copy 3-Stage Overlapped Multi-Core Baseline JPEG-to-JPEG Transcoder.
  * Copies the 14.7KB active 17^3 3D LUT under g_lut_mutex so Live View preview is never blocked.
  */
 JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImageStreamFastScaled(
@@ -1046,14 +1094,27 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImage
     memcpy(lut_copy, &g_lut17, sizeof(Lut17Context));
     pthread_mutex_unlock(&g_lut_mutex);
 
-    int rc = native_fast_transcode_jpeg(lut_copy, in_p, out_p, (int)scaleDenom, 92, (int)grainStrength, (int)clarityStrength);
+    FastTranscodeResult res;
+    int rc = native_fast_transcode_jpeg_ex(lut_copy, in_p, out_p, (int)scaleDenom, 92,
+                                           (int)grainStrength, (int)clarityStrength, &res);
     g_last_fast_rc = rc;
+
+    pthread_mutex_lock(&g_fast_res_mutex);
+    if (g_last_fast_res.preview_rgb565 != NULL) {
+        free(g_last_fast_res.preview_rgb565);
+        g_last_fast_res.preview_rgb565 = NULL;
+    }
+    g_last_fast_res = res;
+    pthread_mutex_unlock(&g_fast_res_mutex);
+
     int ok = (rc > 0) ? 1 : 0;
     if (!ok) {
-        LOGE("native_fast_transcode_jpeg failed (rc=%d) for %s -> %s", rc, in_p, out_p);
+        LOGE("native_fast_transcode_jpeg_ex failed (rc=%d) for %s -> %s", rc, in_p, out_p);
         ok = native_process_image_stream_fast(in_p, out_p, (int)grainStrength, (int)clarityStrength);
     } else {
-        LOGI("native_fast_transcode_jpeg succeeded (rc=%d) for %s -> %s", rc, in_p, out_p);
+        LOGI("native_fast_transcode_jpeg_ex OK (%dms: h=%d p=%d e=%d %dc/v%d%s) %s -> %s",
+             res.total_ms, res.dec_ms, res.proc_ms, res.emit_ms,
+             res.ncpu, res.is_v7 ? 7 : 5, res.has_neon ? "N" : "", in_p, out_p);
     }
 
     free(lut_copy);

@@ -8,26 +8,48 @@ extern "C" {
 #endif
 
 /**
- * Pure-C Single-Pass 4-Core Parallel Streaming Baseline JPEG-to-JPEG Transcoder.
- *
- * Completely bypasses Java BitmapRegionDecoder (eliminating the 2.5s Huffman index scan,
- * 6.3s of per-strip seeks, Dalvik Bitmap allocations, and 71MB JNI pixel copies).
+ * Extended telemetry and zero-I/O in-memory Quick Review preview returned by
+ * native_fast_transcode_jpeg_ex().
+ */
+typedef struct {
+    int rc;                   // 1 on success, <=0 error stage code
+    int total_ms;             // Total wall time in ms
+    int dec_ms;               // Blocking time spent in Stage 1 (SD read + Huffman decode)
+    int proc_ms;              // Time spent in Stage 2 (parallel IDCT + YCbCr LUT + FDCT + Quant)
+    int emit_ms;              // Blocking time spent waiting on Stage 3 (Huffman emit + SD write)
+    int ncpu;                 // Detected online CPU cores from /proc/cpuinfo
+    int has_neon;             // 1 if /proc/cpuinfo reports neon/asimd
+    int is_v7;                // 1 if compiled for ARMv7-A (armeabi-v7a)
+    uint16_t* preview_rgb565; // Allocated RGB_565 DC preview (caller frees via free()), or NULL
+    int preview_w;
+    int preview_h;
+} FastTranscodeResult;
+
+/**
+ * Pure-C Single-Pass 3-Stage Overlapped Multi-Core Baseline JPEG-to-JPEG Transcoder.
  *
  * Architecture:
  *  - Pre-bakes a 19.6KB L1-cache-resident 17^3 direct YCbCr -> YCbCr 3D LUT once per image
- *    (eliminating 100% of per-pixel YCbCr<->RGB conversions and evaluating chroma once per 2x2 quad).
- *  - Supports Sony BIONZ X native 4:2:2 (2x1), standard 4:2:0 (2x2), 4:4:4 (1x1), and 4:4:0 (1x2) SOF0 JPEGs.
- *  - Pre-loads standard Annex K Huffman tables before marker parsing and supports DRI restart intervals.
- *  - Supports Scale 1:1 (e.g. 5168x3448 -> 5168x3448) and 1:2 (e.g. 7952x5304 -> 3976x2652).
- *  - Emits clean sanitized EXIF APP1 (Orientation, DateTime, Exposure, FNumber, ISO, FocalLength)
- *    with standard JFIF APP0 and zero stale ungraded thumbnails / broken MakerNote offsets.
- *  - Scoped 4-core pthread fork-join (ZERO pthread_cond_wait) + overlapped async Huffman emit.
+ *    with exact same-cell 2x2 quad fast path and precomputed 256-byte luma grain table.
+ *  - Dedicated half-height vertical AAN IDCT (idct_8x4_half_v_aan) for Sony 4:2:2 chroma.
+ *  - 3-stage overlapped pipeline: double-buffered in_band overlaps SD read + Huffman decode
+ *    of Band N+1 with multi-core IDCT/LUT/FDCT of Band N and async Huffman emit of Band N-1.
+ *  - Zero-I/O RGB565 Quick Review preview extracted directly from FDCT DC coefficients
+ *    (eliminates post-write SD re-read & Skia re-decode of the full 17.7MP output JPEG).
  *
  * Returns:
  *   1  on complete success
- *  <=0 on unsupported format or I/O error (negative code identifies exact failing stage for telemetry;
- *      -9 = output file open failed, triggers Tier 2/3 output path retry; other codes trigger clean BRD fallback).
+ *  <=0 on unsupported format or I/O error (-9 = output open failed -> retry Tier 2/3).
  */
+int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
+                                  const char* input_jpeg_path,
+                                  const char* output_jpeg_path,
+                                  int scale_denom,
+                                  int quality,
+                                  int grain_strength,
+                                  int clarity_strength,
+                                  FastTranscodeResult* out_result);
+
 int native_fast_transcode_jpeg(const Lut17Context* lut,
                                const char* input_jpeg_path,
                                const char* output_jpeg_path,

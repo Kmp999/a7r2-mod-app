@@ -71,11 +71,15 @@ jobs:
               int scale = atoi(argv[3]);
               int grain = (argc >= 6) ? atoi(argv[5]) : 0;
               int clarity = (argc >= 7) ? atoi(argv[6]) : 0;
-              int rc = native_fast_transcode_jpeg(&lut, argv[1], argv[2], scale, 92, grain, clarity);
-              if (rc <= 0) {
-                  fprintf(stderr, "native_fast_transcode_jpeg failed rc=%d\n", rc);
+              FastTranscodeResult res;
+              int rc = native_fast_transcode_jpeg_ex(&lut, argv[1], argv[2], scale, 92, grain, clarity, &res);
+              if (rc <= 0 || res.preview_rgb565 == NULL || res.preview_w <= 0 || res.preview_h <= 0) {
+                  fprintf(stderr, "native_fast_transcode_jpeg_ex failed rc=%d prev=%p (%dx%d)\n",
+                          rc, (void*)res.preview_rgb565, res.preview_w, res.preview_h);
+                  free(res.preview_rgb565);
                   return 1;
               }
+              free(res.preview_rgb565);
               return 0;
           }
           EOF

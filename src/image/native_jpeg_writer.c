@@ -64,28 +64,19 @@ static void init_ycbcr_tables(void) {
     g_ycbcr_ready = 1;
 }
 
-// Buffered BitWriter (32KB write buffer tuned for FAT32 clusters; heap-allocated to avoid JNI stack overflow)
+// Buffered BitWriter (64KB write buffer tuned for FAT32 clusters; heap-allocated to avoid JNI stack overflow)
 typedef struct {
     FILE* fp;
     uint32_t buf;
     int bits;
-    uint8_t obuf[32768];
+    uint8_t obuf[65536];
     int opos;
 } BitWriter;
 
 static inline void bw_put_byte(BitWriter* bw, uint8_t b) {
     bw->obuf[bw->opos++] = b;
     if (b == 0xFF) bw->obuf[bw->opos++] = 0x00;
-    if (bw->opos >= 32760) { fwrite(bw->obuf, 1, bw->opos, bw->fp); bw->opos = 0; }
-}
-
-static inline void bw_put_bits(BitWriter* bw, uint32_t code, int len) {
-    bw->buf = (bw->buf << len) | (code & ((1U << len) - 1U));
-    bw->bits += len;
-    while (bw->bits >= 8) {
-        bw->bits -= 8;
-        bw_put_byte(bw, (uint8_t)(bw->buf >> bw->bits));
-    }
+    if (bw->opos >= 65528) { fwrite(bw->obuf, 1, bw->opos, bw->fp); bw->opos = 0; }
 }
 
 static void bw_flush(BitWriter* bw) {
@@ -178,20 +169,19 @@ static inline void fdct_1d(int16_t* blk) {
     }
 }
 
-static inline void quantize_block_fast(int16_t* blk, const uint16_t* inv_q, JpegQuantBlock* qb) {
+static inline void quantize_block_fast(int16_t* blk, const uint16_t* inv_q_zz, JpegQuantBlock* qb) {
     fdct_1d(blk);
     int c0 = blk[0];
     int s0 = c0 < 0;
-    int q0 = (((s0 ? -c0 : c0) * inv_q[0]) + 32768) >> 16;
+    int q0 = (((s0 ? -c0 : c0) * inv_q_zz[0]) + 32768) >> 16;
     qb->q[0] = (int16_t)(s0 ? -q0 : q0);
     int last_nz = 0;
     for (int i = 1; i < 64; i++) {
-        int nat = ZIGZAG[i];
-        int coeff = blk[nat];
+        int coeff = blk[ZIGZAG[i]];
         if (coeff == 0) continue;
         int sign = coeff < 0;
         int abs_c = sign ? -coeff : coeff;
-        int q_val = (abs_c * inv_q[nat] + 32768) >> 16;
+        int q_val = (abs_c * inv_q_zz[i] + 32768) >> 16;
         if (q_val != 0) {
             for (int z = last_nz + 1; z < i; z++) qb->q[z] = 0;
             if (q_val > 1023) q_val = 1023;
@@ -205,26 +195,40 @@ static inline void quantize_block_fast(int16_t* blk, const uint16_t* inv_q, Jpeg
 static inline void emit_quant_block(BitWriter* bw, const JpegQuantBlock* qb,
                                     const uint16_t* dc_codes, const uint8_t* dc_sizes,
                                     const uint16_t* ac_codes, const uint8_t* ac_sizes, int* last_dc) {
+    uint32_t buf = bw->buf;
+    int bits = bw->bits, opos = bw->opos;
+    uint8_t* obuf = bw->obuf;
+    #define BW_EMIT(code, len) do { \
+        buf = (buf << (len)) | (uint32_t)(code); bits += (len); \
+        while (bits >= 8) { bits -= 8; uint8_t _b = (uint8_t)(buf >> bits); obuf[opos++] = _b; if (_b == 0xFF) obuf[opos++] = 0x00; } \
+    } while (0)
+
     int diff = qb->q[0] - *last_dc;
     *last_dc = qb->q[0];
     if (diff > 2047) diff = 2047; else if (diff < -2047) diff = -2047;
-    int cat, bits;
-    get_cat_bits(diff, &cat, &bits);
-    bw_put_bits(bw, dc_codes[cat], dc_sizes[cat]);
-    if (cat > 0) bw_put_bits(bw, (uint32_t)bits, cat);
+    int cat, abits;
+    get_cat_bits(diff, &cat, &abits);
+    int dlen = dc_sizes[cat];
+    if (cat == 0) { BW_EMIT(dc_codes[0], dlen); }
+    else if (dlen + cat <= 24) { BW_EMIT(((uint32_t)dc_codes[cat] << cat) | (uint32_t)abits, dlen + cat); }
+    else { BW_EMIT(dc_codes[cat], dlen); BW_EMIT(abits, cat); }
 
     int r = 0, last_nz = qb->last_nz;
     for (int k = 1; k <= last_nz; k++) {
         int val = qb->q[k];
         if (val == 0) { r++; } else {
-            while (r > 15) { bw_put_bits(bw, ac_codes[0xF0], ac_sizes[0xF0]); r -= 16; }
-            get_cat_bits(val, &cat, &bits);
-            bw_put_bits(bw, ac_codes[(r << 4) | cat], ac_sizes[(r << 4) | cat]);
-            bw_put_bits(bw, (uint32_t)bits, cat);
+            while (r > 15) { BW_EMIT(ac_codes[0xF0], ac_sizes[0xF0]); r -= 16; }
+            get_cat_bits(val, &cat, &abits);
+            int sym = (r << 4) | cat, alen = ac_sizes[sym];
+            if (alen + cat <= 24) { BW_EMIT(((uint32_t)ac_codes[sym] << cat) | (uint32_t)abits, alen + cat); }
+            else { BW_EMIT(ac_codes[sym], alen); BW_EMIT(abits, cat); }
             r = 0;
         }
     }
-    if (last_nz < 63) bw_put_bits(bw, ac_codes[0x00], ac_sizes[0x00]);
+    if (last_nz < 63) BW_EMIT(ac_codes[0x00], ac_sizes[0x00]);
+    #undef BW_EMIT
+    if (opos >= 65000) { fwrite(obuf, 1, opos, bw->fp); opos = 0; }
+    bw->buf = buf; bw->bits = bits; bw->opos = opos;
 }
 
 static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q,
@@ -235,7 +239,7 @@ static void encode_block_fast(BitWriter* bw, int16_t* blk, const uint16_t* inv_q
     emit_quant_block(bw, &qb, dc_codes, dc_sizes, ac_codes, ac_sizes, last_dc);
 }
 
-static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma, uint16_t* inv_q_luma, uint16_t* inv_q_chroma) {
+static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma, uint16_t* inv_q_luma_zz, uint16_t* inv_q_chroma_zz) {
     int q = quality < 1 ? 1 : (quality > 100 ? 100 : quality);
     int s = (q < 50) ? (5000 / q) : (200 - q * 2);
     for (int i = 0; i < 64; i++) {
@@ -243,11 +247,14 @@ static void compute_quant_tables(int quality, uint8_t* q_luma, uint8_t* q_chroma
         int vc = (BASE_Q_CHROMA[i] * s + 50) / 100;
         q_luma[i] = (uint8_t)(vl < 1 ? 1 : (vl > 255 ? 255 : vl));
         q_chroma[i] = (uint8_t)(vc < 1 ? 1 : (vc > 255 ? 255 : vc));
-        uint32_t aan_num = (uint32_t)AAN_IFACT[i >> 3] * (uint32_t)AAN_IFACT[i & 7];
-        uint32_t il = (aan_num + ((uint32_t)q_luma[i] << 7)) / ((uint32_t)q_luma[i] << 8);
-        uint32_t ic = (aan_num + ((uint32_t)q_chroma[i] << 7)) / ((uint32_t)q_chroma[i] << 8);
-        inv_q_luma[i] = (uint16_t)(il > 65535U ? 65535U : il);
-        inv_q_chroma[i] = (uint16_t)(ic > 65535U ? 65535U : ic);
+    }
+    for (int i = 0; i < 64; i++) {
+        int nat = ZIGZAG[i];
+        uint32_t aan_num = (uint32_t)AAN_IFACT[nat >> 3] * (uint32_t)AAN_IFACT[nat & 7];
+        uint32_t il = (aan_num + ((uint32_t)q_luma[nat] << 7)) / ((uint32_t)q_luma[nat] << 8);
+        uint32_t ic = (aan_num + ((uint32_t)q_chroma[nat] << 7)) / ((uint32_t)q_chroma[nat] << 8);
+        inv_q_luma_zz[i] = (uint16_t)(il > 65535U ? 65535U : il);
+        inv_q_chroma_zz[i] = (uint16_t)(ic > 65535U ? 65535U : ic);
     }
 }
 

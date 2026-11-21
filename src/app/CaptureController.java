@@ -1114,20 +1114,28 @@ public class CaptureController {
             final long totalMs = System.currentTimeMillis() - captureStartTime;
             final float mp = (float)(dstW * dstH) / 1000000.0f;
             final String savedFileName = (gradedSavedPath != null) ? new File(gradedSavedPath).getName() : String.format(Locale.US, "fuji_%04d.jpg", seqNum);
+            final int[] fastStats = usedFastTranscode ? ColorEngine.getLastFastStatsSafe() : null;
+            final String cpuDiag = (fastStats != null)
+                ? String.format(Locale.US, "h:%d p:%d e:%d %dc/v%d%s",
+                    fastStats[2], fastStats[3], fastStats[4],
+                    fastStats[5], (fastStats[7] != 0 ? 7 : 5), (fastStats[6] != 0 ? "N" : ""))
+                : null;
             final String perfTag = usedFastTranscode
                 ? String.format(Locale.US, "C-FAST sd:%d c:%d", sdWaitMs, fastTranscodeMs)
                 : String.format(Locale.US, "BRD rc:%d sd:%d idx:%d dec:%d jni:%d", lastFastRc, sdWaitMs, brdIdxMs, brdDecMs, brdJniMs);
             final String telemetry = String.format(Locale.US, "SAVED %s (%dx%d | %.1fMP) in %dms",
-                savedFileName, dstW, dstH, mp, totalMs) + " [" + perfTag + "]";
+                savedFileName, dstW, dstH, mp, totalMs) + " [" + perfTag + (cpuDiag != null ? " " + cpuDiag : "") + "]";
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
-            // 10. Load crisp display-safe review bitmap (<= 960px, aspect-preserving letterbox in FujiQMenuView)
-            Bitmap reviewBmp = null;
-            File reviewFile = (gradedSavedPath != null && new File(gradedSavedPath).exists())
-                ? new File(gradedSavedPath) : targetOutputFile;
-            if (reviewFile != null && reviewFile.exists()) {
-                reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 960);
+            // 10. Instant Zero-I/O Quick Review from in-memory DC RGB565 preview (skips 1-1.5s SD re-read & Skia decode!)
+            Bitmap reviewBmp = usedFastTranscode ? ColorEngine.takeLastFastPreviewBitmapSafe() : null;
+            if (reviewBmp == null) {
+                File reviewFile = (gradedSavedPath != null && new File(gradedSavedPath).exists())
+                    ? new File(gradedSavedPath) : targetOutputFile;
+                if (reviewFile != null && reviewFile.exists()) {
+                    reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 960);
+                }
             }
             if (reviewBmp == null && rawMasterFile.exists()) {
                 reviewBmp = StorageResolver.loadPhotoForReview(rawMasterFile, 960);
@@ -1138,8 +1146,11 @@ public class CaptureController {
                 }
             }
             if (reviewBmp != null) {
+                String reviewSubline = (cpuDiag != null)
+                    ? (cpuDiag + " | " + savedFileName)
+                    : gradedSavedPath;
                 if (resultListener != null) {
-                    deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, gradedSavedPath, perfTag);
+                    deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, reviewSubline, perfTag);
                 } else if (uiController != null) {
                     uiController.showQuickReview(reviewBmp);
                 } else if (!reviewBmp.isRecycled()) {

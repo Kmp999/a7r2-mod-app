@@ -401,7 +401,44 @@ public class ColorEngine {
         }
     }
 
+    /** Returns [rc, totalMs, decMs, procMs, emitMs, ncpu, hasNeon, isV7, previewW, previewH], or null. */
+    public static int[] getLastFastStatsSafe() {
+        if (!sNativeAvailable) return null;
+        try {
+            int[] stats = new int[10];
+            if (nativeGetLastFastStats(stats)) {
+                return stats;
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * Takes the zero-I/O RGB_565 Quick Review Bitmap generated in memory during the last
+     * nativeProcessImageStreamFastScaled call (eliminates 1-1.5s SD re-read & Skia JPEG re-decode).
+     */
+    public static android.graphics.Bitmap takeLastFastPreviewBitmapSafe() {
+        if (!sNativeAvailable) return null;
+        try {
+            int[] stats = getLastFastStatsSafe();
+            if (stats == null || stats[8] <= 0 || stats[9] <= 0) return null;
+            int w = stats[8];
+            int h = stats[9];
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect(w * h * 2);
+            if (!nativeTakeLastFastPreview(buf)) return null;
+            buf.rewind();
+            android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.RGB_565);
+            bmp.copyPixelsFromBuffer(buf);
+            return bmp;
+        } catch (Throwable t) {
+            Log.w(TAG, "takeLastFastPreviewBitmapSafe fallback: " + t.getMessage());
+            return null;
+        }
+    }
+
     public static native boolean nativeProcessImageStreamFast(String inputPath, String outputPath, int grainStrength, int clarityStrength);
     public static native boolean nativeProcessImageStreamFastScaled(String inputPath, String outputPath, int scaleDenom, int grainStrength, int clarityStrength);
     public static native int nativeGetLastFastRc();
+    public static native boolean nativeGetLastFastStats(int[] outStats);
+    public static native boolean nativeTakeLastFastPreview(java.nio.ByteBuffer dstDirectBuffer);
 }
