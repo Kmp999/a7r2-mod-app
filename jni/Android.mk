@@ -37,7 +37,8 @@ LOCAL_LDLIBS    := -llog -lm
 LOCAL_ARM_MODE  := arm
 LOCAL_CFLAGS    := -std=gnu99 -O3 -funroll-loops -fomit-frame-pointer -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
-LOCAL_CFLAGS    += -mcpu=cortex-a5 -mtune=cortex-a5
+LOCAL_SRC_FILES += ../src/image/neon_jpeg_kernels.c.neon
+LOCAL_CFLAGS    += -mcpu=cortex-a5 -mtune=cortex-a5 -DHAVE_NEON_KERNELS=1
 endif
 LOCAL_LDFLAGS   := -Wl,--hash-style=both
 

@@ -1336,13 +1336,10 @@ public final class StorageResolver {
             if (newest != null) {
                 long initialSize = newest.length();
                 if (initialSize > 200000 && isJpegComplete(newest)) {
-                    try { Thread.sleep(20); } catch (InterruptedException ignored) {}
-                    if (newest.length() == initialSize) {
-                        Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (initialSize/1024) + " KB)");
-                        return newest;
-                    }
+                    Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (initialSize/1024) + " KB)");
+                    return newest;
                 } else {
-                    try { Thread.sleep(30); } catch (InterruptedException ignored) {}
+                    try { Thread.sleep(20); } catch (InterruptedException ignored) {}
                     long currentSize = newest.length();
                     if (currentSize == initialSize && isJpegComplete(newest)) {
                         Log.i(TAG, "New hardware JPEG verified complete: " + newest.getAbsolutePath() + " (" + (currentSize/1024) + " KB)");
@@ -1351,7 +1348,7 @@ public final class StorageResolver {
                 }
             }
             try {
-                Thread.sleep(40);
+                Thread.sleep(20);
             } catch (InterruptedException ignored) {
                 break;
             }

@@ -1095,7 +1095,7 @@ JNIEXPORT jboolean JNICALL Java_com_fujilite_a7r2_ColorEngine_nativeProcessImage
     pthread_mutex_unlock(&g_lut_mutex);
 
     FastTranscodeResult res;
-    int rc = native_fast_transcode_jpeg_ex(lut_copy, in_p, out_p, (int)scaleDenom, 92,
+    int rc = native_fast_transcode_jpeg_ex(lut_copy, in_p, out_p, (int)scaleDenom, 88,
                                            (int)grainStrength, (int)clarityStrength, &res);
     g_last_fast_rc = rc;
 
