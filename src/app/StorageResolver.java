@@ -437,23 +437,84 @@ public final class StorageResolver {
         return null;
     }
 
-    public static final String PREFIX_FUJI = "FUJI"; // Supported for DCF compatibility
+    public static final String PREFIX_FUJI = "FUJI"; // Strict DCF 8.3 prefix
 
     /**
-     * Resolves the target file path on SD card using the mandatory fuji_%04d.jpg naming format (Requirement 2).
+     * Normalizes a DCF sequence number strictly into [1..9999] so generated filenames
+     * never exceed Sony libInfraFuFsys.so's strict DOS 8.3 length limit.
+     */
+    public static int normalizeDcfSequence(int sequenceNum) {
+        if (sequenceNum <= 0) return 1;
+        return ((sequenceNum - 1) % 9999) + 1;
+    }
+
+    /**
+     * Formats a strict DOS 8.3 / DCF 2.0 graded JPEG filename (FUJI0001.JPG .. FUJI9999.JPG).
+     * Sony A7R II's FUSE filesystem (libInfraFuFsys.so) rejects >8.3 names with ENAMETOOLONG.
+     */
+    public static String formatGradedFilename(int sequenceNum) {
+        return String.format(Locale.US, "FUJI%04d.JPG", normalizeDcfSequence(sequenceNum));
+    }
+
+    /**
+     * Formats a strict DOS 8.3 temporary filename (FUJI0001.TMP .. FUJI9999.TMP) for atomic rename.
+     */
+    public static String formatGradedTempFilename(int sequenceNum) {
+        return String.format(Locale.US, "FUJI%04d.TMP", normalizeDcfSequence(sequenceNum));
+    }
+
+    /**
+     * Returns ordered candidate output files pointing to the SAME DCIM subfolder as targetFile
+     * across known Sony SD mount aliases (handles read-only vs writable mount aliases).
+     */
+    public static List<File> getSameFolderWriteTargets(File targetFile) {
+        List<File> targets = new ArrayList<File>();
+        if (targetFile == null) return targets;
+        targets.add(targetFile);
+        Set<String> seenPaths = new HashSet<String>();
+        seenPaths.add(targetFile.getAbsolutePath());
+
+        File parent = targetFile.getParentFile();
+        String folderName = (parent != null) ? parent.getName() : null;
+        String fileName = targetFile.getName();
+        if (folderName != null && folderName.length() > 0) {
+            Set<String> roots = new LinkedHashSet<String>();
+            if (Environment.getExternalStorageDirectory() != null) {
+                roots.add(Environment.getExternalStorageDirectory().getAbsolutePath());
+            }
+            roots.add("/storage/sdcard0");
+            roots.add("/mnt/sdcard");
+            roots.add("/sdcard");
+            roots.add("/mnt/sd0");
+            roots.add("/storage/sdcard1");
+            for (String root : roots) {
+                File altDir = new File(new File(root, "DCIM"), folderName);
+                if (altDir.exists() && altDir.isDirectory()) {
+                    File altFile = new File(altDir, fileName);
+                    if (seenPaths.add(altFile.getAbsolutePath())) {
+                        targets.add(altFile);
+                    }
+                }
+            }
+        }
+        return targets;
+    }
+
+    /**
+     * Resolves the target file path on SD card using strict DCF 8.3 naming (FUJI%04d.JPG).
      */
     public static File getGradedOutputFile(int sequenceNum) {
+        String filename = formatGradedFilename(sequenceNum);
         List<File> candidates = getCandidateDcimDirs();
         for (File dir : candidates) {
             try {
                 if (!dir.exists()) dir.mkdirs();
                 if (dir.exists() && dir.isDirectory()) {
-                    String filename = String.format(Locale.US, "fuji_%04d.jpg", sequenceNum);
                     return new File(dir, filename);
                 }
             } catch (Throwable ignored) {}
         }
-        return new File("/mnt/sdcard/DCIM/100MSDCF", String.format(Locale.US, "fuji_%04d.jpg", sequenceNum));
+        return new File("/mnt/sdcard/DCIM/100MSDCF", filename);
     }
 
     /**
@@ -555,17 +616,23 @@ public final class StorageResolver {
                 }
 
                 String filename;
+                String tmpName;
                 if (sequenceNum > 0) {
                     if ("fuji_".equalsIgnoreCase(prefix) || "FUJI".equalsIgnoreCase(prefix)) {
-                        filename = String.format(Locale.US, "fuji_%04d.jpg", sequenceNum);
+                        filename = formatGradedFilename(sequenceNum);
+                        tmpName = formatGradedTempFilename(sequenceNum);
                     } else {
-                        filename = String.format(Locale.US, "%s%04d.JPG", prefix, sequenceNum);
+                        int dcfSeq = normalizeDcfSequence(sequenceNum);
+                        filename = String.format(Locale.US, "%s%04d.JPG", prefix.toUpperCase(Locale.US), dcfSeq);
+                        tmpName = String.format(Locale.US, "%s%04d.TMP", prefix.toUpperCase(Locale.US), dcfSeq);
                     }
                 } else {
                     filename = generateDcfFilename(dir, prefix);
+                    int dot = filename.lastIndexOf('.');
+                    tmpName = (dot > 0 ? filename.substring(0, dot) : filename) + ".TMP";
                 }
                 File file = new File(dir, filename);
-                File tmpFile = new File(dir, filename + ".tmp");
+                File tmpFile = new File(dir, tmpName);
 
                 boolean compressed = false;
                 try {
@@ -640,8 +707,8 @@ public final class StorageResolver {
         // Failsafe: Android MediaStore provider (LightLab saveViaMedia strategy)
         if (context != null) {
             String fallbackName = (sequenceNum > 0)
-                ? String.format(Locale.US, "fuji_%04d.jpg", sequenceNum)
-                : ("fuji_" + System.currentTimeMillis() + ".jpg");
+                ? formatGradedFilename(sequenceNum)
+                : formatGradedFilename(allocateNextSequenceNumber());
             String mediaSaved = saveViaMediaStore(context, bitmap, fallbackName, recipeName);
             if (mediaSaved != null) {
                 return mediaSaved;
@@ -704,58 +771,102 @@ public final class StorageResolver {
     }
 
     /**
-     * Streams an already-encoded JPEG file (e.g. written by native C into app cache when SD POSIX write
-     * returns EACCES) directly into MediaStore in 64KB chunks with zero Bitmap decode/re-encode.
+     * Streams an already-encoded JPEG file (e.g. written by native C into app cache) to the exact
+     * same DCIM subfolder as the original camera photo, trying direct Java FileOutputStream across
+     * mount aliases first and then Android MediaStore with explicit 8.3 DATA path.
+     * Returns the verified on-disk path only if the destination file exists with length > 0, else null.
      */
     public static String saveJpegFileViaMediaStore(Context context, File srcJpegFile, String filename, String recipeName) {
-        if (context == null || srcJpegFile == null || !srcJpegFile.exists() || srcJpegFile.length() == 0) return null;
-        java.io.FileInputStream in = null;
-        java.io.OutputStream out = null;
-        try {
-            ContentValues cv = new ContentValues();
-            cv.put(MediaStore.Images.Media.TITLE, filename);
-            cv.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
-            cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-            cv.put(MediaStore.Images.Media.DESCRIPTION, "Fuji Recipe: " + (recipeName != null ? recipeName : "Default"));
+        File target = new File(getGradedOutputFile(1).getParentFile(), filename);
+        return saveJpegFileViaMediaStore(context, srcJpegFile, target, recipeName);
+    }
 
-            Uri uri = context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
-            if (uri == null) return null;
+    public static String saveJpegFileViaMediaStore(Context context, File srcJpegFile, File targetOutputFile, String recipeName) {
+        if (srcJpegFile == null || !srcJpegFile.exists() || srcJpegFile.length() == 0) return null;
 
-            out = context.getContentResolver().openOutputStream(uri);
-            if (out == null) return null;
-            in = new java.io.FileInputStream(srcJpegFile);
-            byte[] buf = new byte[65536];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
-            }
-            out.flush();
-            out.close();
-            out = null;
-            in.close();
-            in = null;
-
-            Cursor c = context.getContentResolver().query(uri, new String[]{MediaStore.Images.Media.DATA}, null, null, null);
-            String savedPath = null;
-            if (c != null) {
-                if (c.moveToFirst()) {
-                    savedPath = c.getString(0);
+        // 1. Try direct Java copy into the exact target DCIM folder (and any writable SD mount alias)
+        if (targetOutputFile != null) {
+            List<File> sameFolderTargets = getSameFolderWriteTargets(targetOutputFile);
+            for (File dst : sameFolderTargets) {
+                try {
+                    File parent = dst.getParentFile();
+                    if (parent != null && !parent.exists()) parent.mkdirs();
+                    if (dst.exists()) dst.delete();
+                    copyFile(srcJpegFile, dst);
+                    if (dst.exists() && dst.length() > 0) {
+                        String savedPath = dst.getAbsolutePath();
+                        sLastDiagnostic = "OK (DirectCopy): " + savedPath + " (" + (dst.length() / 1024) + "KB)";
+                        Log.i(TAG, "Copied cached JPEG directly to same folder: " + sLastDiagnostic);
+                        return savedPath;
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "Direct same-folder copy failed for " + dst.getAbsolutePath() + ": " + t.getMessage());
                 }
-                c.close();
             }
-            if (savedPath != null && new File(savedPath).exists()) {
-                sLastDiagnostic = "OK (Native-MediaStore): " + savedPath + " (" + (new File(savedPath).length() / 1024) + "KB)";
-                Log.i(TAG, "Streamed native JPEG via MediaStore: " + sLastDiagnostic);
-                return savedPath;
-            }
-            return uri.toString();
-        } catch (Throwable t) {
-            Log.w(TAG, "saveJpegFileViaMediaStore failed: " + t.getMessage(), t);
-            return null;
-        } finally {
-            if (in != null) try { in.close(); } catch (Throwable ignored) {}
-            if (out != null) try { out.close(); } catch (Throwable ignored) {}
         }
+
+        if (context == null) return null;
+        String filename = (targetOutputFile != null) ? targetOutputFile.getName() : srcJpegFile.getName();
+
+        // 2. Try Android MediaStore with explicit strict-8.3 DATA path first (keeps same folder!),
+        //    then fallback without DATA only if MediaProvider rejects explicit _data.
+        boolean[] tryExplicitData = (targetOutputFile != null) ? new boolean[]{true, false} : new boolean[]{false};
+        for (int attempt = 0; attempt < tryExplicitData.length; attempt++) {
+            java.io.FileInputStream in = null;
+            java.io.OutputStream out = null;
+            try {
+                ContentValues cv = new ContentValues();
+                cv.put(MediaStore.Images.Media.TITLE, filename);
+                cv.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+                cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                cv.put(MediaStore.Images.Media.DESCRIPTION, "Fuji Recipe: " + (recipeName != null ? recipeName : "Default"));
+                if (tryExplicitData[attempt]) {
+                    cv.put(MediaStore.Images.Media.DATA, targetOutputFile.getAbsolutePath());
+                }
+
+                Uri uri = context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                if (uri == null) continue;
+
+                out = context.getContentResolver().openOutputStream(uri);
+                if (out == null) {
+                    try { context.getContentResolver().delete(uri, null, null); } catch (Throwable ignored) {}
+                    continue;
+                }
+                in = new java.io.FileInputStream(srcJpegFile);
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+                out.flush();
+                out.close();
+                out = null;
+                in.close();
+                in = null;
+
+                Cursor c = context.getContentResolver().query(uri, new String[]{MediaStore.Images.Media.DATA}, null, null, null);
+                String savedPath = null;
+                if (c != null) {
+                    if (c.moveToFirst()) {
+                        savedPath = c.getString(0);
+                    }
+                    c.close();
+                }
+                if (savedPath != null && new File(savedPath).exists() && new File(savedPath).length() > 0) {
+                    sLastDiagnostic = "OK (Native-MediaStore): " + savedPath + " (" + (new File(savedPath).length() / 1024) + "KB)";
+                    Log.i(TAG, "Streamed native JPEG via MediaStore: " + sLastDiagnostic);
+                    return savedPath;
+                }
+                try { context.getContentResolver().delete(uri, null, null); } catch (Throwable ignored) {}
+            } catch (Throwable t) {
+                sLastDiagnostic = "ERR (MediaStore): " + t.getMessage();
+                Log.w(TAG, "saveJpegFileViaMediaStore attempt " + attempt + " failed: " + t.getMessage(), t);
+            } finally {
+                if (in != null) try { in.close(); } catch (Throwable ignored) {}
+                if (out != null) try { out.close(); } catch (Throwable ignored) {}
+            }
+        }
+        return null;
     }
 
     /**
@@ -890,7 +1001,7 @@ public final class StorageResolver {
             File[] files = dir.listFiles();
             if (files == null) continue;
             for (File f : files) {
-                if (f.isFile() && f.getName().endsWith(".tmp")) {
+                if (f.isFile() && f.getName().toLowerCase(Locale.US).endsWith(".tmp")) {
                     boolean ok = f.delete();
                     if (ok) {
                         cleanedCount++;
@@ -1329,7 +1440,7 @@ public final class StorageResolver {
                 for (String rawName : names) {
                     if (rawName == null) continue;
                     String name = rawName.toUpperCase(Locale.US);
-                    if ((name.endsWith(".JPG") || name.endsWith(".JPEG")) && !name.startsWith("FUJI_")) {
+                    if ((name.endsWith(".JPG") || name.endsWith(".JPEG")) && !name.startsWith("FUJI")) {
                         String fullPath = dirPath + File.separator + rawName;
                         if (preExistingFiles != null && preExistingFiles.contains(fullPath)) {
                             continue;

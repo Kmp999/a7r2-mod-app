@@ -1,12 +1,12 @@
 #include "native_jpeg_fast_stream.h"
 #include "native_jpeg_writer.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
-#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -2745,14 +2745,19 @@ int native_fast_transcode_jpeg_ex(const Lut17Context* lut,
     uint8_t clean_exif[512];
     size_t clean_exif_len = build_clean_exif_app1(clean_exif, sizeof(clean_exif), &info->exif, info->dst_w, info->dst_h);
 
-    // Open output file FIRST before reading ANY input scan data (so Tier 1/2 EACCES retries return -9 in <1ms!)
+    // Open output file FIRST before reading ANY input scan data (so Tier 1/2 open retries return -9 in <1ms!)
+    errno = 0;
     JpegStreamState* out_state = native_jpeg_stream_open_with_exif(
         output_jpeg_path, info->dst_w, info->dst_h, eff_quality,
         clean_exif_len > 0 ? clean_exif : NULL, clean_exif_len);
     if (!out_state) {
+        int saved_errno = errno;
         free(info);
         fclose(fp);
-        if (out_result) out_result->rc = -9;
+        if (out_result) {
+            out_result->rc = -9;
+            out_result->open_errno = saved_errno;
+        }
         return -9;
     }
 

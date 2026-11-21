@@ -36,6 +36,7 @@ typedef struct {
     int read_ms;              // Blocking stall ms waiting on async SD prefetcher
     int pin_cnt;              // Number of threads pinned to distinct CPU cores
     int dct_fast_pct;         // Percentage (0..100) of 8x8 luma blocks transcoded directly in DCT domain
+    int open_errno;           // POSIX errno when output fopen() fails (rc == -9), else 0
     uint16_t* preview_rgb565; // Allocated RGB_565 DC preview (caller frees via free()), or NULL
     int preview_w;
     int preview_h;

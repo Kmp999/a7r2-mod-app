@@ -74,9 +74,12 @@ class TestEndToEndCapturePipeline(unittest.TestCase):
         self.assertIn("4 * 1024 * 1024", pool_content)
 
     def test_storage_resolver_fuji_filename_and_deduplication(self):
-        """Step 3: StorageResolver formats fuji_%04d.jpg, uses .tmp rename pattern, and removes cleanupUnfilteredRawFiles."""
+        """Step 3: StorageResolver enforces Sony strict DOS 8.3 FUJI%04d.JPG / FUJI%04d.TMP naming and removes cleanupUnfilteredRawFiles."""
         storage_content = self.storage_resolver.read_text(encoding="utf-8")
-        self.assertIn('String.format(Locale.US, "fuji_%04d.jpg", sequenceNum)', storage_content)
+        self.assertIn('String.format(Locale.US, "FUJI%04d.JPG", normalizeDcfSequence(sequenceNum))', storage_content)
+        self.assertIn('String.format(Locale.US, "FUJI%04d.TMP", normalizeDcfSequence(sequenceNum))', storage_content)
+        self.assertIn("getSameFolderWriteTargets", storage_content)
+        self.assertNotIn('!name.startsWith("FUJI_")', storage_content)
         self.assertNotIn("cleanupUnfilteredRawFiles", storage_content)
         self.assertIn("copyExifMetadata", storage_content)
         self.assertIn("postProcessGradedFile", storage_content)

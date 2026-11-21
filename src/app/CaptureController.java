@@ -690,16 +690,20 @@ public class CaptureController {
             final int dstH = (targetSample == 1) ? srcH : ((srcH > 3000) ? (srcW >= 7000 ? srcH / 2 : srcH) : srcH);
             Log.i(TAG, "Processing Strip-Streaming [" + resMode.label + "]: " + srcW + "x" + srcH + " -> " + dstW + "x" + dstH + " (" + rawJpegPath + ")");
 
-            // 3. Prepare target and temporary files (Safe temp-file-then-rename)
+            // 3. Prepare strict DOS 8.3 / DCF 2.0 target and temp files in the EXACT SAME folder as the original photo.
+            //    Sony A7R II's FUSE driver (libInfraFuFsys.so) rejects >8.3 names (like fuji_8107.jpg) with ENAMETOOLONG!
+            final int dcfSeq = StorageResolver.normalizeDcfSequence(seqNum);
+            final String dcfJpegName = StorageResolver.formatGradedFilename(dcfSeq);
+            final String dcfTmpName = StorageResolver.formatGradedTempFilename(dcfSeq);
             File resolvedTarget = StorageResolver.getGradedOutputFile(seqNum);
             if (rawJpegPath != null) {
                 File rawDir = new File(rawJpegPath).getParentFile();
                 if (rawDir != null && rawDir.exists() && rawDir.isDirectory() && !rawDir.getAbsolutePath().contains("wv_cache")) {
-                    resolvedTarget = new File(rawDir, String.format(Locale.US, "fuji_%04d.jpg", seqNum));
+                    resolvedTarget = new File(rawDir, dcfJpegName);
                 }
             }
             final File targetOutputFile = resolvedTarget;
-            final File tmpFile = new File(targetOutputFile.getParentFile(), targetOutputFile.getName() + ".tmp");
+            final File tmpFile = new File(targetOutputFile.getParentFile(), dcfTmpName);
             if (tmpFile.exists()) {
                 tmpFile.delete();
             }
@@ -718,9 +722,11 @@ public class CaptureController {
             boolean usedDirectTarget = false;
             boolean usedCacheStream = false;
             boolean usedFastTranscode = false;
+            File actualDirectTarget = targetOutputFile;
             File cacheStreamFile = null;
             long fastTranscodeMs = 0;
             int lastFastRc = 0;
+            int lastOpenErrno = 0;
             long brdIdxMs = 0;
             long brdDecMs = 0;
             long brdJniMs = 0;
@@ -736,35 +742,58 @@ public class CaptureController {
                     : ((pref == 2) ? new int[]{2, 1, 3} : new int[]{1, 2, 3});
                 for (int ti = 0; ti < tierOrder.length && !streamSuccess; ti++) {
                     int tier = tierOrder[ti];
-                    String outPath = null;
                     if (tier == 1) {
-                        outPath = tmpFile.getAbsolutePath();
+                        if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, tmpFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                            streamSuccess = true;
+                            usedFastTranscode = true;
+                            inlineExifWritten = true;
+                            lastFastRc = 1;
+                            usedFastTier = 1;
+                            sPreferredFastOutputTier = 1;
+                        } else {
+                            lastFastRc = ColorEngine.getLastFastRcSafe();
+                            int[] errSt = ColorEngine.getLastFastStatsSafe();
+                            if (errSt != null && errSt.length >= 20 && errSt[19] != 0) lastOpenErrno = errSt[19];
+                            if (lastFastRc != -9) break;
+                        }
                     } else if (tier == 2) {
-                        outPath = targetOutputFile.getAbsolutePath();
+                        java.util.List<File> directCandidates = StorageResolver.getSameFolderWriteTargets(targetOutputFile);
+                        for (int ci = 0; ci < directCandidates.size() && !streamSuccess; ci++) {
+                            File cand = directCandidates.get(ci);
+                            if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, cand.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                                streamSuccess = true;
+                                usedFastTranscode = true;
+                                inlineExifWritten = true;
+                                lastFastRc = 1;
+                                usedFastTier = 2;
+                                usedDirectTarget = true;
+                                actualDirectTarget = cand;
+                                sPreferredFastOutputTier = 2;
+                            } else {
+                                lastFastRc = ColorEngine.getLastFastRcSafe();
+                                int[] errSt = ColorEngine.getLastFastStatsSafe();
+                                if (errSt != null && errSt.length >= 20 && errSt[19] != 0) lastOpenErrno = errSt[19];
+                                if (lastFastRc != -9) break;
+                            }
+                        }
+                        if (!streamSuccess && lastFastRc != -9) break;
                     } else if (tier == 3 && context != null && context.getCacheDir() != null) {
-                        cacheStreamFile = new File(context.getCacheDir(), String.format(Locale.US, "fuji_stream_%04d.jpg", seqNum));
+                        cacheStreamFile = new File(context.getCacheDir(), dcfJpegName);
                         if (cacheStreamFile.exists()) cacheStreamFile.delete();
-                        outPath = cacheStreamFile.getAbsolutePath();
-                    }
-                    if (outPath == null) continue;
-
-                    if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, outPath, targetSample, grainStrength, clarityStrength)) {
-                        streamSuccess = true;
-                        usedFastTranscode = true;
-                        inlineExifWritten = true;
-                        lastFastRc = 1;
-                        usedFastTier = tier;
-                        if (tier == 2) usedDirectTarget = true;
-                        else if (tier == 3) usedCacheStream = true;
-                        sPreferredFastOutputTier = tier;
-                    } else {
-                        lastFastRc = ColorEngine.getLastFastRcSafe();
-                        if (tier == 3 && cacheStreamFile != null) {
+                        if (ColorEngine.nativeProcessImageStreamFastScaledSafe(rawJpegPath, cacheStreamFile.getAbsolutePath(), targetSample, grainStrength, clarityStrength)) {
+                            streamSuccess = true;
+                            usedFastTranscode = true;
+                            inlineExifWritten = true;
+                            lastFastRc = 1;
+                            usedFastTier = 3;
+                            usedCacheStream = true;
+                            sPreferredFastOutputTier = 3;
+                        } else {
+                            lastFastRc = ColorEngine.getLastFastRcSafe();
                             if (cacheStreamFile.exists()) cacheStreamFile.delete();
                             cacheStreamFile = null;
+                            if (lastFastRc != -9) break;
                         }
-                        // Only retry other output tiers when output file open failed (rc == -9)
-                        if (lastFastRc != -9) break;
                     }
                 }
                 fastTranscodeMs = System.currentTimeMillis() - tFast0;
@@ -804,7 +833,7 @@ public class CaptureController {
                     if (streamHandle == 0 && context != null) {
                         File cacheDir = context.getCacheDir();
                         if (cacheDir != null) {
-                            cacheStreamFile = new File(cacheDir, String.format(Locale.US, "fuji_stream_%04d.jpg", seqNum));
+                            cacheStreamFile = new File(cacheDir, dcfJpegName);
                             if (cacheStreamFile.exists()) cacheStreamFile.delete();
                             Log.w(TAG, "Tier 2 direct SD stream open failed (EACCES?); trying Tier 3 app-cache stream: " + cacheStreamFile.getAbsolutePath());
                             streamHandle = openNativeStreamTier(cacheStreamFile, dstW, dstH, inlineExifApp1);
@@ -897,8 +926,9 @@ public class CaptureController {
                         }
                         long ms = System.currentTimeMillis() - captureStartTime;
                         String fbTag = graded ? "C-FB" : (nativeReady ? "JAVA-FB" : "JAVA-NOJNI");
+                        String fbName = (saved != null) ? new File(saved).getName() : dcfJpegName;
                         deliverResult(fallbackBmp, presetName, fallbackBmp.getWidth(), fallbackBmp.getHeight(), ms, saved, fbTag);
-                        uiController.updateStatusAsync(String.format(Locale.US, "SAVED fuji_%04d.jpg (%dx%d [%s]) in %dms", seqNum, fallbackBmp.getWidth(), fallbackBmp.getHeight(), fbTag, ms));
+                        uiController.updateStatusAsync(String.format(Locale.US, "SAVED %s (%dx%d [%s]) in %dms", fbName, fallbackBmp.getWidth(), fallbackBmp.getHeight(), fbTag, ms));
                     } else {
                         Log.e(TAG, "Failed to decode fallback bitmap for " + rawJpegPath);
                         if (uiController != null) uiController.updateStatusAsync("ERR: Decode failed");
@@ -1052,68 +1082,38 @@ public class CaptureController {
                 }
             }
 
-            // Grab in-memory DC RGB565 preview BEFORE Tier-3 finalization so Quick Review never waits on MediaStore SD copy!
+            // Grab in-memory DC RGB565 preview (zero SD re-read / Skia decode!)
             Bitmap reviewBmp = usedFastTranscode ? ColorEngine.takeLastFastPreviewBitmapSafe() : null;
 
-            // 7. Finalize native output (Tier 1 atomic .tmp rename / Tier 2 direct / Tier 3 cache -> MediaStore)
+            // 7. Finalize native output into the EXACT SAME folder as the original image
+            //    (Tier 1 atomic .TMP -> .JPG rename / Tier 2 direct .JPG / Tier 3 verified copy or MediaStore)
             String gradedSavedPath = null;
             if (streamSuccess && usedCacheStream && cacheStreamFile != null && cacheStreamFile.exists() && cacheStreamFile.length() > 0) {
-                boolean queuedAsyncSave = false;
-                if (usedFastTranscode && reviewBmp != null && !isShuttingDown) {
-                    final File asyncCacheFile = cacheStreamFile;
-                    final String asyncTargetName = targetOutputFile.getName();
-                    final String asyncPresetName = presetName;
-                    final String asyncRawPath = rawJpegPath;
-                    final boolean asyncInlineExif = inlineExifWritten;
-                    final FujiRecipe.DynamicRange asyncDr = recipe.dynamicRange;
-                    try {
-                        ioExecutor.execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                String saved = StorageResolver.saveJpegFileViaMediaStore(context, asyncCacheFile, asyncTargetName, asyncPresetName);
-                                asyncCacheFile.delete();
-                                if (saved != null) {
-                                    if (!asyncInlineExif && new File(saved).exists()) {
-                                        if (asyncDr != null && asyncDr != FujiRecipe.DynamicRange.DR100) {
-                                            StorageResolver.copyExifMetadata(asyncRawPath, saved, asyncPresetName, asyncDr.label, dstW, dstH);
-                                        } else {
-                                            StorageResolver.copyExifMetadata(asyncRawPath, saved, asyncPresetName, dstW, dstH);
-                                        }
-                                    }
-                                    StorageResolver.registerWithAvindex(context, saved);
-                                } else {
-                                    Log.e(TAG, "Async MediaStore save failed for " + asyncTargetName);
-                                }
-                            }
-                        });
-                        gradedSavedPath = targetOutputFile.getAbsolutePath();
-                        queuedAsyncSave = true;
-                    } catch (java.util.concurrent.RejectedExecutionException ree) {
-                        Log.w(TAG, "ioExecutor rejected async MediaStore save; falling back to sync", ree);
-                    }
-                }
-                if (!queuedAsyncSave) {
-                    gradedSavedPath = StorageResolver.saveJpegFileViaMediaStore(context, cacheStreamFile, targetOutputFile.getName(), presetName);
+                gradedSavedPath = StorageResolver.saveJpegFileViaMediaStore(context, cacheStreamFile, targetOutputFile, presetName);
+                if (gradedSavedPath != null && new File(gradedSavedPath).exists() && new File(gradedSavedPath).length() > 0) {
                     cacheStreamFile.delete();
-                    if (gradedSavedPath != null) {
-                        if (!inlineExifWritten && new File(gradedSavedPath).exists()) {
-                            if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
-                                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
-                            } else {
-                                StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
-                            }
+                    recordKnownPhoto(new File(gradedSavedPath));
+                    if (!inlineExifWritten) {
+                        if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
+                            StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
+                        } else {
+                            StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
                         }
-                        final String avindexPath = gradedSavedPath;
-                        ioExecutor.execute(new Runnable() {
-                            @Override
-                            public void run() {
-                                StorageResolver.registerWithAvindex(context, avindexPath);
-                            }
-                        });
                     }
+                    final String avindexPath = gradedSavedPath;
+                    ioExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            StorageResolver.registerWithAvindex(context, avindexPath);
+                        }
+                    });
+                } else {
+                    Log.e(TAG, "Tier-3 save failed for " + targetOutputFile.getAbsolutePath() + " (diag=" + StorageResolver.getLastDiagnostic() + "); keeping cache file " + cacheStreamFile.getAbsolutePath());
+                    gradedSavedPath = null;
                 }
-            } else if (streamSuccess && usedDirectTarget && targetOutputFile.exists() && targetOutputFile.length() > 0) {
-                gradedSavedPath = targetOutputFile.getAbsolutePath();
+            } else if (streamSuccess && usedDirectTarget && actualDirectTarget != null && actualDirectTarget.exists() && actualDirectTarget.length() > 0) {
+                gradedSavedPath = actualDirectTarget.getAbsolutePath();
+                recordKnownPhoto(actualDirectTarget);
                 if (!inlineExifWritten) {
                     if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
                         StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
@@ -1134,28 +1134,37 @@ public class CaptureController {
                 }
                 boolean renamed = tmpFile.renameTo(targetOutputFile);
                 if (!renamed) {
-                    StorageResolver.copyFile(tmpFile, targetOutputFile);
-                    tmpFile.delete();
-                }
-                gradedSavedPath = targetOutputFile.getAbsolutePath();
-
-                // 8. Copy original camera EXIF metadata ONLY if inline single-pass APP1 wasn't already embedded
-                if (!inlineExifWritten) {
-                    if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
-                        StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
-                    } else {
-                        StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
+                    try {
+                        StorageResolver.copyFile(tmpFile, targetOutputFile);
+                        if (targetOutputFile.exists() && targetOutputFile.length() > 0) {
+                            tmpFile.delete();
+                        }
+                    } catch (Throwable copyErr) {
+                        Log.e(TAG, "Failed finalizing " + tmpFile.getName() + " -> " + targetOutputFile.getAbsolutePath(), copyErr);
                     }
                 }
+                if (targetOutputFile.exists() && targetOutputFile.length() > 0) {
+                    gradedSavedPath = targetOutputFile.getAbsolutePath();
+                    recordKnownPhoto(targetOutputFile);
 
-                // 9. Register with Sony AvindexStore asynchronously off the grading worker
-                final String avindexPath = gradedSavedPath;
-                ioExecutor.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        StorageResolver.registerWithAvindex(context, avindexPath);
+                    // 8. Copy original camera EXIF metadata ONLY if inline single-pass APP1 wasn't already embedded
+                    if (!inlineExifWritten) {
+                        if (recipe.dynamicRange != null && recipe.dynamicRange != FujiRecipe.DynamicRange.DR100) {
+                            StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, recipe.dynamicRange.label, dstW, dstH);
+                        } else {
+                            StorageResolver.copyExifMetadata(rawJpegPath, gradedSavedPath, presetName, dstW, dstH);
+                        }
                     }
-                });
+
+                    // 9. Register with Sony AvindexStore asynchronously off the grading worker
+                    final String avindexPath = gradedSavedPath;
+                    ioExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            StorageResolver.registerWithAvindex(context, avindexPath);
+                        }
+                    });
+                }
             } else {
                 if (tmpFile.exists()) {
                     tmpFile.delete();
@@ -1168,30 +1177,48 @@ public class CaptureController {
 
             final long totalMs = System.currentTimeMillis() - captureStartTime;
             final float mp = (float)(dstW * dstH) / 1000000.0f;
-            final String savedFileName = (gradedSavedPath != null) ? new File(gradedSavedPath).getName() : String.format(Locale.US, "fuji_%04d.jpg", seqNum);
+            final File verifiedSavedFile = (gradedSavedPath != null) ? new File(gradedSavedPath) : null;
+            final boolean saveVerified = (verifiedSavedFile != null && verifiedSavedFile.exists() && verifiedSavedFile.length() > 0);
+            if (!saveVerified) {
+                gradedSavedPath = null;
+            }
+            final String savedLabel;
+            if (saveVerified) {
+                File parentDir = verifiedSavedFile.getParentFile();
+                savedLabel = (parentDir != null)
+                    ? (parentDir.getName() + "/" + verifiedSavedFile.getName())
+                    : verifiedSavedFile.getName();
+            } else {
+                savedLabel = "SAVE FAILED" + (lastOpenErrno != 0 ? (" e:" + lastOpenErrno) : "");
+            }
             final int[] fastStats = usedFastTranscode ? ColorEngine.getLastFastStatsSafe() : null;
             final String cpuDiag = (fastStats != null)
                 ? String.format(Locale.US, "h:%d p:%d e:%d %dc/v%d%s",
                     fastStats[2], fastStats[3], fastStats[4],
                     fastStats[5], (fastStats[7] != 0 ? 7 : 5), (fastStats[6] != 0 ? "N" : ""))
                 : null;
+            final String tierTag = (usedFastTier > 1 && lastOpenErrno != 0)
+                ? String.format(Locale.US, "t%d(e%d)", usedFastTier, lastOpenErrno)
+                : String.format(Locale.US, "t%d", usedFastTier);
             final String profDiag = (fastStats != null && fastStats.length >= 24)
-                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d rd:%d lutb:%d pin:%d t%d dct:%d%%",
+                ? String.format(Locale.US, "cpu s2:%d dec:%d em:%d | idct:%d lut:%d fdct:%d\nsu:%d rd:%d lutb:%d pin:%d %s dct:%d%%",
                     fastStats[13], fastStats[12], fastStats[14], fastStats[15], fastStats[16], fastStats[17],
-                    fastStats[10], fastStats[22], fastStats[11], fastStats[23], usedFastTier, fastStats[18])
+                    fastStats[10], fastStats[22], fastStats[11], fastStats[23], tierTag, fastStats[18])
                 : null;
             final String perfTag = usedFastTranscode
                 ? String.format(Locale.US, "C-FAST sd:%d c:%d", sdWaitMs, fastTranscodeMs)
                 : String.format(Locale.US, "BRD rc:%d sd:%d idx:%d dec:%d jni:%d", lastFastRc, sdWaitMs, brdIdxMs, brdDecMs, brdJniMs);
-            final String telemetry = String.format(Locale.US, "SAVED %s (%dx%d | %.1fMP) in %dms",
-                savedFileName, dstW, dstH, mp, totalMs) + " [" + perfTag + (cpuDiag != null ? " " + cpuDiag : "") + "]";
+            final String telemetry = saveVerified
+                ? (String.format(Locale.US, "SAVED %s (%dx%d | %.1fMP) in %dms",
+                    savedLabel, dstW, dstH, mp, totalMs) + " [" + perfTag + (cpuDiag != null ? " " + cpuDiag : "") + "]")
+                : (String.format(Locale.US, "SAVE FAILED %s (%dx%d | %.1fMP) in %dms",
+                    dcfJpegName, dstW, dstH, mp, totalMs) + " [" + perfTag + " e:" + lastOpenErrno + "]");
             uiController.updateStatusAsync(telemetry);
             Log.i(TAG, telemetry + " -> " + gradedSavedPath);
 
             // 10. Instant Zero-I/O Quick Review from in-memory DC RGB565 preview (skips 1-1.5s SD re-read & Skia decode!)
             if (reviewBmp == null) {
-                File reviewFile = (gradedSavedPath != null && new File(gradedSavedPath).exists())
-                    ? new File(gradedSavedPath) : targetOutputFile;
+                File reviewFile = saveVerified ? verifiedSavedFile : targetOutputFile;
                 if (reviewFile != null && reviewFile.exists()) {
                     reviewBmp = StorageResolver.loadPhotoForReview(reviewFile, 960);
                 }
@@ -1205,9 +1232,15 @@ public class CaptureController {
                 }
             }
             if (reviewBmp != null) {
-                String reviewSubline = (cpuDiag != null)
-                    ? (cpuDiag + (profDiag != null ? "\n" + profDiag : "") + " | " + savedFileName)
-                    : gradedSavedPath;
+                String reviewSubline;
+                if (!saveVerified) {
+                    reviewSubline = savedLabel + (cpuDiag != null ? (" | " + cpuDiag) : "")
+                        + (profDiag != null ? ("\n" + profDiag) : "");
+                } else {
+                    reviewSubline = (cpuDiag != null)
+                        ? (cpuDiag + (profDiag != null ? "\n" + profDiag : "") + " | " + savedLabel)
+                        : savedLabel;
+                }
                 if (resultListener != null) {
                     deliverResult(reviewBmp, presetName, dstW, dstH, totalMs, reviewSubline, perfTag);
                 } else if (uiController != null) {
@@ -1271,7 +1304,11 @@ public class CaptureController {
         String tag = (engineTag != null && engineTag.length() > 0) ? engineTag : "C";
         String baseInfo = String.format(Locale.US, "%s  %.1fMP [%s]  %d ms", preset, mp, tag, ms);
         if (savedPath != null) {
-            baseInfo += "\nSAVED: " + savedPath;
+            if (savedPath.startsWith("SAVE FAILED")) {
+                baseInfo += "\n" + savedPath;
+            } else {
+                baseInfo += "\nSAVED OK: " + savedPath;
+            }
         } else if (!ColorEngine.isNativeAvailable() && ColorEngine.getNativeLoadError() != null) {
             baseInfo += "\nJNI: " + ColorEngine.getNativeLoadError();
         }

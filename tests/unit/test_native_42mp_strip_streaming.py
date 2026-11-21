@@ -38,10 +38,10 @@ class TestNative42MPStripStreaming(unittest.TestCase):
         self.assertIn("findRawMasterFile", storage_content)
         self.assertIn("Note: Original master files are strictly preserved and NEVER deleted", storage_content)
 
-        # Safe temp-file-then-rename pattern in StorageResolver and CaptureController
-        self.assertIn('.tmp"', storage_content)
+        # Safe strict DOS 8.3 temp-file-then-rename pattern in StorageResolver and CaptureController
+        self.assertIn('.TMP"', storage_content)
         self.assertIn("tmpFile.renameTo", storage_content)
-        self.assertIn('.tmp"', capture_content)
+        self.assertIn("formatGradedTempFilename", capture_content)
         self.assertIn("tmpFile.renameTo", capture_content)
 
     def test_guardrail_2_true_42_4mp_resolution_no_upscaler(self):
